@@ -25,7 +25,12 @@ final class RealtimeTranslationClient: NSObject {
     private var pingTimer: Timer?
     private var intentionallyClosed = false
     private(set) var state: State = .idle {
-        didSet { onStateChange?(state) }
+        didSet {
+            // A drop fires both the receive-failure path and didCloseWith;
+            // collapse closed->closed so observers see one transition.
+            if case .closed = oldValue, case .closed = state { return }
+            onStateChange?(state)
+        }
     }
 
     // Callbacks fire on an arbitrary queue; consumers hop to main as needed.
@@ -61,6 +66,9 @@ final class RealtimeTranslationClient: NSObject {
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("realtime=v1", forHTTPHeaderField: "OpenAI-Beta")
 
+        // URLSession retains its delegate until invalidated; reconnects must
+        // release the previous session or every retry leaks one.
+        urlSession?.invalidateAndCancel()
         let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
         urlSession = session
         let task = session.webSocketTask(with: request)

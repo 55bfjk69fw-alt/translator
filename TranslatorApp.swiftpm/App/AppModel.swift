@@ -14,6 +14,7 @@ final class AppModel: ObservableObject {
 
     enum Mode: Equatable {
         case idle
+        case bench          // meters only, no translation sessions
         case conversation
         case pushToTalk
     }
@@ -29,6 +30,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var estimatedCost: Double = 0
     @Published var errorBanner: String?
     @Published private(set) var speakerOverrideActive = false
+    @Published private(set) var pttLevel: Float = 0
 
     let transcript: TranscriptStore
     let log = Log.shared
@@ -43,6 +45,9 @@ final class AppModel: ObservableObject {
 
     /// laneID -> client. DJI lanes are 0..<channelCount; the user's
     /// push-to-talk lane is SpeakerLane.userLaneID.
+    /// `clients`, `resamplers`, and `gate` internals are confined to
+    /// audioQueue (mutations from the main thread hop via audioQueue.sync)
+    /// because the tap pipeline reads them concurrently.
     private var clients: [Int: RealtimeTranslationClient] = [:]
     private var resamplers: [Int: StreamResampler] = [:]
     private var reconnectAttempts: [Int: Int] = [:]
@@ -55,8 +60,15 @@ final class AppModel: ObservableObject {
 
     private var uiTimer: Timer?
     private var stopping = false
-    private var pttEngaged = false
     private var cancellables: Set<AnyCancellable> = []
+
+    // Read on the tap thread, written on main — lock-protected.
+    private let pttFlagLock = NSLock()
+    private var _pttEngaged = false
+    private var pttEngaged: Bool {
+        get { pttFlagLock.lock(); defer { pttFlagLock.unlock() }; return _pttEngaged }
+        set { pttFlagLock.lock(); _pttEngaged = newValue; pttFlagLock.unlock() }
+    }
 
     init() {
         transcript = TranscriptStore()
@@ -99,10 +111,11 @@ final class AppModel: ObservableObject {
         meters = Array(repeating: 0, count: channelCount)
         gateOpen = Array(repeating: false, count: channelCount)
 
-        gate.enabled = AppSettings.noiseGateEnabled
-        gate.voiceThreshold = AppSettings.vadThreshold
-        gate.reset()
-
+        audioQueue.sync {
+            gate.enabled = AppSettings.noiseGateEnabled
+            gate.voiceThreshold = AppSettings.vadThreshold
+            gate.reset()
+        }
         buildResamplers(channelCount: channelCount)
         for channel in 0..<channelCount {
             openClient(lane: channel, outputLanguage: "en", apiKey: apiKey)
@@ -119,24 +132,42 @@ final class AppModel: ObservableObject {
         guard mode != .idle else { return }
         stopping = true
         mode = .idle
+        pttEngaged = false
         uiTimer?.invalidate()
         uiTimer = nil
         engineGraph.onInputChannels = nil
         engineGraph.stop()
-        for (_, client) in clients { client.close() }
-        clients.removeAll()
-        resamplers.removeAll()
+        audioQueue.sync {
+            for (_, client) in clients { client.close() }
+            clients.removeAll()
+            resamplers.removeAll()
+        }
         reconnectAttempts.removeAll()
-        pendingPlaybackBuffers.removeAll()
+        resetPlaybackState()
         UIApplication.shared.isIdleTimerDisabled = false
         refreshCost()
         Log.info("Conversation stopped")
     }
 
     private func buildResamplers(channelCount: Int) {
-        resamplers.removeAll()
-        for channel in 0..<channelCount {
-            resamplers[channel] = StreamResampler(inputSampleRate: engineGraph.inputSampleRate)
+        let rate = engineGraph.inputSampleRate
+        audioQueue.sync {
+            resamplers.removeAll()
+            for channel in 0..<channelCount {
+                resamplers[channel] = StreamResampler(inputSampleRate: rate)
+            }
+        }
+    }
+
+    /// Player nodes are torn down on every engine rebuild and their pending
+    /// completion handlers may never fire — reset the counters that ducking
+    /// and the speaker override key off, or they wedge.
+    private func resetPlaybackState() {
+        pendingPlaybackBuffers.removeAll()
+        zhSpeakerPlaybackOutstanding = 0
+        if speakerOverrideActive {
+            audioSession.overrideToSpeaker(false)
+            speakerOverrideActive = false
         }
     }
 
@@ -188,11 +219,12 @@ final class AppModel: ObservableObject {
 
     /// Runs on audioQueue.
     private func processPTTBuffer(_ buffer: AVAudioPCMBuffer, rms: Float) {
+        let level = min(1, rms * 12)
+        DispatchQueue.main.async { self.pttLevel = level }
         guard let resampler = resamplers[SpeakerLane.userLaneID],
               let client = clients[SpeakerLane.userLaneID],
               let data = resampler.convert(buffer) else { return }
         client.sendAudio(data)
-        pushMeters([ChannelGate.Decision(rms: rms, voiced: rms > gate.voiceThreshold, pass: true)])
     }
 
     private var lastMeterPush = Date.distantPast
@@ -224,7 +256,7 @@ final class AppModel: ObservableObject {
             endpointTemplate: AppSettings.endpointTemplate
         )
         wireClient(client, lane: lane)
-        clients[lane] = client
+        audioQueue.sync { clients[lane] = client }
         client.connect()
     }
 
@@ -232,24 +264,29 @@ final class AppModel: ObservableObject {
         let isUserLane = lane == SpeakerLane.userLaneID
 
         client.onStateChange = { [weak self] state in
-            guard let self else { return }
-            switch state {
-            case .open:
-                self.costMeter.sessionOpened()
-                DispatchQueue.main.async { self.reconnectAttempts[lane] = 0 }
-            case .closed:
-                self.costMeter.sessionClosed()
-                self.scheduleReconnectIfNeeded(lane: lane)
-            default:
-                break
+            DispatchQueue.main.async {
+                guard let self else { return }
+                // Cost accounting keyed on the transition we observed, so a
+                // handshake that fails before opening never double-decrements.
+                let previous = self.sessionStates[lane]
+                switch state {
+                case .open:
+                    if previous != .open { self.costMeter.sessionOpened() }
+                    self.reconnectAttempts[lane] = 0
+                case .closed:
+                    if previous == .open { self.costMeter.sessionClosed() }
+                    self.scheduleReconnectIfNeeded(lane: lane)
+                default:
+                    break
+                }
+                self.sessionStates[lane] = state
             }
-            DispatchQueue.main.async { self.sessionStates[lane] = state }
         }
         client.onSourceTranscriptDelta = { [weak self] delta in
             DispatchQueue.main.async { self?.transcript.appendSourceDelta(lane: lane, text: delta) }
         }
         client.onSourceTranscriptDone = { [weak self] full in
-            DispatchQueue.main.async { self?.transcript.finalize(lane: lane, sourceText: full) }
+            DispatchQueue.main.async { self?.transcript.setFinalSourceText(lane: lane, text: full) }
         }
         client.onTranslatedTranscriptDelta = { [weak self] delta in
             DispatchQueue.main.async { self?.transcript.appendTranslationDelta(lane: lane, text: delta) }
@@ -271,7 +308,8 @@ final class AppModel: ObservableObject {
 
     private func scheduleReconnectIfNeeded(lane: Int) {
         DispatchQueue.main.async {
-            guard !self.stopping, self.mode != .idle, self.clients[lane] != nil else { return }
+            guard !self.stopping, self.mode != .idle else { return }
+            guard self.audioQueue.sync(execute: { self.clients[lane] != nil }) else { return }
             let attempts = (self.reconnectAttempts[lane] ?? 0) + 1
             self.reconnectAttempts[lane] = attempts
             guard attempts <= 5 else {
@@ -282,7 +320,7 @@ final class AppModel: ObservableObject {
             Log.warn("Reconnecting \(self.laneName(lane)) in \(Int(delay))s (attempt \(attempts))")
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                 guard !self.stopping, self.mode != .idle else { return }
-                self.clients[lane]?.connect()
+                self.audioQueue.sync(execute: { self.clients[lane] })?.connect()
             }
         }
     }
@@ -324,6 +362,7 @@ final class AppModel: ObservableObject {
         Log.info("PTT engaged — switching input to AirPods mic")
 
         engineGraph.stop()
+        resetPlaybackState()
         do {
             try audioSession.configureForPushToTalk()
         } catch {
@@ -332,14 +371,17 @@ final class AppModel: ObservableObject {
         // The route change settles asynchronously; give it a beat before the
         // engine rebuilds against the new input format.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            guard let self, self.pttEngaged else { return }
+            guard let self, self.pttEngaged, self.mode == .pushToTalk else { return }
             do {
                 try self.engineGraph.start(playerCount: self.zhPlaybackLane + 1)
             } catch {
                 Log.error("PTT engine start failed: \(error.localizedDescription)")
             }
-            self.resamplers[SpeakerLane.userLaneID] = StreamResampler(inputSampleRate: self.engineGraph.inputSampleRate)
-            if self.clients[SpeakerLane.userLaneID] == nil {
+            let rate = self.engineGraph.inputSampleRate
+            self.audioQueue.sync {
+                self.resamplers[SpeakerLane.userLaneID] = StreamResampler(inputSampleRate: rate)
+            }
+            if self.audioQueue.sync(execute: { self.clients[SpeakerLane.userLaneID] }) == nil {
                 self.openClient(lane: SpeakerLane.userLaneID, outputLanguage: "zh", apiKey: apiKey)
             }
             self.refreshRoute()
@@ -352,6 +394,7 @@ final class AppModel: ObservableObject {
         Log.info("PTT released — restoring USB input")
 
         engineGraph.stop()
+        resetPlaybackState()
         do {
             try audioSession.configureForConversation()
         } catch {
@@ -362,11 +405,12 @@ final class AppModel: ObservableObject {
             do {
                 try self.engineGraph.start(playerCount: self.zhPlaybackLane + 1)
                 self.buildResamplers(channelCount: self.lanes.count)
-                self.gate.reset()
+                self.audioQueue.sync { self.gate.reset() }
             } catch {
                 Log.error("Engine restart failed: \(error.localizedDescription)")
             }
             self.refreshRoute()
+            self.pttLevel = 0
             self.mode = .conversation
         }
     }
@@ -382,7 +426,8 @@ final class AppModel: ObservableObject {
 
     /// Replay a finished utterance's Chinese audio over the iPad speaker.
     func playUtteranceAudio(_ utterance: TranscriptStore.Utterance) {
-        guard let audio = utterance.translatedAudio else { return }
+        // Player nodes only exist while the engine runs.
+        guard mode != .idle, let audio = utterance.translatedAudio else { return }
         playChineseOverSpeaker(audio)
     }
 
@@ -427,12 +472,12 @@ final class AppModel: ObservableObject {
         lanes = (0..<channelCount).map { SpeakerLane.djiLane(channel: $0, name: AppSettings.speakerName($0)) }
         meters = Array(repeating: 0, count: channelCount)
         gateOpen = Array(repeating: false, count: channelCount)
-        gate.enabled = false
+        audioQueue.sync { gate.enabled = false }
         installInputHandler()
         // Bench mode has no clients; processConversationBuffers still runs
         // and drives the meters, sends go nowhere.
         refreshRoute()
-        mode = .conversation
+        mode = .bench
         Log.info("Bench test running: \(channelCount) channel(s) at \(Int(engineGraph.inputSampleRate)) Hz")
     }
 
@@ -500,11 +545,12 @@ final class AppModel: ObservableObject {
     private func restartEngineForCurrentRoute() {
         guard mode == .conversation else { return }
         engineGraph.stop()
+        resetPlaybackState()
         do {
             try audioSession.configureForConversation()
             try engineGraph.start(playerCount: zhPlaybackLane + 1)
             buildResamplers(channelCount: lanes.count)
-            gate.reset()
+            audioQueue.sync { gate.reset() }
             refreshRoute()
         } catch {
             errorBanner = "Audio restart failed: \(error.localizedDescription)"

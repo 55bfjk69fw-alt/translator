@@ -62,8 +62,11 @@ final class EngineGraph {
     }
 
     func stop() {
+        // Remove unconditionally: a tap can be left installed when start()
+        // threw after installing it, and removing a nonexistent tap is a
+        // safe no-op — while installing a second tap is a fatal exception.
+        engine.inputNode.removeTap(onBus: 0)
         if isRunning || engine.isRunning {
-            engine.inputNode.removeTap(onBus: 0)
             engine.stop()
         }
         for player in players {
@@ -80,7 +83,7 @@ final class EngineGraph {
 
         if let floatData = buffer.floatChannelData {
             // Non-interleaved float32: pass channel pointers straight through.
-            let channels = (0..<Int(buffer.format.channelCount)).map { floatData[$0] as UnsafePointer<Float> }
+            let channels = (0..<Int(buffer.format.channelCount)).map { UnsafePointer(floatData[$0]) }
             onInputChannels?(channels, frames, buffer.format.sampleRate)
         } else {
             Log.warn("Unexpected input buffer layout (no floatChannelData); dropping buffer")

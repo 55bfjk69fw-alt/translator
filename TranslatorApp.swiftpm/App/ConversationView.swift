@@ -82,7 +82,7 @@ struct ConversationView: View {
                         UtteranceBubble(
                             utterance: utterance,
                             lane: model.lane(for: utterance.laneID),
-                            playAction: utterance.translatedAudio != nil
+                            playAction: utterance.translatedAudio != nil && model.mode != .idle
                                 ? { model.playUtteranceAudio(utterance) }
                                 : nil
                         )
@@ -121,6 +121,12 @@ struct ConversationView: View {
                 Label("Playing Chinese over speaker", systemImage: "speaker.wave.2.fill")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
+            }
+            if model.mode == .pushToTalk {
+                ProgressView(value: Double(model.pttLevel))
+                    .progressViewStyle(.linear)
+                    .tint(.red)
+                    .frame(maxWidth: 220)
             }
             PushToTalkButton(
                 enabled: model.mode == .conversation || model.mode == .pushToTalk,

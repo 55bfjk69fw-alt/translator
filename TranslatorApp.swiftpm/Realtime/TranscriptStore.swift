@@ -68,9 +68,18 @@ final class TranscriptStore: ObservableObject {
         }
     }
 
-    func finalize(lane: Int, sourceText: String? = nil, translatedText: String? = nil) {
+    /// Source transcript finished for the current segment. Does NOT close the
+    /// utterance — the translation usually finishes streaming after the
+    /// source does; closing here would split every utterance in two.
+    func setFinalSourceText(lane: Int, text: String?) {
         guard let index = openUtteranceIndex[lane], utterances.indices.contains(index) else { return }
-        if let sourceText, !sourceText.isEmpty { utterances[index].sourceText = sourceText }
+        if let text, !text.isEmpty { utterances[index].sourceText = text }
+        utterances[index].lastActivity = Date()
+    }
+
+    /// Translation finished: close the utterance.
+    func finalize(lane: Int, translatedText: String? = nil) {
+        guard let index = openUtteranceIndex[lane], utterances.indices.contains(index) else { return }
         if let translatedText, !translatedText.isEmpty { utterances[index].translatedText = translatedText }
         utterances[index].isFinal = true
         openUtteranceIndex[lane] = nil

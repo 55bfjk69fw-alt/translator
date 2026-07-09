@@ -25,17 +25,14 @@ struct SessionConfig {
     /// on-device if the server rejects the shape — check DiagnosticsView for
     /// server `error` events.
     func sessionUpdateEvent() -> [String: Any] {
-        [
+        let session: [String: Any] = [
+            "type": "translation",
+            "output": ["language": outputLanguage],
+            "transcription": ["model": transcriptionModel]
+        ]
+        return [
             "type": "session.update",
-            "session": [
-                "type": "translation",
-                "output": [
-                    "language": outputLanguage
-                ],
-                "transcription": [
-                    "model": transcriptionModel
-                ]
-            ]
+            "session": session
         ]
     }
 }

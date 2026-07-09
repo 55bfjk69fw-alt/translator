@@ -1,0 +1,42 @@
+// swift-tools-version: 5.9
+
+// App playground package for Swift Playgrounds on iPad.
+// Open this folder (TranslatorApp.swiftpm) in Swift Playgrounds 4.7+ on iPadOS 26.
+import PackageDescription
+import AppleProductTypes
+
+let package = Package(
+    name: "Translator",
+    platforms: [
+        .iOS("17.0")
+    ],
+    products: [
+        .iOSApplication(
+            name: "Translator",
+            targets: ["AppModule"],
+            bundleIdentifier: "com.stufflebeam.translator",
+            displayVersion: "0.1",
+            bundleVersion: "1",
+            accentColor: .presetColor(.indigo),
+            supportedDeviceFamilies: [
+                .pad,
+                .phone
+            ],
+            supportedInterfaceOrientations: [
+                .portrait,
+                .landscapeRight,
+                .landscapeLeft
+            ],
+            capabilities: [
+                .microphone(purposeString: "Captures audio from the DJI Mic receiver and AirPods to translate conversations in real time.")
+            ],
+            appCategory: .productivity
+        )
+    ],
+    targets: [
+        .executableTarget(
+            name: "AppModule",
+            path: "."
+        )
+    ]
+)

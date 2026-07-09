@@ -46,4 +46,13 @@ final class Log: ObservableObject {
     func clear() {
         DispatchQueue.main.async { self.entries.removeAll() }
     }
+
+    /// Full log as plain text, oldest first — for copy/share out of the app.
+    func exportText() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss.SSS"
+        return entries
+            .map { "\(formatter.string(from: $0.date)) [\($0.level.rawValue)] \($0.message)" }
+            .joined(separator: "\n")
+    }
 }

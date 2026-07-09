@@ -181,7 +181,7 @@ final class RealtimeTranslationClient: NSObject {
         guard let data = text.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let type = object["type"] as? String else {
-            Log.warn("[\(label)] Unparseable WS message (\(text.prefix(120)))")
+            Log.warn("[\(label)] Unparseable WS message (\(text.prefix(500)))")
             return
         }
 
@@ -213,13 +213,13 @@ final class RealtimeTranslationClient: NSObject {
         case "session.created", "session.updated":
             Log.info("[\(label)] \(type)")
         case "error":
-            let detail = (object["error"] as? [String: Any])?["message"] as? String
-                ?? String(text.prefix(300))
-            Log.error("[\(label)] Server error: \(detail)")
+            // Log the complete error payload — this is the primary evidence
+            // for correcting the session.update shape or endpoint.
+            Log.error("[\(label)] Server error: \(text.prefix(2000))")
         default:
-            // Unknown event: log the type (and a snippet) so the alias tables
-            // above can be extended from real evidence.
-            Log.info("[\(label)] Unhandled event \(type): \(text.prefix(160))")
+            // Unknown event: log the full payload so the alias tables above
+            // can be extended from real evidence.
+            Log.info("[\(label)] Unhandled event \(type): \(text.prefix(2000))")
         }
     }
 
@@ -259,6 +259,19 @@ extension RealtimeTranslationClient: URLSessionWebSocketDelegate {
         state = .open
         sendJSON(config.sessionUpdateEvent())
         startPing()
+    }
+
+    func urlSession(_ session: URLSession,
+                    task: URLSessionTask,
+                    didCompleteWithError error: Error?) {
+        // A rejected handshake (401/403/404) surfaces here with the HTTP
+        // status on task.response rather than as a WebSocket close frame.
+        if let http = task.response as? HTTPURLResponse, http.statusCode != 101 {
+            Log.error("[\(label)] WS handshake HTTP \(http.statusCode) \(HTTPURLResponse.localizedString(forStatusCode: http.statusCode))")
+        }
+        if let error, !intentionallyClosed {
+            Log.warn("[\(label)] WS task completed with error: \(error.localizedDescription)")
+        }
     }
 
     func urlSession(_ session: URLSession,

@@ -1,5 +1,6 @@
 import SwiftUI
 import AVFoundation
+import UIKit
 
 /// Bench-test and event-log screen. This is the first thing to open on new
 /// hardware: it shows whether the DJI RX enumerates with 4 channels, whether
@@ -7,6 +8,7 @@ import AVFoundation
 struct DiagnosticsView: View {
     @EnvironmentObject private var model: AppModel
     @ObservedObject private var log = Log.shared
+    @State private var logCopied = false
 
     var body: some View {
         NavigationStack {
@@ -113,9 +115,19 @@ struct DiagnosticsView: View {
                 }
             }
         } header: {
-            HStack {
+            HStack(spacing: 16) {
                 Text("Event log")
                 Spacer()
+                Button(logCopied ? "Copied ✓" : "Copy") {
+                    UIPasteboard.general.string = log.exportText()
+                    logCopied = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { logCopied = false }
+                }
+                .font(.caption)
+                ShareLink(item: log.exportText()) {
+                    Text("Share")
+                        .font(.caption)
+                }
                 Button("Clear") { log.clear() }
                     .font(.caption)
             }

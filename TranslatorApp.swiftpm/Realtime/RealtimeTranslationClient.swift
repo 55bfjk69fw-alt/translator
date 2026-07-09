@@ -82,6 +82,9 @@ final class RealtimeTranslationClient: NSObject {
     func close() {
         intentionallyClosed = true
         stopPing()
+        if state == .open {
+            sendJSON(["type": "session.close"])
+        }
         task?.cancel(with: .normalClosure, reason: nil)
         task = nil
         urlSession?.invalidateAndCancel()
@@ -97,10 +100,13 @@ final class RealtimeTranslationClient: NSObject {
     // MARK: - Sending
 
     /// Append 24 kHz mono PCM16 audio to the session's input buffer.
+    /// Translation sessions accept exactly: session.update,
+    /// session.input_audio_buffer.append, session.close — note the
+    /// "session." prefix on all client events.
     func sendAudio(_ pcm16: Data) {
         guard state == .open else { return }
         let event: [String: Any] = [
-            "type": "input_audio_buffer.append",
+            "type": "session.input_audio_buffer.append",
             "audio": pcm16.base64EncodedString()
         ]
         sendJSON(event)

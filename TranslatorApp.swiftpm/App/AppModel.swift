@@ -53,6 +53,13 @@ final class AppModel: ObservableObject {
     private var reconnectAttempts: [Int: Int] = [:]
     private var sessionOpenedAt: [Int: Date] = [:]
 
+    // audioQueue-confined lazy-session state. Sessions open on first
+    // detected speech per channel (a powered-off TX is pure silence and
+    // never opens one) and are closed again after idle timeout.
+    private var pipelineActive = false
+    private var sessionAPIKey: String?
+    private var lastVoiceAt: [Int: Date] = [:]
+
     /// Playback lanes on the engine: 0..3 = translated English per speaker,
     /// 4 = the user's translated Chinese.
     private let zhPlaybackLane = 4
@@ -116,17 +123,20 @@ final class AppModel: ObservableObject {
             gate.enabled = AppSettings.noiseGateEnabled
             gate.voiceThreshold = AppSettings.vadThreshold
             gate.reset()
+            pipelineActive = true
+            sessionAPIKey = apiKey
+            lastVoiceAt.removeAll()
         }
         buildResamplers(channelCount: channelCount)
-        for channel in 0..<channelCount {
-            openClient(lane: channel, outputLanguage: "en", apiKey: apiKey)
-        }
+        // Sessions are opened lazily on first speech per channel, not here —
+        // a disconnected/powered-off TX never opens a billed session.
+        sessionStates = Dictionary(uniqueKeysWithValues: (0..<channelCount).map { ($0, RealtimeTranslationClient.State.idle) })
 
         installInputHandler()
         startUITimer()
         mode = .conversation
         UIApplication.shared.isIdleTimerDisabled = true
-        Log.info("Conversation started: \(channelCount) channel(s)")
+        Log.info("Conversation started: \(channelCount) channel(s); sessions open on first speech")
     }
 
     func stopConversation() {
@@ -139,6 +149,9 @@ final class AppModel: ObservableObject {
         engineGraph.onInputChannels = nil
         engineGraph.stop()
         audioQueue.sync {
+            pipelineActive = false
+            sessionAPIKey = nil
+            lastVoiceAt.removeAll()
             for (_, client) in clients { client.close() }
             clients.removeAll()
             resamplers.removeAll()
@@ -203,7 +216,9 @@ final class AppModel: ObservableObject {
     private func processConversationBuffers(_ buffers: [AVAudioPCMBuffer], rmsValues: [Float], frames: Int, sampleRate: Double) {
         let decisions = gate.evaluate(rmsPerChannel: rmsValues)
         for (channel, decision) in decisions.enumerated() {
-            guard let resampler = resamplers[channel], let client = clients[channel] else { continue }
+            if decision.voiced { lastVoiceAt[channel] = Date() }
+            guard let resampler = resamplers[channel] else { continue }
+            guard let client = clients[channel] ?? lazyOpenSession(channel: channel, voiced: decision.voiced) else { continue }
             let outgoing: AVAudioPCMBuffer?
             if decision.pass {
                 outgoing = buffers[channel]
@@ -219,10 +234,23 @@ final class AppModel: ObservableObject {
         pushMeters(decisions)
     }
 
+    /// Runs on audioQueue. Opens a channel's translation session the first
+    /// time speech is detected on it; the client queues audio while the
+    /// socket connects, so the triggering words are translated too.
+    private func lazyOpenSession(channel: Int, voiced: Bool) -> RealtimeTranslationClient? {
+        guard voiced, pipelineActive, let apiKey = sessionAPIKey else { return nil }
+        Log.info("Speech on channel \(channel) — opening translation session")
+        let client = makeClient(lane: channel, outputLanguage: "en", apiKey: apiKey)
+        clients[channel] = client
+        client.connect()
+        return client
+    }
+
     /// Runs on audioQueue.
     private func processPTTBuffer(_ buffer: AVAudioPCMBuffer, rms: Float) {
         let level = min(1, rms * 12)
         DispatchQueue.main.async { self.pttLevel = level }
+        lastVoiceAt[SpeakerLane.userLaneID] = Date()
         guard let resampler = resamplers[SpeakerLane.userLaneID],
               let client = clients[SpeakerLane.userLaneID],
               let data = resampler.convert(buffer) else { return }
@@ -247,7 +275,9 @@ final class AppModel: ObservableObject {
 
     // MARK: - Sessions
 
-    private func openClient(lane: Int, outputLanguage: String, apiKey: String) {
+    /// Create and wire a client without registering or connecting it.
+    /// Safe to call from any thread (settings/keychain are thread-safe).
+    private func makeClient(lane: Int, outputLanguage: String, apiKey: String) -> RealtimeTranslationClient {
         var config = SessionConfig(outputLanguage: outputLanguage)
         config.model = AppSettings.modelName
         let label = lane == SpeakerLane.userLaneID ? "me→zh" : "ch\(lane)→\(outputLanguage)"
@@ -258,6 +288,12 @@ final class AppModel: ObservableObject {
             endpointTemplate: AppSettings.endpointTemplate
         )
         wireClient(client, lane: lane)
+        return client
+    }
+
+    /// Main-thread path (push-to-talk lane): register + connect.
+    private func openClient(lane: Int, outputLanguage: String, apiKey: String) {
+        let client = makeClient(lane: lane, outputLanguage: outputLanguage, apiKey: apiKey)
         audioQueue.sync { clients[lane] = client }
         client.connect()
     }
@@ -265,9 +301,13 @@ final class AppModel: ObservableObject {
     private func wireClient(_ client: RealtimeTranslationClient, lane: Int) {
         let isUserLane = lane == SpeakerLane.userLaneID
 
-        client.onStateChange = { [weak self] state in
+        client.onStateChange = { [weak self, weak client] state in
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, let client else { return }
+                // Ignore events from clients no longer registered for this
+                // lane (e.g. after an idle-close) so they can't clobber the
+                // lane's displayed state or trigger reconnects.
+                guard self.audioQueue.sync(execute: { self.clients[lane] === client }) else { return }
                 // Cost accounting keyed on the transition we observed, so a
                 // handshake that fails before opening never double-decrements.
                 let previous = self.sessionStates[lane]
@@ -498,6 +538,31 @@ final class AppModel: ObservableObject {
             guard let self else { return }
             self.refreshCost()
             self.transcript.finalizeStale(timeout: 2.5)
+            self.closeIdleSessions()
+        }
+    }
+
+    /// Close sessions whose channel has been silent past the idle timeout —
+    /// they reopen automatically on the next detected speech. Stops billing
+    /// for quiet channels and for the PTT lane between uses.
+    private func closeIdleSessions() {
+        let timeout = AppSettings.idleCloseSeconds
+        guard timeout > 0, mode != .idle else { return }
+        let now = Date()
+        var closedLanes: [Int] = []
+        audioQueue.sync {
+            for (lane, client) in clients {
+                if lane == SpeakerLane.userLaneID && pttEngaged { continue }
+                guard let last = lastVoiceAt[lane], now.timeIntervalSince(last) > timeout else { continue }
+                clients[lane] = nil
+                client.close()
+                closedLanes.append(lane)
+            }
+        }
+        for lane in closedLanes {
+            sessionStates[lane] = .idle
+            reconnectAttempts[lane] = 0
+            Log.info("Closed idle session for \(laneName(lane)) (silent \(Int(timeout))s) — reopens on speech")
         }
     }
 

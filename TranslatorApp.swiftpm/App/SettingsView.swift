@@ -16,6 +16,7 @@ struct SettingsView: View {
     @AppStorage("speakerName3") private var speakerName3 = ""
     @AppStorage(AppSettings.modelNameKey) private var modelName = ""
     @AppStorage(AppSettings.endpointTemplateKey) private var endpointTemplate = ""
+    @AppStorage(AppSettings.idleCloseSecondsKey) private var idleCloseSeconds = 120.0
 
     var body: some View {
         NavigationStack {
@@ -59,6 +60,19 @@ struct SettingsView: View {
                     Text("Signal quality")
                 } footer: {
                     Text("The gate replaces mic bleed with silence so one speaker doesn't produce four duplicate translations. Raise the threshold in noisy rooms; also enable each transmitter's onboard noise cancelling (Basic/Strong) from the DJI receiver.")
+                }
+
+                Section {
+                    Picker("Close idle sessions after", selection: $idleCloseSeconds) {
+                        Text("1 minute").tag(60.0)
+                        Text("2 minutes").tag(120.0)
+                        Text("5 minutes").tag(300.0)
+                        Text("Never").tag(0.0)
+                    }
+                } header: {
+                    Text("Sessions")
+                } footer: {
+                    Text("Translation sessions open when a mic first picks up speech and close after this much silence (they reopen instantly on the next speech). Disconnected or powered-off transmitters never open a session.")
                 }
 
                 Section {

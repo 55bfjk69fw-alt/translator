@@ -9,6 +9,7 @@ enum AppSettings {
     static let noiseGateEnabledKey = "noiseGateEnabled"
     static let vadThresholdKey = "vadThreshold"
     static let userNameKey = "userName"
+    static let idleCloseSecondsKey = "idleCloseSeconds"
 
     static func speakerNameKey(_ channel: Int) -> String { "speakerName\(channel)" }
 
@@ -35,6 +36,12 @@ enum AppSettings {
     static var vadThreshold: Float {
         let value = UserDefaults.standard.float(forKey: vadThresholdKey)
         return value > 0 ? value : 0.010
+    }
+
+    /// Seconds of channel silence before its session is closed (0 = never).
+    static var idleCloseSeconds: Double {
+        if UserDefaults.standard.object(forKey: idleCloseSecondsKey) == nil { return 120 }
+        return UserDefaults.standard.double(forKey: idleCloseSecondsKey)
     }
 
     static func speakerName(_ channel: Int) -> String {

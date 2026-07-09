@@ -27,6 +27,14 @@ final class RealtimeTranslationClient: NSObject {
     /// Event types seen this connection; each is logged once so the log
     /// records the actual server schema without flooding.
     private var seenEventTypes: Set<String> = []
+
+    // Audio arriving while the socket is still connecting is queued and
+    // flushed on open, so lazily-opened sessions don't drop the words that
+    // triggered them. Bounded to ~30 s of 24 kHz PCM16.
+    private let pendingLock = NSLock()
+    private var pendingAudio: [Data] = []
+    private var pendingBytes = 0
+    private let maxPendingBytes = 1_500_000
     private(set) var state: State = .idle {
         didSet {
             // A drop fires both the receive-failure path and didCloseWith;
@@ -108,12 +116,33 @@ final class RealtimeTranslationClient: NSObject {
     /// session.input_audio_buffer.append, session.close — note the
     /// "session." prefix on all client events.
     func sendAudio(_ pcm16: Data) {
-        guard state == .open else { return }
-        let event: [String: Any] = [
+        if state == .open {
+            sendAppendEvent(pcm16)
+        } else if !intentionallyClosed {
+            pendingLock.lock()
+            pendingAudio.append(pcm16)
+            pendingBytes += pcm16.count
+            while pendingBytes > maxPendingBytes, !pendingAudio.isEmpty {
+                pendingBytes -= pendingAudio.removeFirst().count
+            }
+            pendingLock.unlock()
+        }
+    }
+
+    private func sendAppendEvent(_ pcm16: Data) {
+        sendJSON([
             "type": "session.input_audio_buffer.append",
             "audio": pcm16.base64EncodedString()
-        ]
-        sendJSON(event)
+        ])
+    }
+
+    private func flushPendingAudio() {
+        pendingLock.lock()
+        let queued = pendingAudio
+        pendingAudio.removeAll()
+        pendingBytes = 0
+        pendingLock.unlock()
+        for chunk in queued { sendAppendEvent(chunk) }
     }
 
     private func sendJSON(_ object: [String: Any]) {
@@ -274,6 +303,7 @@ extension RealtimeTranslationClient: URLSessionWebSocketDelegate {
         Log.info("[\(label)] WS open")
         state = .open
         sendJSON(config.sessionUpdateEvent())
+        flushPendingAudio()
         startPing()
     }
 

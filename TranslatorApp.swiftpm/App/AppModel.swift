@@ -59,6 +59,15 @@ final class AppModel: ObservableObject {
     private var pipelineActive = false
     private var sessionAPIKey: String?
     private var lastVoiceAt: [Int: Date] = [:]
+    /// Last logged voiced state per channel (audioQueue-confined) so
+    /// speech start/end transitions land in the diagnostics log.
+    private var voicedState: [Int: Bool] = [:]
+
+    // Engine watchdog bookkeeping (main thread). The engine auto-stops on
+    // configuration changes and interruptions; the watchdog brings it back.
+    private var interruptedSince: Date?
+    private var lastWatchdogRestart = Date.distantPast
+    private var lastEngineDownWarn = Date.distantPast
 
     /// Playback lanes on the engine: 0..3 = translated English per speaker,
     /// 4 = the user's translated Chinese.
@@ -126,6 +135,7 @@ final class AppModel: ObservableObject {
             pipelineActive = true
             sessionAPIKey = apiKey
             lastVoiceAt.removeAll()
+            voicedState.removeAll()
         }
         buildResamplers(channelCount: channelCount)
         // Sessions are opened lazily on first speech per channel, not here —
@@ -216,6 +226,17 @@ final class AppModel: ObservableObject {
     private func processConversationBuffers(_ buffers: [AVAudioPCMBuffer], rmsValues: [Float], frames: Int, sampleRate: Double) {
         let decisions = gate.evaluate(rmsPerChannel: rmsValues)
         for (channel, decision) in decisions.enumerated() {
+            // Log utterance-level transitions (the hangover smooths word
+            // gaps) so missing translations can be correlated with whether
+            // speech was even detected and whether the gate passed it.
+            if decision.voiced != (voicedState[channel] ?? false) {
+                voicedState[channel] = decision.voiced
+                if decision.voiced {
+                    Log.info("ch\(channel) speech started (rms \(String(format: "%.4f", decision.rms)), gate \(decision.pass ? "pass" : "SUPPRESSED by louder channel"))")
+                } else {
+                    Log.info("ch\(channel) speech ended")
+                }
+            }
             if decision.voiced { lastVoiceAt[channel] = Date() }
             guard let resampler = resamplers[channel] else { continue }
             guard let client = clients[channel] ?? lazyOpenSession(channel: channel, voiced: decision.voiced) else { continue }
@@ -381,6 +402,10 @@ final class AppModel: ObservableObject {
     // MARK: - English playback with overlap ducking (main thread)
 
     private func playEnglishAudio(_ audio: Data, lane: Int) {
+        if !engineGraph.engine.isRunning, Date().timeIntervalSince(lastEngineDownWarn) > 5 {
+            lastEngineDownWarn = Date()
+            Log.warn("Translated audio arriving for lane \(lane) but the audio engine is not running — playback stalled (watchdog will restart it)")
+        }
         let othersActive = pendingPlaybackBuffers.contains { $0.key != lane && $0.key != zhPlaybackLane && $0.value > 0 }
         engineGraph.setLaneVolume(othersActive ? 0.35 : 1.0, lane: lane)
         pendingPlaybackBuffers[lane, default: 0] += 1
@@ -533,7 +558,25 @@ final class AppModel: ObservableObject {
             self.refreshCost()
             self.transcript.finalizeStale(timeout: 2.5)
             self.closeIdleSessions()
+            self.watchdogEngineCheck()
         }
+    }
+
+    /// AVAudioEngine auto-stops on configuration changes (Bluetooth codec
+    /// renegotiation, USB glitches) and interruptions, and before this
+    /// watchdog nothing ever restarted it — the classic "playback never
+    /// continues after a pause" failure. Restart it whenever it's found dead
+    /// outside an active interruption.
+    private func watchdogEngineCheck() {
+        guard mode == .conversation, !pttEngaged, !engineGraph.engine.isRunning else { return }
+        // During an interruption the session can't be reactivated; wait for
+        // the .ended notification, but only up to 60 s — it famously doesn't
+        // always arrive.
+        if let since = interruptedSince, Date().timeIntervalSince(since) < 60 { return }
+        guard Date().timeIntervalSince(lastWatchdogRestart) >= 5 else { return }
+        lastWatchdogRestart = Date()
+        Log.warn("Watchdog: audio engine stopped (config change or interruption) — restarting")
+        restartEngineForCurrentRoute()
     }
 
     /// Close sessions whose channel has been silent past the idle timeout —
@@ -600,8 +643,10 @@ final class AppModel: ObservableObject {
               let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
         switch type {
         case .began:
+            interruptedSince = Date()
             Log.warn("Audio interruption began")
         case .ended:
+            interruptedSince = nil
             guard mode != .idle else { return }
             Log.info("Audio interruption ended — restarting engine")
             restartEngineForCurrentRoute()

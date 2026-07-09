@@ -24,6 +24,31 @@ final class EngineGraph {
     private(set) var inputSampleRate: Double = 48_000
     private(set) var isRunning = false
 
+    private var configChangeObserver: NSObjectProtocol?
+
+    init() {
+        // AVAudioEngine silently stops itself when its I/O configuration
+        // changes underneath it (Bluetooth codec renegotiation, USB device
+        // hiccup) — often during quiet periods. Nothing else reports this,
+        // so log it loudly and clear isRunning; AppModel's watchdog restarts
+        // the graph.
+        configChangeObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: nil
+        ) { [weak self] _ in
+            guard let self, self.isRunning else { return }
+            self.isRunning = false
+            Log.warn("Audio engine configuration changed — engine auto-stopped (capture and playback halted until restart)")
+        }
+    }
+
+    deinit {
+        if let configChangeObserver {
+            NotificationCenter.default.removeObserver(configChangeObserver)
+        }
+    }
+
     /// (Re)build the graph for the current route. `playerCount` playback
     /// lanes are attached regardless of input shape so translated audio can
     /// keep playing in every mode.

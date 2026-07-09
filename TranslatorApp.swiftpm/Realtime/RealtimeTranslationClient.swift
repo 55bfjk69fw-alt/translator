@@ -28,6 +28,29 @@ final class RealtimeTranslationClient: NSObject {
     /// records the actual server schema without flooding.
     private var seenEventTypes: Set<String> = []
 
+    /// Per-connection traffic counters. The periodic/closing summary lines
+    /// are the primary evidence for "Chinese text missing" (source-transcript
+    /// deltas never arrived) and "playback stopped" (audio frames stopped or
+    /// the socket went half-dead) reports.
+    private struct Stats {
+        var audioChunksSent = 0
+        var audioBytesSent = 0
+        var chunksQueuedPreOpen = 0
+        var sendFailures = 0
+        var sourceDeltas = 0
+        var sourceChars = 0
+        var translationDeltas = 0
+        var translationChars = 0
+        var audioFrames = 0
+        var audioBytes = 0
+        var heartbeatsDropped = 0
+    }
+    private let statsLock = NSLock()
+    private var stats = Stats()
+    private var lastServerEventAt = Date()
+    private var connectStartedAt: Date?
+    private var pingTicks = 0
+
     // Audio arriving while the socket is still connecting is queued and
     // flushed on open, so lazily-opened sessions don't drop the words that
     // triggered them. Bounded to ~30 s of 24 kHz PCM16.
@@ -40,6 +63,7 @@ final class RealtimeTranslationClient: NSObject {
             // A drop fires both the receive-failure path and didCloseWith;
             // collapse closed->closed so observers see one transition.
             if case .closed = oldValue, case .closed = state { return }
+            if case .closed = state { logSummary(context: "closing") }
             onStateChange?(state)
         }
     }
@@ -73,6 +97,12 @@ final class RealtimeTranslationClient: NSObject {
         }
         intentionallyClosed = false
         seenEventTypes.removeAll()
+        statsLock.lock()
+        stats = Stats()
+        lastServerEventAt = Date()
+        statsLock.unlock()
+        connectStartedAt = Date()
+        pingTicks = 0
         state = .connecting
 
         var request = URLRequest(url: url)
@@ -148,10 +178,17 @@ final class RealtimeTranslationClient: NSObject {
                 pendingBytes -= pendingAudio.removeFirst().count
             }
             pendingLock.unlock()
+            statsLock.lock()
+            stats.chunksQueuedPreOpen += 1
+            statsLock.unlock()
         }
     }
 
     private func sendAppendEvent(_ pcm16: Data) {
+        statsLock.lock()
+        stats.audioChunksSent += 1
+        stats.audioBytesSent += pcm16.count
+        statsLock.unlock()
         sendJSON([
             "type": "session.input_audio_buffer.append",
             "audio": pcm16.base64EncodedString()
@@ -170,6 +207,10 @@ final class RealtimeTranslationClient: NSObject {
         pendingAudio.removeAll()
         pendingBytes = 0
         pendingLock.unlock()
+        if !queued.isEmpty {
+            let bytes = queued.reduce(0) { $0 + $1.count }
+            Log.info("[\(label)] flushing \(queued.count) chunks (\(bytes / 1024)KB) queued while connecting")
+        }
         for chunk in queued { sendAppendEvent(chunk) }
     }
 
@@ -178,10 +219,26 @@ final class RealtimeTranslationClient: NSObject {
               let data = try? JSONSerialization.data(withJSONObject: object),
               let text = String(data: data, encoding: .utf8) else { return }
         task.send(.string(text)) { [weak self] error in
-            if let error, let self, !self.intentionallyClosed {
-                Log.error("[\(self.label)] WS send failed: \(error.localizedDescription)")
-            }
+            guard let error, let self, !self.intentionallyClosed else { return }
+            self.statsLock.lock()
+            self.stats.sendFailures += 1
+            self.statsLock.unlock()
+            // A failed send means the socket is broken even though receive()
+            // may hang without erroring — fail fast so the lane reconnects
+            // instead of staying "open" and permanently silent.
+            self.failConnection("WS send failed: \(error.localizedDescription)")
         }
+    }
+
+    /// Tear down a connection we've decided is dead (failed send/ping, event
+    /// stall) so the closed state triggers AppModel's reconnect path.
+    private func failConnection(_ reason: String) {
+        guard !intentionallyClosed, !stateIsClosed else { return }
+        Log.error("[\(label)] \(reason) — dropping socket to trigger reconnect")
+        stopPing()
+        task?.cancel(with: .abnormalClosure, reason: nil)
+        task = nil
+        state = .closed(reason)
     }
 
     // MARK: - Receiving
@@ -227,6 +284,9 @@ final class RealtimeTranslationClient: NSObject {
         if seenEventTypes.insert(type).inserted {
             Log.info("[\(label)] first \(type)")
         }
+        statsLock.lock()
+        lastServerEventAt = Date()
+        statsLock.unlock()
 
         switch type {
         case "session.output_audio.delta":
@@ -235,14 +295,35 @@ final class RealtimeTranslationClient: NSObject {
             // not RMS (clips quiet speech) and not frame length (observed to
             // change server-side without notice).
             if let base64 = object["delta"] as? String,
-               let audio = Data(base64Encoded: base64),
-               !Self.isPureSilence(audio) {
-                onTranslatedAudio?(audio)
+               let audio = Data(base64Encoded: base64) {
+                if Self.isPureSilence(audio) {
+                    statsLock.lock()
+                    stats.heartbeatsDropped += 1
+                    statsLock.unlock()
+                } else {
+                    statsLock.lock()
+                    stats.audioFrames += 1
+                    stats.audioBytes += audio.count
+                    statsLock.unlock()
+                    onTranslatedAudio?(audio)
+                }
             }
         case "session.input_transcript.delta":
-            if let delta = object["delta"] as? String { onSourceTranscriptDelta?(delta) }
+            if let delta = object["delta"] as? String {
+                statsLock.lock()
+                stats.sourceDeltas += 1
+                stats.sourceChars += delta.count
+                statsLock.unlock()
+                onSourceTranscriptDelta?(delta)
+            }
         case "session.output_transcript.delta":
-            if let delta = object["delta"] as? String { onTranslatedTranscriptDelta?(delta) }
+            if let delta = object["delta"] as? String {
+                statsLock.lock()
+                stats.translationDeltas += 1
+                stats.translationChars += delta.count
+                statsLock.unlock()
+                onTranslatedTranscriptDelta?(delta)
+            }
         case "session.created", "session.updated":
             Log.info("[\(label)] \(type)")
         case "session.closed":
@@ -265,10 +346,55 @@ final class RealtimeTranslationClient: NSObject {
             guard let self else { return }
             self.pingTimer?.invalidate()
             self.pingTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
-                self?.task?.sendPing { error in
-                    if let error { Log.warn("Ping failed: \(error.localizedDescription)") }
+                guard let self, self.state == .open else { return }
+                // The server sends events continuously while a session is
+                // healthy (heartbeat audio frames every ~200 ms). A long
+                // event gap on an "open" socket means it's half-dead —
+                // receive() can hang for minutes without erroring, and a
+                // lost pong never invokes the sendPing handler either.
+                self.statsLock.lock()
+                let eventGap = Date().timeIntervalSince(self.lastServerEventAt)
+                self.statsLock.unlock()
+                if eventGap > 75 {
+                    self.failConnection("no server events for \(Int(eventGap))s — connection presumed dead")
+                    return
+                }
+                self.pingTicks += 1
+                if self.pingTicks % 3 == 0 { self.logSummary(context: "periodic") }
+                self.task?.sendPing { [weak self] error in
+                    if let error {
+                        self?.failConnection("ping failed: \(error.localizedDescription)")
+                    }
                 }
             }
+        }
+    }
+
+    /// One-line traffic summary, logged every ~60 s while open and once on
+    /// close. Reads as: what we sent vs. what each server stream returned.
+    private func logSummary(context: String) {
+        statsLock.lock()
+        let s = stats
+        statsLock.unlock()
+        // A handshake that never carried traffic has nothing to summarize.
+        guard s.audioChunksSent + s.chunksQueuedPreOpen + s.sourceDeltas
+            + s.translationDeltas + s.audioFrames + s.heartbeatsDropped > 0 else { return }
+        var line = "sent \(s.audioChunksSent) chunks/\(s.audioBytesSent / 1024)KB"
+        if s.chunksQueuedPreOpen > 0 { line += " (\(s.chunksQueuedPreOpen) queued pre-open)" }
+        if s.sendFailures > 0 { line += " (\(s.sendFailures) SEND FAILURES)" }
+        line += "; recv source \(s.sourceDeltas)Δ/\(s.sourceChars)ch"
+        line += ", translation \(s.translationDeltas)Δ/\(s.translationChars)ch"
+        line += ", audio \(s.audioFrames) frames/\(s.audioBytes / 1024)KB"
+        line += ", \(s.heartbeatsDropped) heartbeats dropped"
+        Log.info("[\(label)] stats (\(context)): \(line)")
+        // ~10 s of sent audio is enough to expect both streams; call out the
+        // two symptom signatures explicitly.
+        guard s.audioChunksSent > 50 else { return }
+        if s.sourceDeltas == 0, s.translationDeltas + s.audioFrames > 0 {
+            Log.warn("[\(label)] translation flowing but NO source-transcript deltas — Chinese text will be missing; check session.updated ack / transcription config")
+        }
+        if s.audioFrames == 0, s.sourceDeltas > 0 {
+            Log.warn("[\(label)] source transcript flowing but NO translated audio frames — playback will be silent for this lane")
         }
     }
 
@@ -284,7 +410,11 @@ extension RealtimeTranslationClient: URLSessionWebSocketDelegate {
     func urlSession(_ session: URLSession,
                     webSocketTask: URLSessionWebSocketTask,
                     didOpenWithProtocol protocol: String?) {
-        Log.info("[\(label)] WS open")
+        let latency = connectStartedAt.map { String(format: " (%.1fs)", Date().timeIntervalSince($0)) } ?? ""
+        Log.info("[\(label)] WS open\(latency)")
+        statsLock.lock()
+        lastServerEventAt = Date()
+        statsLock.unlock()
         state = .open
         sendJSON(config.sessionUpdateEvent())
         flushPendingAudio()

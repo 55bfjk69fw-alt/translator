@@ -55,16 +55,21 @@ final class TranscriptStore: ObservableObject {
     /// Index of the open (partial) utterance per lane.
     private var openUtteranceIndex: [Int: Int] = [:]
 
+    private enum Stream: String {
+        case source, translation, audio
+    }
+
     func appendSourceDelta(lane: Int, text: String) {
-        withOpenUtterance(lane: lane) {
+        reopenRecentIfNeeded(lane: lane, stream: .source)
+        withOpenUtterance(lane: lane, stream: .source) {
             $0.sourceText += text
             $0.lastSourceActivity = Date()
         }
     }
 
     func appendTranslationDelta(lane: Int, text: String) {
-        reopenRecentIfNeeded(lane: lane)
-        withOpenUtterance(lane: lane) {
+        reopenRecentIfNeeded(lane: lane, stream: .translation)
+        withOpenUtterance(lane: lane, stream: .translation) {
             $0.translatedText += text
             $0.lastTranslationActivity = Date()
         }
@@ -72,8 +77,8 @@ final class TranscriptStore: ObservableObject {
 
     func appendTranslatedAudio(lane: Int, audio: Data, keepAudio: Bool) {
         guard keepAudio else { return }
-        reopenRecentIfNeeded(lane: lane)
-        withOpenUtterance(lane: lane) {
+        reopenRecentIfNeeded(lane: lane, stream: .audio)
+        withOpenUtterance(lane: lane, stream: .audio) {
             var existing = $0.translatedAudio ?? Data()
             existing.append(audio)
             $0.translatedAudio = existing
@@ -81,14 +86,25 @@ final class TranscriptStore: ObservableObject {
         }
     }
 
-    /// Translation output trails the source; if a translation delta arrives
-    /// just after its bubble was finalized, reattach it to that bubble
-    /// instead of opening an orphan bubble with no source text.
-    private func reopenRecentIfNeeded(lane: Int) {
+    /// The two server streams are not in lockstep: translation output trails
+    /// the source, and the source (whisper) transcript can arrive as a burst
+    /// AFTER the translation is done. If a late delta arrives just after its
+    /// bubble was finalized, reattach it to that bubble instead of opening an
+    /// orphan bubble carrying only half the content.
+    ///
+    /// A late SOURCE delta only reattaches to a bubble still missing its
+    /// source text — a finalized bubble that already has Chinese means new
+    /// speech started, which deserves a fresh bubble. (This is the fix for
+    /// English-only bubbles: the late Chinese burst used to open a sourceless
+    /// orphan instead of filling in the bubble the user is looking at.)
+    private func reopenRecentIfNeeded(lane: Int, stream: Stream) {
+        let window: TimeInterval = stream == .source ? 10 : 6
         guard openUtteranceIndex[lane] == nil,
               let lastIndex = utterances.lastIndex(where: { $0.laneID == lane }),
               utterances[lastIndex].isFinal,
-              Date().timeIntervalSince(utterances[lastIndex].lastActivity) < 6 else { return }
+              Date().timeIntervalSince(utterances[lastIndex].lastActivity) < window else { return }
+        if stream == .source, !utterances[lastIndex].sourceText.isEmpty { return }
+        Log.info("[transcript] lane \(lane): late \(stream.rawValue) delta reattached to finalized bubble")
         utterances[lastIndex].isFinal = false
         openUtteranceIndex[lane] = lastIndex
     }
@@ -120,6 +136,7 @@ final class TranscriptStore: ObservableObject {
                 utterances[index].isFinal = true
                 openUtteranceIndex[lane] = nil
                 finalizedAny = true
+                logFinalize(utterance, lane: lane, reason: sourceQuiet && translationQuiet && translationDrained ? "quiet" : "hard-cap")
             }
         }
         if finalizedAny { trim() }
@@ -130,11 +147,27 @@ final class TranscriptStore: ObservableObject {
         openUtteranceIndex.removeAll()
     }
 
-    private func withOpenUtterance(lane: Int, _ mutate: (inout Utterance) -> Void) {
+    /// One WARN per half-empty bubble: these lines are the direct evidence
+    /// for "Chinese characters missing" (translation, no source) and for the
+    /// server never sending translation for a segment (source, no output).
+    private func logFinalize(_ utterance: Utterance, lane: Int, reason: String) {
+        let source = utterance.sourceText.count
+        let translation = utterance.translatedText.count
+        if source == 0, translation > 0 {
+            Log.warn("[transcript] lane \(lane): finalized (\(reason)) with translation (\(translation)ch) but NO source text — Mandarin characters missing")
+        } else if source > 0, translation == 0, utterance.translatedAudio == nil {
+            Log.warn("[transcript] lane \(lane): finalized (\(reason)) with source (\(source)ch) but NO translation output")
+        } else {
+            Log.info("[transcript] lane \(lane): finalized (\(reason)) source=\(source)ch translation=\(translation)ch")
+        }
+    }
+
+    private func withOpenUtterance(lane: Int, stream: Stream, _ mutate: (inout Utterance) -> Void) {
         let index: Int
         if let existing = openUtteranceIndex[lane], utterances.indices.contains(existing), !utterances[existing].isFinal {
             index = existing
         } else {
+            Log.info("[transcript] lane \(lane): new bubble opened by \(stream.rawValue) stream")
             utterances.append(Utterance(
                 laneID: lane,
                 date: Date(),

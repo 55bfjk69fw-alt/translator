@@ -86,8 +86,13 @@ The app disables the screen-idle timer while a conversation is running.
   `Realtime/SessionConfig.swift` and the event aliases in
   `Realtime/RealtimeTranslationClient.swift` — both are built to be tweaked from
   logged evidence.
-- **Duplicate translations of one speaker** — mic bleed. Raise the voice threshold
-  in Settings, enable per-TX noise cancelling, spread speakers out.
+- **Duplicate translations of one speaker** — mic bleed getting past the gate.
+  The gate cross-correlates channels and keeps only the loudest copy of a shared
+  voice, so duplicates should be rare; if they persist, enable per-TX noise
+  cancelling (Basic/Strong) and check the gate is enabled in Settings.
+- **A quiet speaker gets cut off mid-sentence** — raise their TX gain (or move the
+  mic closer to their mouth) rather than lowering the minimum voice threshold; the
+  gate adapts to the room's noise floor automatically.
 
 ## Roadmap
 

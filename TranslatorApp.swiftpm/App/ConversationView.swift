@@ -184,6 +184,8 @@ private struct UtteranceBubble: View {
     let lane: SpeakerLane
     let playAction: (() -> Void)?
 
+    @AppStorage(AppSettings.showPinyinKey) private var showPinyin = true
+
     private var isUser: Bool { utterance.laneID == SpeakerLane.userLaneID }
 
     var body: some View {
@@ -212,11 +214,23 @@ private struct UtteranceBubble: View {
                 if !utterance.sourceText.isEmpty {
                     Text(utterance.sourceText)
                         .font(.body)
+                    if showPinyin, let pinyin = utterance.sourceText.pinyin {
+                        Text(pinyin)
+                            .font(.footnote.italic())
+                            .foregroundStyle(.teal)
+                            .textSelection(.enabled)
+                    }
                 }
                 if !utterance.translatedText.isEmpty {
                     Text(utterance.translatedText)
                         .font(.callout)
                         .foregroundStyle(.secondary)
+                    if showPinyin, let pinyin = utterance.translatedText.pinyin {
+                        Text(pinyin)
+                            .font(.footnote.italic())
+                            .foregroundStyle(.teal)
+                            .textSelection(.enabled)
+                    }
                 }
             }
             .padding(10)

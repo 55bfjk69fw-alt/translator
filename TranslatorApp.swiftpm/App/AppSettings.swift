@@ -10,6 +10,7 @@ enum AppSettings {
     static let vadThresholdKey = "vadThreshold"
     static let userNameKey = "userName"
     static let idleCloseSecondsKey = "idleCloseSeconds"
+    static let showPinyinKey = "showPinyin"
 
     static func speakerNameKey(_ channel: Int) -> String { "speakerName\(channel)" }
 

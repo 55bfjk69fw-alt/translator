@@ -17,6 +17,7 @@ struct SettingsView: View {
     @AppStorage(AppSettings.modelNameKey) private var modelName = ""
     @AppStorage(AppSettings.endpointTemplateKey) private var endpointTemplate = ""
     @AppStorage(AppSettings.idleCloseSecondsKey) private var idleCloseSeconds = 120.0
+    @AppStorage(AppSettings.showPinyinKey) private var showPinyin = true
 
     var body: some View {
         NavigationStack {
@@ -47,6 +48,14 @@ struct SettingsView: View {
                     Text("Push to talk")
                 } footer: {
                     Text("Off: your translated Chinese appears as text with a play button. On: it plays over the iPad speaker as soon as it arrives.")
+                }
+
+                Section {
+                    Toggle("Show pinyin under Chinese text", isOn: $showPinyin)
+                } header: {
+                    Text("Transcript")
+                } footer: {
+                    Text("Tone-marked pinyin generated on-device. Heteronyms (多音字) occasionally get the wrong reading.")
                 }
 
                 Section {

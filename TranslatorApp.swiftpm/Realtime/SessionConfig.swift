@@ -20,16 +20,22 @@ struct SessionConfig {
         URL(string: String(format: endpointTemplate, model))
     }
 
-    /// session.update payload sent right after the socket opens. Built as a
-    /// dictionary (not Codable) so unknown/renamed fields are easy to tweak
-    /// on-device if the server rejects the shape — check DiagnosticsView for
-    /// server `error` events.
+    /// session.update payload sent right after the socket opens, matching the
+    /// GA translation-session shape from OpenAI's realtime translation guide:
+    /// output language at session.audio.output.language, source transcription
+    /// at session.audio.input.transcription. near_field noise reduction suits
+    /// the DJI lav mics. Built as a dictionary (not Codable) so it stays easy
+    /// to tweak on-device from DiagnosticsView evidence.
     func sessionUpdateEvent() -> [String: Any] {
-        let session: [String: Any] = [
-            "type": "translation",
-            "output": ["language": outputLanguage],
-            "transcription": ["model": transcriptionModel]
+        let input: [String: Any] = [
+            "transcription": ["model": transcriptionModel],
+            "noise_reduction": ["type": "near_field"]
         ]
+        let audio: [String: Any] = [
+            "input": input,
+            "output": ["language": outputLanguage]
+        ]
+        let session: [String: Any] = ["audio": audio]
         return [
             "type": "session.update",
             "session": session

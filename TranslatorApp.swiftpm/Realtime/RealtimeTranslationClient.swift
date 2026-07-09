@@ -64,7 +64,9 @@ final class RealtimeTranslationClient: NSObject {
         var request = URLRequest(url: url)
         request.timeoutInterval = 15
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.setValue("realtime=v1", forHTTPHeaderField: "OpenAI-Beta")
+        // Do NOT send "OpenAI-Beta: realtime=v1": it marks the connection as
+        // the retired beta protocol and the server rejects it with
+        // beta_api_shape_disabled (beta shut down 2026-05-12).
 
         // URLSession retains its delegate until invalidated; reconnects must
         // release the previous session or every retry leaks one.

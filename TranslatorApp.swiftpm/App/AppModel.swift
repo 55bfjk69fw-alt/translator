@@ -51,6 +51,7 @@ final class AppModel: ObservableObject {
     private var clients: [Int: RealtimeTranslationClient] = [:]
     private var resamplers: [Int: StreamResampler] = [:]
     private var reconnectAttempts: [Int: Int] = [:]
+    private var sessionOpenedAt: [Int: Date] = [:]
 
     /// Playback lanes on the engine: 0..3 = translated English per speaker,
     /// 4 = the user's translated Chinese.
@@ -143,6 +144,7 @@ final class AppModel: ObservableObject {
             resamplers.removeAll()
         }
         reconnectAttempts.removeAll()
+        sessionOpenedAt.removeAll()
         resetPlaybackState()
         UIApplication.shared.isIdleTimerDisabled = false
         refreshCost()
@@ -272,9 +274,16 @@ final class AppModel: ObservableObject {
                 switch state {
                 case .open:
                     if previous != .open { self.costMeter.sessionOpened() }
-                    self.reconnectAttempts[lane] = 0
+                    self.sessionOpenedAt[lane] = Date()
                 case .closed:
                     if previous == .open { self.costMeter.sessionClosed() }
+                    // Only a session that survived a while proves the config
+                    // works; resetting the attempt counter on every open let
+                    // an open-then-instant-reject loop retry forever.
+                    if let openedAt = self.sessionOpenedAt.removeValue(forKey: lane),
+                       Date().timeIntervalSince(openedAt) >= 5 {
+                        self.reconnectAttempts[lane] = 0
+                    }
                     self.scheduleReconnectIfNeeded(lane: lane)
                 default:
                     break

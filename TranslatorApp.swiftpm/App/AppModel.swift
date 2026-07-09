@@ -334,14 +334,8 @@ final class AppModel: ObservableObject {
         client.onSourceTranscriptDelta = { [weak self] delta in
             DispatchQueue.main.async { self?.transcript.appendSourceDelta(lane: lane, text: delta) }
         }
-        client.onSourceTranscriptDone = { [weak self] full in
-            DispatchQueue.main.async { self?.transcript.setFinalSourceText(lane: lane, text: full) }
-        }
         client.onTranslatedTranscriptDelta = { [weak self] delta in
             DispatchQueue.main.async { self?.transcript.appendTranslationDelta(lane: lane, text: delta) }
-        }
-        client.onTranslatedTranscriptDone = { [weak self] full in
-            DispatchQueue.main.async { self?.transcript.finalize(lane: lane, translatedText: full) }
         }
         client.onTranslatedAudio = { [weak self] audio in
             guard let self else { return }

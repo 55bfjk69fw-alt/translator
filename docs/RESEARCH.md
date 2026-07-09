@@ -83,9 +83,32 @@ Realtime API. Confidence noted where it matters.
   target language**; keep tracks separate; duck-don't-mute originals.
 - Transport: WebRTC (browsers/mobile recommended) or **WebSocket**
   (`wss://api.openai.com/v1/realtime/translations?model=…`) with
-  `Authorization: Bearer` — fine from a native app; audio is base64 **24 kHz mono
-  PCM16** via `input_audio_buffer.append`. WebSocket chosen because the libWebRTC
-  binary can't build in Swift Playgrounds.
+  `Authorization: Bearer` — fine from a native app. WebSocket chosen because the
+  libWebRTC binary can't build in Swift Playgrounds.
+- **Verified wire protocol (July 2026, from the API reference — implemented
+  exactly in `Realtime/RealtimeTranslationClient.swift`):**
+  - Do NOT send `OpenAI-Beta: realtime=v1` (beta shut down 2026-05-12;
+    rejected with `beta_api_shape_disabled`).
+  - Client events (exactly 3): `session.update`,
+    `session.input_audio_buffer.append` (base64 in `audio`), `session.close`.
+  - Server events (exactly 7): `error`, `session.created`, `session.updated`,
+    `session.closed`, `session.input_transcript.delta`,
+    `session.output_transcript.delta`, `session.output_audio.delta` — all
+    payloads in `delta`. **No done/completed events, no segment boundaries,
+    no item ids**; utterance segmentation must be client-side (quiet timeout).
+  - `session.update` surface: only `audio.output.language`,
+    `audio.input.transcription.model`, `audio.input.noise_reduction.type`
+    (`near_field`/`far_field`/null). No prompts, voice, formats, VAD.
+  - Audio format fixed both directions: 24 kHz PCM16 mono LE (not
+    configurable). Output arrives as 200 ms frames; append input in 200 ms
+    chunks for best behavior. Stream continuously including silence — a send
+    gap is treated as contiguous audio, not a pause.
+  - Graceful shutdown: send `session.close`, stop appending, keep reading
+    until `session.closed` (server flushes remaining output), then drop the
+    socket. Closing immediately loses draining output.
+  - Language codes: ISO-639-1 (`"zh"`, `"en"`). Billing: duration-based
+    $0.034/min ("realtime audio duration"; streamed-vs-connected not
+    disambiguated — since silence must be streamed, they converge).
 - Reported end-to-end: ~300–800 ms speech → translated audio.
 - Pricing: **$0.034/min per session** → 5 sessions ≈ **$10.20/hr ceiling**
   (billing basis wall-clock vs active speech unconfirmed — the app meters it).

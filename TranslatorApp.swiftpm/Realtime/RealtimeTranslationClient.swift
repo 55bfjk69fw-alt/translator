@@ -45,11 +45,13 @@ final class RealtimeTranslationClient: NSObject {
     }
 
     // Callbacks fire on an arbitrary queue; consumers hop to main as needed.
+    // Note: translation sessions emit NO done/completed transcript events and
+    // no segment boundaries — deltas are append-only, ordered, correlated
+    // only by elapsed_ms. Utterance segmentation is the consumer's job
+    // (quiet-timeout in TranscriptStore).
     var onStateChange: ((State) -> Void)?
     var onSourceTranscriptDelta: ((String) -> Void)?
-    var onSourceTranscriptDone: ((String?) -> Void)?
     var onTranslatedTranscriptDelta: ((String) -> Void)?
-    var onTranslatedTranscriptDone: ((String?) -> Void)?
     /// 24 kHz mono PCM16 little-endian audio of the translated speech.
     var onTranslatedAudio: ((Data) -> Void)?
 
@@ -91,17 +93,35 @@ final class RealtimeTranslationClient: NSObject {
         receiveLoop()
     }
 
+    /// Graceful shutdown: session.close asks the server to flush pending
+    /// input and emit remaining translated output; we keep reading until the
+    /// session.closed ack (bounded by a timeout) — dropping the socket
+    /// immediately loses output still draining from the session.
     func close() {
+        guard !intentionallyClosed else { return }
         intentionallyClosed = true
         stopPing()
         if state == .open {
             sendJSON(["type": "session.close"])
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                self?.forceClose()
+            }
+        } else {
+            forceClose()
         }
-        task?.cancel(with: .normalClosure, reason: nil)
-        task = nil
-        urlSession?.invalidateAndCancel()
-        urlSession = nil
-        if state != .idle { state = .closed(nil) }
+    }
+
+    private func forceClose() {
+        // Serialized on main: reachable from the receive thread
+        // (session.closed), the drain-timeout timer, and close() callers.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.task?.cancel(with: .normalClosure, reason: nil)
+            self.task = nil
+            self.urlSession?.invalidateAndCancel()
+            self.urlSession = nil
+            if self.state != .idle { self.state = .closed(nil) }
+        }
     }
 
     private var stateIsClosed: Bool {
@@ -116,9 +136,11 @@ final class RealtimeTranslationClient: NSObject {
     /// session.input_audio_buffer.append, session.close — note the
     /// "session." prefix on all client events.
     func sendAudio(_ pcm16: Data) {
+        // Appending after session.close is a protocol violation.
+        guard !intentionallyClosed else { return }
         if state == .open {
             sendAppendEvent(pcm16)
-        } else if !intentionallyClosed {
+        } else {
             pendingLock.lock()
             pendingAudio.append(pcm16)
             pendingBytes += pcm16.count
@@ -184,40 +206,10 @@ final class RealtimeTranslationClient: NSObject {
         }
     }
 
-    // Event-type aliases: first-match wins. Covers both the documented
-    // translation-session names (session.*_transcript.*) and the older
-    // conversation/response names in case the server uses those.
-    private static let sourceDeltaTypes: Set<String> = [
-        "session.input_transcript.delta",
-        "input_transcript.delta",
-        "conversation.item.input_audio_transcription.delta"
-    ]
-    private static let sourceDoneTypes: Set<String> = [
-        "session.input_transcript.done",
-        "session.input_transcript.completed",
-        "input_transcript.done",
-        "conversation.item.input_audio_transcription.completed"
-    ]
-    private static let translatedDeltaTypes: Set<String> = [
-        "session.output_transcript.delta",
-        "output_transcript.delta",
-        "response.output_audio_transcript.delta",
-        "response.audio_transcript.delta"
-    ]
-    private static let translatedDoneTypes: Set<String> = [
-        "session.output_transcript.done",
-        "session.output_transcript.completed",
-        "output_transcript.done",
-        "response.output_audio_transcript.done",
-        "response.audio_transcript.done"
-    ]
-    private static let audioDeltaTypes: Set<String> = [
-        "session.output_audio.delta",
-        "output_audio.delta",
-        "response.output_audio.delta",
-        "response.audio.delta"
-    ]
-
+    // Translation sessions emit exactly seven server events (per the API
+    // reference): error, session.created, session.updated, session.closed,
+    // session.input_transcript.delta, session.output_transcript.delta,
+    // session.output_audio.delta. Text/audio payloads are all in "delta".
     private func handleEventText(_ text: String) {
         guard let data = text.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -230,48 +222,29 @@ final class RealtimeTranslationClient: NSObject {
             Log.info("[\(label)] first \(type)")
         }
 
-        if Self.audioDeltaTypes.contains(type) {
-            if let base64 = (object["delta"] as? String) ?? (object["audio"] as? String),
+        switch type {
+        case "session.output_audio.delta":
+            if let base64 = object["delta"] as? String,
                let audio = Data(base64Encoded: base64) {
                 onTranslatedAudio?(audio)
             }
-            return
-        }
-        if Self.sourceDeltaTypes.contains(type) {
-            if let delta = Self.textPayload(of: object) { onSourceTranscriptDelta?(delta) }
-            return
-        }
-        if Self.sourceDoneTypes.contains(type) {
-            onSourceTranscriptDone?(Self.textPayload(of: object))
-            return
-        }
-        if Self.translatedDeltaTypes.contains(type) {
-            if let delta = Self.textPayload(of: object) { onTranslatedTranscriptDelta?(delta) }
-            return
-        }
-        if Self.translatedDoneTypes.contains(type) {
-            onTranslatedTranscriptDone?(Self.textPayload(of: object))
-            return
-        }
-
-        switch type {
+        case "session.input_transcript.delta":
+            if let delta = object["delta"] as? String { onSourceTranscriptDelta?(delta) }
+        case "session.output_transcript.delta":
+            if let delta = object["delta"] as? String { onTranslatedTranscriptDelta?(delta) }
         case "session.created", "session.updated":
             Log.info("[\(label)] \(type)")
+        case "session.closed":
+            // Server finished draining after our session.close — safe to
+            // drop the socket now instead of waiting out the timeout.
+            Log.info("[\(label)] session.closed (output drained)")
+            forceClose()
         case "error":
-            // Log the complete error payload — this is the primary evidence
-            // for correcting the session.update shape or endpoint.
+            // Full payload: this is the primary evidence for protocol fixes.
             Log.error("[\(label)] Server error: \(text.prefix(2000))")
         default:
-            // Unknown event: log the full payload so the alias tables above
-            // can be extended from real evidence.
             Log.info("[\(label)] Unhandled event \(type): \(text.prefix(2000))")
         }
-    }
-
-    private static func textPayload(of object: [String: Any]) -> String? {
-        (object["delta"] as? String)
-            ?? (object["text"] as? String)
-            ?? (object["transcript"] as? String)
     }
 
     // MARK: - Keepalive

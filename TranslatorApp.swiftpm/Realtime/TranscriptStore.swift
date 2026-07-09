@@ -68,27 +68,12 @@ final class TranscriptStore: ObservableObject {
         }
     }
 
-    /// Source transcript finished for the current segment. Does NOT close the
-    /// utterance — the translation usually finishes streaming after the
-    /// source does; closing here would split every utterance in two.
-    func setFinalSourceText(lane: Int, text: String?) {
-        guard let index = openUtteranceIndex[lane], utterances.indices.contains(index) else { return }
-        if let text, !text.isEmpty { utterances[index].sourceText = text }
-        utterances[index].lastActivity = Date()
-    }
-
-    /// Translation finished: close the utterance.
-    func finalize(lane: Int, translatedText: String? = nil) {
-        guard let index = openUtteranceIndex[lane], utterances.indices.contains(index) else { return }
-        if let translatedText, !translatedText.isEmpty { utterances[index].translatedText = translatedText }
-        utterances[index].isFinal = true
-        openUtteranceIndex[lane] = nil
-        trim()
-    }
-
     /// Finalize any lane whose open utterance has been quiet for `timeout`.
+    /// This is the ONLY segmentation mechanism by design: translation
+    /// sessions emit append-only deltas with no done/boundary events.
     func finalizeStale(timeout: TimeInterval) {
         let now = Date()
+        var finalizedAny = false
         for (lane, index) in openUtteranceIndex {
             guard utterances.indices.contains(index) else {
                 openUtteranceIndex[lane] = nil
@@ -97,8 +82,10 @@ final class TranscriptStore: ObservableObject {
             if now.timeIntervalSince(utterances[index].lastActivity) > timeout {
                 utterances[index].isFinal = true
                 openUtteranceIndex[lane] = nil
+                finalizedAny = true
             }
         }
+        if finalizedAny { trim() }
     }
 
     func clear() {

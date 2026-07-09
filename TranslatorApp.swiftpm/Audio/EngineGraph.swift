@@ -49,9 +49,10 @@ final class EngineGraph {
             ])
         }
 
-        // 4800 frames @48k = 100 ms per callback; a good balance of latency
-        // and per-buffer overhead for streaming to the API.
-        input.installTap(onBus: 0, bufferSize: 4800, format: format) { [weak self] buffer, _ in
+        // 9600 frames @48k = 200 ms per callback, matching the translation
+        // engine's 200 ms frame size (OpenAI recommends appending in 200 ms
+        // chunks; shorter chunks are buffered server-side anyway).
+        input.installTap(onBus: 0, bufferSize: 9600, format: format) { [weak self] buffer, _ in
             self?.handleInput(buffer: buffer)
         }
 

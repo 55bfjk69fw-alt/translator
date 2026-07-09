@@ -24,6 +24,9 @@ final class RealtimeTranslationClient: NSObject {
     private var urlSession: URLSession?
     private var pingTimer: Timer?
     private var intentionallyClosed = false
+    /// Event types seen this connection; each is logged once so the log
+    /// records the actual server schema without flooding.
+    private var seenEventTypes: Set<String> = []
     private(set) var state: State = .idle {
         didSet {
             // A drop fires both the receive-failure path and didCloseWith;
@@ -59,6 +62,7 @@ final class RealtimeTranslationClient: NSObject {
             return
         }
         intentionallyClosed = false
+        seenEventTypes.removeAll()
         state = .connecting
 
         var request = URLRequest(url: url)
@@ -191,6 +195,10 @@ final class RealtimeTranslationClient: NSObject {
               let type = object["type"] as? String else {
             Log.warn("[\(label)] Unparseable WS message (\(text.prefix(500)))")
             return
+        }
+
+        if seenEventTypes.insert(type).inserted {
+            Log.info("[\(label)] first \(type)")
         }
 
         if Self.audioDeltaTypes.contains(type) {

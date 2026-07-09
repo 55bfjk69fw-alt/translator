@@ -17,7 +17,10 @@ final class ChannelGate {
     /// A channel must be within this factor of the loudest channel's RMS to
     /// pass (0.3 ~= within ~10 dB — lav-to-lav bleed is typically far lower).
     var dominanceRatio: Float = 0.3
-    var hangover: TimeInterval = 0.8
+    // Generous hangover: gating quiet sentence-endings to silence feeds the
+    // model chopped audio and directly degrades translation quality. The
+    // cost is a longer bleed-exposure window after each utterance.
+    var hangover: TimeInterval = 1.5
     var enabled = true
 
     private var lastVoiced: [Int: Date] = [:]

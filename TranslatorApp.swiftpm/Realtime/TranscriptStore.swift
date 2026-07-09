@@ -41,6 +41,10 @@ final class TranscriptStore: ObservableObject {
         /// ZH utterances so they can be replayed over the speaker).
         var translatedAudio: Data?
         var lastActivity: Date
+        // The translation stream trails the source stream by 1-2 s, so the
+        // two are tracked independently for segmentation.
+        var lastSourceActivity: Date?
+        var lastTranslationActivity: Date?
     }
 
     @Published private(set) var utterances: [Utterance] = []
@@ -52,25 +56,53 @@ final class TranscriptStore: ObservableObject {
     private var openUtteranceIndex: [Int: Int] = [:]
 
     func appendSourceDelta(lane: Int, text: String) {
-        withOpenUtterance(lane: lane) { $0.sourceText += text }
+        withOpenUtterance(lane: lane) {
+            $0.sourceText += text
+            $0.lastSourceActivity = Date()
+        }
     }
 
     func appendTranslationDelta(lane: Int, text: String) {
-        withOpenUtterance(lane: lane) { $0.translatedText += text }
+        reopenRecentIfNeeded(lane: lane)
+        withOpenUtterance(lane: lane) {
+            $0.translatedText += text
+            $0.lastTranslationActivity = Date()
+        }
     }
 
     func appendTranslatedAudio(lane: Int, audio: Data, keepAudio: Bool) {
         guard keepAudio else { return }
+        reopenRecentIfNeeded(lane: lane)
         withOpenUtterance(lane: lane) {
             var existing = $0.translatedAudio ?? Data()
             existing.append(audio)
             $0.translatedAudio = existing
+            $0.lastTranslationActivity = Date()
         }
     }
 
-    /// Finalize any lane whose open utterance has been quiet for `timeout`.
-    /// This is the ONLY segmentation mechanism by design: translation
-    /// sessions emit append-only deltas with no done/boundary events.
+    /// Translation output trails the source; if a translation delta arrives
+    /// just after its bubble was finalized, reattach it to that bubble
+    /// instead of opening an orphan bubble with no source text.
+    private func reopenRecentIfNeeded(lane: Int) {
+        guard openUtteranceIndex[lane] == nil,
+              let lastIndex = utterances.lastIndex(where: { $0.laneID == lane }),
+              utterances[lastIndex].isFinal,
+              Date().timeIntervalSince(utterances[lastIndex].lastActivity) < 6 else { return }
+        utterances[lastIndex].isFinal = false
+        openUtteranceIndex[lane] = lastIndex
+    }
+
+    /// Finalize any lane whose open utterance has gone quiet. This is the
+    /// ONLY segmentation mechanism by design: translation sessions emit
+    /// append-only deltas with no done/boundary events.
+    ///
+    /// Source and translation streams are judged independently — the
+    /// translation trails by 1-2 s, and finalizing on overall inactivity
+    /// truncated translations mid-sentence and spilled the remainder into
+    /// sourceless bubbles. A bubble closes only when BOTH streams are quiet
+    /// and a translation has arrived, or after a hard cap (some segments
+    /// never get transcript deltas).
     func finalizeStale(timeout: TimeInterval) {
         let now = Date()
         var finalizedAny = false
@@ -79,7 +111,12 @@ final class TranscriptStore: ObservableObject {
                 openUtteranceIndex[lane] = nil
                 continue
             }
-            if now.timeIntervalSince(utterances[index].lastActivity) > timeout {
+            let utterance = utterances[index]
+            let sourceQuiet = now.timeIntervalSince(utterance.lastSourceActivity ?? utterance.date) > timeout
+            let translationQuiet = now.timeIntervalSince(utterance.lastTranslationActivity ?? utterance.date) > timeout
+            let translationDrained = !utterance.translatedText.isEmpty || utterance.translatedAudio != nil
+            let hardCap = now.timeIntervalSince(utterance.lastActivity) > timeout * 3
+            if (sourceQuiet && translationQuiet && translationDrained) || hardCap {
                 utterances[index].isFinal = true
                 openUtteranceIndex[lane] = nil
                 finalizedAny = true
@@ -105,7 +142,9 @@ final class TranscriptStore: ObservableObject {
                 translatedText: "",
                 isFinal: false,
                 translatedAudio: nil,
-                lastActivity: Date()
+                lastActivity: Date(),
+                lastSourceActivity: nil,
+                lastTranslationActivity: nil
             ))
             index = utterances.count - 1
             openUtteranceIndex[lane] = index

@@ -158,6 +158,12 @@ final class RealtimeTranslationClient: NSObject {
         ])
     }
 
+    static func isPureSilence(_ pcm16: Data) -> Bool {
+        pcm16.withUnsafeBytes { raw in
+            !raw.bindMemory(to: Int16.self).contains { $0 != 0 }
+        }
+    }
+
     private func flushPendingAudio() {
         pendingLock.lock()
         let queued = pendingAudio
@@ -224,8 +230,13 @@ final class RealtimeTranslationClient: NSObject {
 
         switch type {
         case "session.output_audio.delta":
+            // The stream interleaves pure-zero heartbeat frames (~every
+            // 200 ms) with content frames. Filter by exact zero-amplitude —
+            // not RMS (clips quiet speech) and not frame length (observed to
+            // change server-side without notice).
             if let base64 = object["delta"] as? String,
-               let audio = Data(base64Encoded: base64) {
+               let audio = Data(base64Encoded: base64),
+               !Self.isPureSilence(audio) {
                 onTranslatedAudio?(audio)
             }
         case "session.input_transcript.delta":

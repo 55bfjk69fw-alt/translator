@@ -8,6 +8,7 @@ struct TranslatorApp: App {
         WindowGroup {
             ContentView()
                 .environmentObject(model)
+                .environmentObject(model.signalAnalyzer)
         }
     }
 }

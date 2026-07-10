@@ -35,6 +35,11 @@ final class AppModel: ObservableObject {
     let transcript: TranscriptStore
     let log = Log.shared
 
+    /// Signal-tab analysis. Deliberately its own ObservableObject (not
+    /// forwarded through objectWillChange) so its 5-10 Hz snapshot churn
+    /// only re-renders views that observe it directly.
+    let signalAnalyzer = SignalAnalyzer()
+
     // MARK: - Pipeline components
 
     let audioSession = AudioSessionController()
@@ -130,9 +135,7 @@ final class AppModel: ObservableObject {
         gateOpen = Array(repeating: false, count: channelCount)
 
         audioQueue.sync {
-            gate.enabled = AppSettings.noiseGateEnabled
-            gate.neuralVADEnabled = AppSettings.neuralVADEnabled
-            gate.minimumVoiceThreshold = AppSettings.vadThreshold
+            applyGateTuningLocked()
             gate.reset()
             pipelineActive = true
             sessionAPIKey = apiKey
@@ -144,6 +147,7 @@ final class AppModel: ObservableObject {
         // a disconnected/powered-off TX never opens a billed session.
         sessionStates = Dictionary(uniqueKeysWithValues: (0..<channelCount).map { ($0, RealtimeTranslationClient.State.idle) })
 
+        signalAnalyzer.startSession()
         installInputHandler()
         startUITimer()
         mode = .conversation
@@ -236,6 +240,10 @@ final class AppModel: ObservableObject {
         // toggle mutes/unmutes a mic mid-conversation.
         let enabledMask = (0..<channels.count).map { AppSettings.speakerEnabled($0) }
         let decisions = gate.evaluate(channels: channels, frames: frames, sampleRate: sampleRate, channelEnabled: enabledMask)
+        // Fan out to the Signal tab. When the tab is hidden this is a flag
+        // check and return; otherwise the buffers are retained (no copy)
+        // onto the analyzer's lower-priority queue.
+        signalAnalyzer.ingest(buffers: buffers, frames: frames, sampleRate: sampleRate, telemetry: gate.lastTelemetry)
         for (channel, decision) in decisions.enumerated() {
             // Log utterance-level transitions (the hangover smooths word
             // gaps) so missing translations can be correlated with whether
@@ -537,6 +545,38 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: - Gate tuning
+
+    private var gateTuningApplyScheduled = false
+
+    /// Apply the persisted gate tunables to the live gate. Coalesced on a
+    /// 100 ms trailing edge: the tuning sliders fire onChange dozens of
+    /// times per second during a drag, and the audio queue must not be
+    /// flooded with redundant re-apply blocks. Main thread.
+    func applyGateTuning() {
+        guard !gateTuningApplyScheduled else { return }
+        gateTuningApplyScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            guard let self else { return }
+            self.gateTuningApplyScheduled = false
+            self.audioQueue.async { self.applyGateTuningLocked() }
+        }
+    }
+
+    /// Must run on audioQueue (UserDefaults reads are thread-safe). Reads
+    /// through GateSettingsSnapshot so the gate, the Signal tab display,
+    /// and the export all share one roster of tunables.
+    private func applyGateTuningLocked() {
+        let tuning = GateSettingsSnapshot.current()
+        gate.enabled = tuning.enabled
+        gate.neuralVADEnabled = tuning.neuralVAD
+        gate.minimumVoiceThreshold = tuning.minimumVoiceThreshold
+        gate.snrFactor = tuning.snrFactor
+        gate.bleedCorrelation = tuning.bleedCorrelation
+        gate.takeoverMargin = tuning.takeoverMargin
+        gate.hangover = tuning.hangover
+    }
+
     // MARK: - Diagnostics support
 
     func refreshRoute() {
@@ -560,7 +600,14 @@ final class AppModel: ObservableObject {
         lanes = (0..<channelCount).map { SpeakerLane.djiLane(channel: $0, name: AppSettings.speakerName($0)) }
         meters = Array(repeating: 0, count: channelCount)
         gateOpen = Array(repeating: false, count: channelCount)
-        audioQueue.sync { gate.enabled = false }
+        // Run the gate with the real settings (it used to be disabled here)
+        // so the Signal tab shows genuine gate behavior without any API
+        // cost. Bench meters/gate dots now reflect gating too.
+        audioQueue.sync {
+            applyGateTuningLocked()
+            gate.reset()
+        }
+        signalAnalyzer.startSession()
         installInputHandler()
         // Bench mode has no clients; processConversationBuffers still runs
         // and drives the meters, sends go nowhere.

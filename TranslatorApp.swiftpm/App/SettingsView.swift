@@ -9,7 +9,7 @@ struct SettingsView: View {
     @AppStorage(AppSettings.autoPlayChineseKey) private var autoPlayChinese = false
     @AppStorage(AppSettings.noiseGateEnabledKey) private var noiseGateEnabled = true
     @AppStorage(AppSettings.neuralVADEnabledKey) private var neuralVADEnabled = true
-    @AppStorage(AppSettings.vadThresholdKey) private var vadThreshold = 0.004
+    @AppStorage(AppSettings.vadThresholdKey) private var vadThreshold = AppSettings.GateDefaults.vadThreshold
     @AppStorage(AppSettings.userNameKey) private var userName = ""
     @AppStorage("speakerName0") private var speakerName0 = ""
     @AppStorage("speakerName1") private var speakerName1 = ""

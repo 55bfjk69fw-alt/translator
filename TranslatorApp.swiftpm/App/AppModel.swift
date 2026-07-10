@@ -230,7 +230,10 @@ final class AppModel: ObservableObject {
             guard let data = buffer.floatChannelData else { return }
             channels.append(UnsafePointer(data[0]))
         }
-        let decisions = gate.evaluate(channels: channels, frames: frames, sampleRate: sampleRate)
+        // UserDefaults is thread-safe; reading per buffer means a Settings
+        // toggle mutes/unmutes a mic mid-conversation.
+        let enabledMask = (0..<channels.count).map { AppSettings.speakerEnabled($0) }
+        let decisions = gate.evaluate(channels: channels, frames: frames, sampleRate: sampleRate, channelEnabled: enabledMask)
         for (channel, decision) in decisions.enumerated() {
             // Log utterance-level transitions (the hangover smooths word
             // gaps) so missing translations can be correlated with whether
@@ -590,16 +593,23 @@ final class AppModel: ObservableObject {
 
     /// Close sessions whose channel has been silent past the idle timeout —
     /// they reopen automatically on the next detected speech. Stops billing
-    /// for quiet channels and for the PTT lane between uses.
+    /// for quiet channels and for the PTT lane between uses. Sessions on
+    /// mics disabled in Settings close immediately, timeout or not.
     private func closeIdleSessions() {
+        guard mode != .idle else { return }
         let timeout = AppSettings.idleCloseSeconds
-        guard timeout > 0, mode != .idle else { return }
         let now = Date()
         var closedLanes: [Int] = []
+        var disabledLanes: Set<Int> = []
         audioQueue.sync {
             for (lane, client) in clients {
                 if lane == SpeakerLane.userLaneID && pttEngaged { continue }
-                guard let last = lastVoiceAt[lane], now.timeIntervalSince(last) > timeout else { continue }
+                if lane >= 0 && !AppSettings.speakerEnabled(lane) {
+                    disabledLanes.insert(lane)
+                } else {
+                    guard timeout > 0, let last = lastVoiceAt[lane],
+                          now.timeIntervalSince(last) > timeout else { continue }
+                }
                 clients[lane] = nil
                 client.close()
                 closedLanes.append(lane)
@@ -608,7 +618,11 @@ final class AppModel: ObservableObject {
         for lane in closedLanes {
             sessionStates[lane] = .idle
             reconnectAttempts[lane] = 0
-            Log.info("Closed idle session for \(laneName(lane)) (silent \(Int(timeout))s) — reopens on speech")
+            if disabledLanes.contains(lane) {
+                Log.info("Closed session for \(laneName(lane)) — mic disabled in Settings")
+            } else {
+                Log.info("Closed idle session for \(laneName(lane)) (silent \(Int(timeout))s) — reopens on speech")
+            }
         }
     }
 

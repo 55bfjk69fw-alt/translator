@@ -148,6 +148,15 @@ private struct LaneStatusDot: View {
     let level: Float
     let open: Bool
     let state: RealtimeTranslationClient.State?
+    @AppStorage private var enabled: Bool
+
+    init(lane: SpeakerLane, level: Float, open: Bool, state: RealtimeTranslationClient.State?) {
+        self.lane = lane
+        self.level = level
+        self.open = open
+        self.state = state
+        _enabled = AppStorage(wrappedValue: true, AppSettings.speakerEnabledKey(lane.id))
+    }
 
     var body: some View {
         VStack(spacing: 2) {
@@ -155,14 +164,21 @@ private struct LaneStatusDot: View {
                 Circle()
                     .fill(lane.color.opacity(0.25))
                     .frame(width: 26, height: 26)
-                Circle()
-                    .fill(lane.color)
-                    .frame(width: CGFloat(8 + level * 18), height: CGFloat(8 + level * 18))
-                    .opacity(open ? 1 : 0.45)
+                if enabled {
+                    Circle()
+                        .fill(lane.color)
+                        .frame(width: CGFloat(8 + level * 18), height: CGFloat(8 + level * 18))
+                        .opacity(open ? 1 : 0.45)
+                } else {
+                    Image(systemName: "mic.slash.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
             }
             Text(lane.name)
                 .font(.caption2)
                 .lineLimit(1)
+                .opacity(enabled ? 1 : 0.4)
             Circle()
                 .fill(stateColor)
                 .frame(width: 6, height: 6)

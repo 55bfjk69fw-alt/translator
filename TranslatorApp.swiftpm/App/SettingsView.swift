@@ -14,6 +14,10 @@ struct SettingsView: View {
     @AppStorage("speakerName1") private var speakerName1 = ""
     @AppStorage("speakerName2") private var speakerName2 = ""
     @AppStorage("speakerName3") private var speakerName3 = ""
+    @AppStorage("speakerEnabled0") private var speakerEnabled0 = true
+    @AppStorage("speakerEnabled1") private var speakerEnabled1 = true
+    @AppStorage("speakerEnabled2") private var speakerEnabled2 = true
+    @AppStorage("speakerEnabled3") private var speakerEnabled3 = true
     @AppStorage(AppSettings.modelNameKey) private var modelName = ""
     @AppStorage(AppSettings.endpointTemplateKey) private var endpointTemplate = ""
     @AppStorage(AppSettings.idleCloseSecondsKey) private var idleCloseSeconds = 120.0
@@ -34,12 +38,16 @@ struct SettingsView: View {
                     .disabled(apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
 
-                Section("Speakers") {
-                    TextField("Speaker 1 (TX1)", text: $speakerName0)
-                    TextField("Speaker 2 (TX2)", text: $speakerName1)
-                    TextField("Speaker 3 (TX3)", text: $speakerName2)
-                    TextField("Speaker 4 (TX4)", text: $speakerName3)
+                Section {
+                    speakerRow("Speaker 1 (TX1)", name: $speakerName0, enabled: $speakerEnabled0)
+                    speakerRow("Speaker 2 (TX2)", name: $speakerName1, enabled: $speakerEnabled1)
+                    speakerRow("Speaker 3 (TX3)", name: $speakerName2, enabled: $speakerEnabled2)
+                    speakerRow("Speaker 4 (TX4)", name: $speakerName3, enabled: $speakerEnabled3)
                     TextField("Your name", text: $userName)
+                } header: {
+                    Text("Speakers")
+                } footer: {
+                    Text("Switch off any transmitter you aren't using: its channel is muted and never opens a translation session. Takes effect immediately, even mid-conversation.")
                 }
 
                 Section {
@@ -105,6 +113,15 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("Settings")
+        }
+    }
+
+    private func speakerRow(_ placeholder: String, name: Binding<String>, enabled: Binding<Bool>) -> some View {
+        HStack {
+            TextField(placeholder, text: name)
+                .opacity(enabled.wrappedValue ? 1 : 0.4)
+            Toggle(placeholder, isOn: enabled)
+                .labelsHidden()
         }
     }
 }

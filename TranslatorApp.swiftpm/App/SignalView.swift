@@ -209,7 +209,7 @@ struct SignalView: View {
                             proxy.scrollTo(last.id, anchor: .bottom)
                         }
                     }
-                    .onChange(of: model.transcript.utterances.count) { _ in
+                    .onChange(of: model.transcript.utterances.count) {
                         if let last = model.transcript.utterances.last {
                             withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
                         }
@@ -446,13 +446,13 @@ private struct GateTuningPanel: View {
             }
             .font(.callout)
         }
-        .onChange(of: gateEnabled) { _ in model.applyGateTuning() }
-        .onChange(of: neuralVAD) { _ in model.applyGateTuning() }
-        .onChange(of: vadThreshold) { _ in model.applyGateTuning() }
-        .onChange(of: snrFactor) { _ in model.applyGateTuning() }
-        .onChange(of: bleedCorrelation) { _ in model.applyGateTuning() }
-        .onChange(of: takeoverMargin) { _ in model.applyGateTuning() }
-        .onChange(of: hangover) { _ in model.applyGateTuning() }
+        .onChange(of: gateEnabled) { model.applyGateTuning() }
+        .onChange(of: neuralVAD) { model.applyGateTuning() }
+        .onChange(of: vadThreshold) { model.applyGateTuning() }
+        .onChange(of: snrFactor) { model.applyGateTuning() }
+        .onChange(of: bleedCorrelation) { model.applyGateTuning() }
+        .onChange(of: takeoverMargin) { model.applyGateTuning() }
+        .onChange(of: hangover) { model.applyGateTuning() }
     }
 
     private func slider(

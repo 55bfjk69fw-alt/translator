@@ -34,7 +34,7 @@ final class AudioSessionController {
     /// high-quality recording link avoids the HFP quality collapse; HFP is
     /// the automatic fallback.
     func configureForPushToTalk() throws {
-        var options: AVAudioSession.CategoryOptions = [.allowBluetooth, .allowBluetoothA2DP]
+        var options: AVAudioSession.CategoryOptions = [.allowBluetoothHFP, .allowBluetoothA2DP]
         if #available(iOS 26.0, *) {
             options.insert(.bluetoothHighQualityRecording)
         }

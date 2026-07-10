@@ -84,12 +84,27 @@ final class ChannelGate {
 
     /// Loaded once for the process; each channel gets its own model state.
     private static let vadWeights: SileroVAD.Weights? = {
-        let url = Bundle.main.url(forResource: "silero_vad_16k", withExtension: "svad")
-            ?? Bundle.module.url(forResource: "silero_vad_16k", withExtension: "svad")
-        guard let url, let data = try? Data(contentsOf: url),
+        guard let url = vadWeightsURL(),
+              let data = try? Data(contentsOf: url),
               let weights = SileroVAD.Weights(data: data) else { return nil }
         return weights
     }()
+
+    /// Swift Playgrounds' build of app playgrounds does not synthesize the
+    /// SwiftPM `Bundle.module` accessor, so look in the app bundle first and
+    /// then in any nested SwiftPM resource bundles.
+    private static func vadWeightsURL() -> URL? {
+        let name = "silero_vad_16k"
+        let ext = "svad"
+        if let url = Bundle.main.url(forResource: name, withExtension: ext) { return url }
+        for bundleURL in Bundle.main.urls(forResourcesWithExtension: "bundle", subdirectory: nil) ?? [] {
+            if let nested = Bundle(url: bundleURL),
+               let url = nested.url(forResource: name, withExtension: ext) {
+                return url
+            }
+        }
+        return nil
+    }
 
     private var vads: [StreamingVAD] = []
     /// Per-channel hysteresis: currently above the on threshold.

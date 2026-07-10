@@ -88,7 +88,7 @@ struct SettingsView: View {
                                 .foregroundStyle(.secondary)
                         }
                     }
-                    .onChange(of: outputGain) { newValue in
+                    .onChange(of: outputGain) { _, newValue in
                         model.setOutputGain(Float(newValue))
                     }
                 } header: {

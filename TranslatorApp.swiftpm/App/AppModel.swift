@@ -652,6 +652,33 @@ final class AppModel: ObservableObject {
         ) { [weak self] notification in
             self?.handleInterruption(notification)
         }
+        NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.refreshSpeakerNames()
+        }
+    }
+
+    /// Lanes are built at Start, so without this a speaker renamed in
+    /// Settings kept the old name in the conversation until a restart.
+    /// Fires on every defaults write; the equality checks make writes to
+    /// unrelated keys (sliders, toggles) no-ops.
+    private var lastUserName = AppSettings.userName
+
+    private func refreshSpeakerNames() {
+        if AppSettings.userName != lastUserName {
+            lastUserName = AppSettings.userName
+            // The user lane is derived from AppSettings at render time
+            // (`lane(for:)`), so a re-render is all it needs.
+            objectWillChange.send()
+        }
+        guard !lanes.isEmpty else { return }
+        let updated = lanes.map { SpeakerLane.djiLane(channel: $0.id, name: AppSettings.speakerName($0.id)) }
+        if updated.map(\.name) != lanes.map(\.name) {
+            lanes = updated
+        }
     }
 
     private func handleRouteChange(_ notification: Notification) {

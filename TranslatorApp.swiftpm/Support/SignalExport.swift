@@ -39,6 +39,8 @@ enum SignalExport {
         var rms: Float
         var floor: Float
         var thr: Float
+        /// Silero speech probability; absent when the neural VAD wasn't used.
+        var vad: Float?
         var voiced: Bool
         var pass: Bool
         var bleed: Bool
@@ -91,7 +93,7 @@ enum SignalExport {
                 ),
                 gateTimeline: gate.map {
                     TimelinePoint(t: $0.t, rms: $0.rms, floor: $0.noiseFloor, thr: $0.threshold,
-                                  voiced: $0.voiced, pass: $0.pass, bleed: $0.bleed)
+                                  vad: $0.vadProbability, voiced: $0.voiced, pass: $0.pass, bleed: $0.bleed)
                 },
                 waveEnvelope: Envelope(
                     binSeconds: SignalAnalyzer.waveformBinSeconds,

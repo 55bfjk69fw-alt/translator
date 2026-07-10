@@ -206,6 +206,7 @@ final class SignalAnalyzer: ObservableObject {
                 rms: tele.rms,
                 noiseFloor: tele.noiseFloor,
                 threshold: tele.effectiveThreshold,
+                vadProbability: tele.vadProbability,
                 voiced: tele.voiced,
                 pass: tele.pass,
                 bleed: tele.bleed
@@ -423,6 +424,8 @@ struct GatePoint {
     var rms: Float
     var noiseFloor: Float
     var threshold: Float
+    /// Silero speech probability (nil when the neural VAD wasn't used).
+    var vadProbability: Float?
     var voiced: Bool
     var pass: Bool
     var bleed: Bool
@@ -455,6 +458,7 @@ struct PairEvent {
 /// of truth; AppModel applies the same values to the live gate).
 struct GateSettingsSnapshot: Codable {
     var enabled: Bool
+    var neuralVAD: Bool
     var minimumVoiceThreshold: Float
     var snrFactor: Float
     var bleedCorrelation: Float
@@ -464,6 +468,7 @@ struct GateSettingsSnapshot: Codable {
     static func current() -> GateSettingsSnapshot {
         GateSettingsSnapshot(
             enabled: AppSettings.noiseGateEnabled,
+            neuralVAD: AppSettings.neuralVADEnabled,
             minimumVoiceThreshold: AppSettings.vadThreshold,
             snrFactor: AppSettings.snrFactor,
             bleedCorrelation: AppSettings.bleedCorrelation,

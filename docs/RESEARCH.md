@@ -131,5 +131,6 @@ Realtime API. Confidence noted where it matters.
 | One session per DJI channel | OpenAI cookbook pattern; per-speaker transcripts |
 | AirPods = output only; push-to-talk switches input | iPadOS single-input rule |
 | Gate replaces bleed with silence (not dropped) | Continuous-audio expectation of translation sessions |
+| Voicing via pure-Swift Silero VAD port, not an energy threshold | Energy gates false-open on lav rustle (phantom paid sessions, hallucinated lines) and miss quiet speakers in loud rooms; no binary frameworks in Playgrounds rules out ONNX Runtime, and a Core ML conversion can't be built or debugged iPad-only, so the 16 kHz graph (~310k params, MIT) is reimplemented in Swift and verified to ~1e-6 against onnxruntime (`tools/silero/`) |
 | Bench test screen first | Q-mode-on-iPad is DJI-certified but community-unverified |
 | Foreground-only, idle timer disabled | No background-audio entitlement in Playgrounds |

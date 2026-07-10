@@ -20,6 +20,10 @@ struct GateTimelineView: View {
         Canvas { context, size in
             let window = SignalAnalyzer.gateWindowSeconds
             let start = elapsed - window
+            // The bottom strip shows Silero speech probability as intensity;
+            // the dB plot lives above it.
+            let stripHeight: CGFloat = 8
+            let plotHeight = size.height - stripHeight - 2
 
             func x(_ t: TimeInterval) -> CGFloat {
                 CGFloat((t - start) / window) * size.width
@@ -27,12 +31,12 @@ struct GateTimelineView: View {
             func y(_ value: Float) -> CGFloat {
                 let db = 20 * log10(Double(max(1e-5, value)))
                 let clamped = min(0, max(Self.floorDB, db))
-                return size.height * CGFloat(1 - (clamped - Self.floorDB) / -Self.floorDB)
+                return plotHeight * CGFloat(1 - (clamped - Self.floorDB) / -Self.floorDB)
             }
 
             // dB gridlines every 20 dB, recessive.
             for db in stride(from: Self.floorDB + 20, through: -20, by: 20) {
-                let gy = size.height * CGFloat(1 - (db - Self.floorDB) / -Self.floorDB)
+                let gy = plotHeight * CGFloat(1 - (db - Self.floorDB) / -Self.floorDB)
                 var grid = Path()
                 grid.move(to: CGPoint(x: 0, y: gy))
                 grid.addLine(to: CGPoint(x: size.width, y: gy))
@@ -44,7 +48,7 @@ struct GateTimelineView: View {
                 let x0 = max(0, x(point.t - Self.bufferSeconds))
                 if point.pass {
                     context.fill(
-                        Path(CGRect(x: x0, y: 0, width: x1 - x0, height: size.height)),
+                        Path(CGRect(x: x0, y: 0, width: x1 - x0, height: plotHeight)),
                         with: .color(.green.opacity(0.13))
                     )
                 }
@@ -56,6 +60,12 @@ struct GateTimelineView: View {
                     triangle.addLine(to: CGPoint(x: cx, y: 10))
                     triangle.closeSubpath()
                     context.fill(triangle, with: .color(.red))
+                }
+                if let probability = point.vadProbability {
+                    context.fill(
+                        Path(CGRect(x: x0, y: plotHeight + 2, width: x1 - x0, height: stripHeight)),
+                        with: .color(.indigo.opacity(Double(max(0, min(1, probability)))))
+                    )
                 }
             }
 

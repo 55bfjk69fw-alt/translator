@@ -283,7 +283,7 @@ final class AppModel: ObservableObject {
     private func lazyOpenSession(channel: Int, speech: Bool) -> RealtimeTranslationClient? {
         guard speech, pipelineActive, let apiKey = sessionAPIKey else { return nil }
         Log.info("Speech on channel \(channel) — opening translation session")
-        let client = makeClient(lane: channel, outputLanguage: "en", apiKey: apiKey)
+        let client = makeClient(lane: channel, outputLanguage: AppSettings.outputLanguage, apiKey: apiKey)
         clients[channel] = client
         client.connect()
         return client
@@ -323,7 +323,8 @@ final class AppModel: ObservableObject {
     private func makeClient(lane: Int, outputLanguage: String, apiKey: String) -> RealtimeTranslationClient {
         var config = SessionConfig(outputLanguage: outputLanguage)
         config.model = AppSettings.modelName
-        let label = lane == SpeakerLane.userLaneID ? "me→zh" : "ch\(lane)→\(outputLanguage)"
+        config.noiseReduction = AppSettings.noiseReduction
+        let label = lane == SpeakerLane.userLaneID ? "me→\(outputLanguage)" : "ch\(lane)→\(outputLanguage)"
         let client = RealtimeTranslationClient(
             label: label,
             config: config,
@@ -477,7 +478,7 @@ final class AppModel: ObservableObject {
                 self.resamplers[SpeakerLane.userLaneID] = StreamResampler(inputSampleRate: rate)
             }
             if self.audioQueue.sync(execute: { self.clients[SpeakerLane.userLaneID] }) == nil {
-                self.openClient(lane: SpeakerLane.userLaneID, outputLanguage: "zh", apiKey: apiKey)
+                self.openClient(lane: SpeakerLane.userLaneID, outputLanguage: AppSettings.pttOutputLanguage, apiKey: apiKey)
             }
             self.refreshRoute()
         }
@@ -568,6 +569,7 @@ final class AppModel: ObservableObject {
     private func applyGateTuningLocked() {
         let tuning = GateSettingsSnapshot.current()
         gate.enabled = tuning.enabled
+        gate.neuralVADEnabled = tuning.neuralVAD
         gate.minimumVoiceThreshold = tuning.minimumVoiceThreshold
         gate.snrFactor = tuning.snrFactor
         gate.bleedCorrelation = tuning.bleedCorrelation
@@ -697,6 +699,33 @@ final class AppModel: ObservableObject {
             queue: .main
         ) { [weak self] notification in
             self?.handleInterruption(notification)
+        }
+        NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.refreshSpeakerNames()
+        }
+    }
+
+    /// Lanes are built at Start, so without this a speaker renamed in
+    /// Settings kept the old name in the conversation until a restart.
+    /// Fires on every defaults write; the equality checks make writes to
+    /// unrelated keys (sliders, toggles) no-ops.
+    private var lastUserName = AppSettings.userName
+
+    private func refreshSpeakerNames() {
+        if AppSettings.userName != lastUserName {
+            lastUserName = AppSettings.userName
+            // The user lane is derived from AppSettings at render time
+            // (`lane(for:)`), so a re-render is all it needs.
+            objectWillChange.send()
+        }
+        guard !lanes.isEmpty else { return }
+        let updated = lanes.map { SpeakerLane.djiLane(channel: $0.id, name: AppSettings.speakerName($0.id)) }
+        if updated.map(\.name) != lanes.map(\.name) {
+            lanes = updated
         }
     }
 

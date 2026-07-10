@@ -7,6 +7,7 @@ enum AppSettings {
     static let modelNameKey = "modelName"
     static let autoPlayChineseKey = "autoPlayChinese"
     static let noiseGateEnabledKey = "noiseGateEnabled"
+    static let neuralVADEnabledKey = "neuralVADEnabled"
     static let vadThresholdKey = "vadThreshold"
     static let snrFactorKey = "gateSnrFactor"
     static let bleedCorrelationKey = "gateBleedCorrelation"
@@ -16,6 +17,9 @@ enum AppSettings {
     static let idleCloseSecondsKey = "idleCloseSeconds"
     static let showPinyinKey = "showPinyin"
     static let outputGainKey = "outputGain"
+    static let outputLanguageKey = "outputLanguage"
+    static let pttOutputLanguageKey = "pttOutputLanguage"
+    static let noiseReductionKey = "noiseReduction"
 
     static func speakerNameKey(_ channel: Int) -> String { "speakerName\(channel)" }
     static func speakerEnabledKey(_ channel: Int) -> String { "speakerEnabled\(channel)" }
@@ -38,6 +42,14 @@ enum AppSettings {
         UserDefaults.standard.object(forKey: noiseGateEnabledKey) == nil
             ? true
             : UserDefaults.standard.bool(forKey: noiseGateEnabledKey)
+    }
+
+    /// Voicing via the on-device Silero VAD model instead of the adaptive
+    /// RMS threshold (the gate falls back to RMS when this is off).
+    static var neuralVADEnabled: Bool {
+        UserDefaults.standard.object(forKey: neuralVADEnabledKey) == nil
+            ? true
+            : UserDefaults.standard.bool(forKey: neuralVADEnabledKey)
     }
 
     /// Single source of truth for the gate-tunable defaults: the accessors
@@ -88,8 +100,8 @@ enum AppSettings {
     /// Remove all persisted gate tunables so the defaults apply again.
     static func resetGateTuning() {
         let defaults = UserDefaults.standard
-        for key in [noiseGateEnabledKey, vadThresholdKey, snrFactorKey,
-                    bleedCorrelationKey, takeoverMarginKey, gateHangoverKey] {
+        for key in [noiseGateEnabledKey, neuralVADEnabledKey, vadThresholdKey,
+                    snrFactorKey, bleedCorrelationKey, takeoverMarginKey, gateHangoverKey] {
             defaults.removeObject(forKey: key)
         }
     }
@@ -114,6 +126,28 @@ enum AppSettings {
         UserDefaults.standard.object(forKey: speakerEnabledKey(channel)) == nil
             ? true
             : UserDefaults.standard.bool(forKey: speakerEnabledKey(channel))
+    }
+
+    /// Target language for the DJI speaker lanes (what the table's speech is
+    /// translated into). ISO-639-1, one of the model's 13 output languages.
+    static var outputLanguage: String {
+        let value = UserDefaults.standard.string(forKey: outputLanguageKey) ?? ""
+        return value.isEmpty ? "en" : value
+    }
+
+    /// Target language for the push-to-talk return channel (what the user's
+    /// speech is translated into).
+    static var pttOutputLanguage: String {
+        let value = UserDefaults.standard.string(forKey: pttOutputLanguageKey) ?? ""
+        return value.isEmpty ? "zh" : value
+    }
+
+    /// Server-side noise reduction type ("near_field"/"far_field"), or nil
+    /// when the user turned it off (stored as "off").
+    static var noiseReduction: String? {
+        let value = UserDefaults.standard.string(forKey: noiseReductionKey) ?? ""
+        if value.isEmpty { return "near_field" }
+        return value == "off" ? nil : value
     }
 
     static func speakerName(_ channel: Int) -> String {

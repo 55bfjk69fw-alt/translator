@@ -144,6 +144,10 @@ struct SignalView: View {
                     .foregroundStyle(.red)
                 Text("bleed suppressed")
             }
+            HStack(spacing: 4) {
+                Rectangle().fill(.indigo.opacity(0.8)).frame(width: 14, height: 6)
+                Text("VAD speech probability (bottom strip)")
+            }
         }
         .font(.caption2)
         .foregroundStyle(.secondary)
@@ -387,6 +391,7 @@ private struct GateTuningPanel: View {
     @EnvironmentObject private var model: AppModel
 
     @AppStorage(AppSettings.noiseGateEnabledKey) private var gateEnabled = true
+    @AppStorage(AppSettings.neuralVADEnabledKey) private var neuralVAD = true
     @AppStorage(AppSettings.vadThresholdKey) private var vadThreshold = AppSettings.GateDefaults.vadThreshold
     @AppStorage(AppSettings.snrFactorKey) private var snrFactor = AppSettings.GateDefaults.snrFactor
     @AppStorage(AppSettings.bleedCorrelationKey) private var bleedCorrelation = AppSettings.GateDefaults.bleedCorrelation
@@ -396,6 +401,10 @@ private struct GateTuningPanel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Toggle("Noise gate + bleed rejection", isOn: $gateEnabled)
+            Toggle("Neural VAD voicing (Silero)", isOn: $neuralVAD)
+            Text("On: an on-device speech model scores each channel (bottom strip in the timeline); the SNR factor is unused. Off: voicing falls back to level vs. the tracked noise floor.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
             slider(
                 "Minimum voice threshold",
                 value: $vadThreshold,
@@ -438,6 +447,7 @@ private struct GateTuningPanel: View {
             .font(.callout)
         }
         .onChange(of: gateEnabled) { _ in model.applyGateTuning() }
+        .onChange(of: neuralVAD) { _ in model.applyGateTuning() }
         .onChange(of: vadThreshold) { _ in model.applyGateTuning() }
         .onChange(of: snrFactor) { _ in model.applyGateTuning() }
         .onChange(of: bleedCorrelation) { _ in model.applyGateTuning() }

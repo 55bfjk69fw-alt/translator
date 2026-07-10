@@ -175,12 +175,6 @@ final class AppModel: ObservableObject {
             clients.removeAll()
             resamplers.removeAll()
         }
-        // Cost bookkeeping happens here, not in onStateChange: the clients
-        // were just deregistered, so their async .closed events are dropped
-        // by the identity guard and would never decrement the meter.
-        for (_, state) in sessionStates where state == .open {
-            costMeter.sessionClosed()
-        }
         sessionStates.removeAll()
         reconnectAttempts.removeAll()
         sessionOpenedAt.removeAll()
@@ -368,15 +362,10 @@ final class AppModel: ObservableObject {
                 // lane (e.g. after an idle-close) so they can't clobber the
                 // lane's displayed state or trigger reconnects.
                 guard self.audioQueue.sync(execute: { self.clients[lane] === client }) else { return }
-                // Cost accounting keyed on the transition we observed, so a
-                // handshake that fails before opening never double-decrements.
-                let previous = self.sessionStates[lane]
                 switch state {
                 case .open:
-                    if previous != .open { self.costMeter.sessionOpened() }
                     self.sessionOpenedAt[lane] = Date()
                 case .closed:
-                    if previous == .open { self.costMeter.sessionClosed() }
                     // Only a session that survived a while proves the config
                     // works; resetting the attempt counter on every open let
                     // an open-then-instant-reject loop retry forever.
@@ -396,6 +385,13 @@ final class AppModel: ObservableObject {
         }
         client.onTranslatedTranscriptDelta = { [weak self] delta in
             DispatchQueue.main.async { self?.transcript.appendTranslationDelta(lane: lane, text: delta) }
+        }
+        // Deliberately NOT identity-guarded like the callbacks above: an
+        // idle-closed client is deregistered before its close() drain
+        // finishes, and the audio billed during that drain must still count.
+        // CostMeter is thread-safe, so no main hop either.
+        client.onBilledSeconds = { [weak self] seconds in
+            self?.costMeter.addBilledSeconds(seconds)
         }
         client.onTranslatedAudio = { [weak self] audio in
             guard let self else { return }
@@ -690,11 +686,6 @@ final class AppModel: ObservableObject {
             }
         }
         for lane in closedLanes {
-            // Decrement here, keyed on the state we last displayed: the
-            // client was deregistered before close(), so its async .closed
-            // event is dropped by the identity guard in onStateChange and
-            // would never balance the meter.
-            if sessionStates[lane] == .open { costMeter.sessionClosed() }
             sessionStates[lane] = .idle
             sessionOpenedAt[lane] = nil
             reconnectAttempts[lane] = 0

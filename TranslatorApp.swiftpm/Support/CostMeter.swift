@@ -1,47 +1,37 @@
 import Foundation
 
-/// Tracks connected session-minutes and estimates spend.
-/// gpt-realtime-translate is billed per minute of session audio; the exact
-/// billing basis (wall-clock vs active speech) is unconfirmed, so this meter
-/// assumes the conservative wall-clock interpretation.
+/// Accumulates billed audio seconds reported by the realtime clients and
+/// converts them to dollars.
+///
+/// gpt-realtime-translate bills $0.034 per minute of "realtime audio
+/// duration". Each client measures that directly as the max of two signals:
+/// the server's own session clock (`elapsed_ms` on delta events, including
+/// the ~200 ms heartbeat frames) and the duration of input audio actually
+/// appended (bytes at 24 kHz PCM16 mono). This replaces the old
+/// wall-clock-while-open estimate, which overcounted engine stalls (socket
+/// open, nothing streamed) and undercounted the pre-open queued-audio flush
+/// and the post-close server drain.
 final class CostMeter {
     static let dollarsPerSessionMinute = 0.034
 
-    private var openSessions = 0
-    private var accumulatedSeconds: Double = 0
-    private var lastTick: Date?
+    private var billedSeconds: Double = 0
     private let lock = NSLock()
 
-    func sessionOpened() {
+    /// Thread-safe; clients report increments from their socket queues.
+    func addBilledSeconds(_ seconds: Double) {
+        guard seconds > 0 else { return }
         lock.lock(); defer { lock.unlock() }
-        tickLocked()
-        openSessions += 1
-    }
-
-    func sessionClosed() {
-        lock.lock(); defer { lock.unlock() }
-        tickLocked()
-        openSessions = max(0, openSessions - 1)
+        billedSeconds += seconds
     }
 
     /// Total estimated dollars so far.
     var estimatedDollars: Double {
         lock.lock(); defer { lock.unlock() }
-        tickLocked()
-        return accumulatedSeconds / 60.0 * Self.dollarsPerSessionMinute
+        return billedSeconds / 60.0 * Self.dollarsPerSessionMinute
     }
 
     func reset() {
         lock.lock(); defer { lock.unlock() }
-        accumulatedSeconds = 0
-        lastTick = openSessions > 0 ? Date() : nil
-    }
-
-    private func tickLocked() {
-        let now = Date()
-        if let last = lastTick, openSessions > 0 {
-            accumulatedSeconds += now.timeIntervalSince(last) * Double(openSessions)
-        }
-        lastTick = now
+        billedSeconds = 0
     }
 }

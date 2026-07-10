@@ -89,6 +89,7 @@ final class AppModel: ObservableObject {
 
     init() {
         transcript = TranscriptStore()
+        engineGraph.outputGain = AppSettings.outputGain
         // Nested ObservableObject: forward its changes so views observing
         // AppModel re-render on transcript updates.
         transcript.objectWillChange
@@ -406,6 +407,11 @@ final class AppModel: ObservableObject {
     func lane(for laneID: Int) -> SpeakerLane {
         if laneID == SpeakerLane.userLaneID { return SpeakerLane.userLane(name: AppSettings.userName) }
         return lanes.first(where: { $0.id == laneID }) ?? SpeakerLane.djiLane(channel: max(0, laneID))
+    }
+
+    /// Live update from the Settings volume slider (main thread).
+    func setOutputGain(_ gain: Float) {
+        engineGraph.outputGain = gain
     }
 
     // MARK: - English playback with overlap ducking (main thread)

@@ -18,6 +18,7 @@ struct SettingsView: View {
     @AppStorage(AppSettings.endpointTemplateKey) private var endpointTemplate = ""
     @AppStorage(AppSettings.idleCloseSecondsKey) private var idleCloseSeconds = 120.0
     @AppStorage(AppSettings.showPinyinKey) private var showPinyin = true
+    @AppStorage(AppSettings.outputGainKey) private var outputGain = 1.0
 
     var body: some View {
         NavigationStack {
@@ -40,6 +41,27 @@ struct SettingsView: View {
                     TextField("Speaker 3 (TX3)", text: $speakerName2)
                     TextField("Speaker 4 (TX4)", text: $speakerName3)
                     TextField("Your name", text: $userName)
+                }
+
+                Section {
+                    VStack(alignment: .leading) {
+                        Text("Output volume: \(Int((outputGain * 100).rounded()))%")
+                            .font(.callout)
+                        HStack {
+                            Image(systemName: "speaker.wave.1")
+                                .foregroundStyle(.secondary)
+                            Slider(value: $outputGain, in: 0.25...2.0, step: 0.05)
+                            Image(systemName: "speaker.wave.3")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .onChange(of: outputGain) { newValue in
+                        model.setOutputGain(Float(newValue))
+                    }
+                } header: {
+                    Text("Playback")
+                } footer: {
+                    Text("Volume of translated audio, on top of the iPad's hardware volume. Above 100% is a digital boost for loud rooms — the very top of the range can distort. Takes effect immediately.")
                 }
 
                 Section {

@@ -54,6 +54,12 @@ final class RealtimeTranslationClient: NSObject {
     private struct Stats {
         var audioChunksSent = 0
         var audioBytesSent = 0
+        /// Bytes that actually carried signal. Gate-suppressed audio arrives
+        /// here as exact digital silence (the gate substitutes zero buffers),
+        /// so this split distinguishes "we streamed 60 s of audio" from "the
+        /// server heard 8 s of speech" — the difference is what makes a quiet
+        /// lane's empty transcript expected rather than a bug.
+        var speechBytesSent = 0
         var chunksQueuedPreOpen = 0
         var sendFailures = 0
         var sourceDeltas = 0
@@ -67,7 +73,44 @@ final class RealtimeTranslationClient: NSObject {
     private var stats = Stats()
     private var lastServerEventAt = Date()
     private var connectStartedAt: Date?
+    private var openedAt: Date?
     private var pingTicks = 0
+
+    /// What the server's session.updated ack said about source transcription.
+    /// This is the definitive evidence for "translated audio arrives but the
+    /// source-language (Chinese) text never does": if the ack doesn't echo an
+    /// input transcription config, the server is not transcribing the source
+    /// and no amount of waiting will produce that text.
+    enum TranscriptionAck: Equatable {
+        /// No session.updated ack seen yet this connection.
+        case notReceived
+        /// The ack echoed an input transcription config.
+        case confirmed(String)
+        /// The ack parsed but carried no input transcription config.
+        case absent
+        /// The ack arrived in a shape we couldn't parse; payload is in the log.
+        case unparseable
+
+        var summary: String {
+            switch self {
+            case .notReceived: return "no server ack yet"
+            case .confirmed(let model): return "confirmed (\(model))"
+            case .absent: return "absent from server ack"
+            case .unparseable: return "ack unparseable (see log)"
+            }
+        }
+    }
+    private var transcriptionAck: TranscriptionAck = .notReceived
+    /// When each server stream last produced content (heartbeats excluded).
+    private var lastSourceDeltaAt: Date?
+    private var lastTranslationDeltaAt: Date?
+    private var lastAudioFrameAt: Date?
+    /// Once-per-connection symptom flags so checkStreamSymptoms warns early
+    /// (first ping tick after enough speech) without repeating every 20 s.
+    private var warnedNothingReturned = false
+    private var warnedNoSourceText = false
+    private var warnedNoTranslatedAudio = false
+    private var warnedNoAck = false
 
     /// 24 kHz mono PCM16 → billed audio bytes per second, both directions.
     private static let billedBytesPerSecond = 48_000.0
@@ -112,6 +155,60 @@ final class RealtimeTranslationClient: NSObject {
     /// max(server elapsed_ms, input audio appended), so it keeps counting
     /// through the post-close drain and the pre-open queue flush.
     var onBilledSeconds: ((Double) -> Void)?
+
+    // MARK: - Live snapshot (any thread)
+
+    /// Everything the Diagnostics pipeline panel needs to say where the
+    /// gate → session → transcript chain is breaking for this lane.
+    struct Snapshot {
+        var state: State
+        /// Seconds since the socket reached .open (nil while not open).
+        var openForSeconds: TimeInterval?
+        /// Total audio streamed vs. the part that carried actual signal.
+        var audioSecondsSent: Double
+        var speechSecondsSent: Double
+        var chunksQueuedPreOpen: Int
+        var sendFailures: Int
+        var sourceDeltas: Int
+        var sourceChars: Int
+        var translationDeltas: Int
+        var translationChars: Int
+        var audioFrames: Int
+        var audioSecondsReceived: Double
+        var secondsSinceLastServerEvent: TimeInterval
+        /// nil = that stream has produced nothing this connection.
+        var secondsSinceLastSourceDelta: TimeInterval?
+        var secondsSinceLastTranslationDelta: TimeInterval?
+        var secondsSinceLastAudioFrame: TimeInterval?
+        var transcriptionAck: TranscriptionAck
+    }
+
+    /// Point-in-time copy of the connection's counters. Synchronous hop onto
+    /// the client queue; safe from main (the queue never blocks on main).
+    func snapshot() -> Snapshot {
+        queue.sync {
+            let now = Date()
+            return Snapshot(
+                state: state,
+                openForSeconds: state == .open ? openedAt.map { now.timeIntervalSince($0) } : nil,
+                audioSecondsSent: Double(stats.audioBytesSent) / Self.billedBytesPerSecond,
+                speechSecondsSent: Double(stats.speechBytesSent) / Self.billedBytesPerSecond,
+                chunksQueuedPreOpen: stats.chunksQueuedPreOpen,
+                sendFailures: stats.sendFailures,
+                sourceDeltas: stats.sourceDeltas,
+                sourceChars: stats.sourceChars,
+                translationDeltas: stats.translationDeltas,
+                translationChars: stats.translationChars,
+                audioFrames: stats.audioFrames,
+                audioSecondsReceived: Double(stats.audioBytes) / Self.billedBytesPerSecond,
+                secondsSinceLastServerEvent: now.timeIntervalSince(lastServerEventAt),
+                secondsSinceLastSourceDelta: lastSourceDeltaAt.map { now.timeIntervalSince($0) },
+                secondsSinceLastTranslationDelta: lastTranslationDeltaAt.map { now.timeIntervalSince($0) },
+                secondsSinceLastAudioFrame: lastAudioFrameAt.map { now.timeIntervalSince($0) },
+                transcriptionAck: transcriptionAck
+            )
+        }
+    }
 
     init(label: String, config: SessionConfig, apiKey: String, endpointTemplate: String) {
         self.label = label
@@ -166,7 +263,16 @@ final class RealtimeTranslationClient: NSObject {
         reportedBilledSeconds = 0
         lastServerEventAt = Date()
         connectStartedAt = Date()
+        openedAt = nil
         pingTicks = 0
+        transcriptionAck = .notReceived
+        lastSourceDeltaAt = nil
+        lastTranslationDeltaAt = nil
+        lastAudioFrameAt = nil
+        warnedNothingReturned = false
+        warnedNoSourceText = false
+        warnedNoTranslatedAudio = false
+        warnedNoAck = false
         state = .connecting
 
         var request = URLRequest(url: url)
@@ -243,6 +349,11 @@ final class RealtimeTranslationClient: NSObject {
     private func sendAppendEvent(_ pcm16: Data) {
         stats.audioChunksSent += 1
         stats.audioBytesSent += pcm16.count
+        // Gate-suppressed audio is exact zeros, so the scan cleanly splits
+        // "keeping the timeline alive" from "sending the server speech".
+        if !Self.isPureSilence(pcm16) {
+            stats.speechBytesSent += pcm16.count
+        }
         sendJSON([
             "type": "session.input_audio_buffer.append",
             "audio": pcm16.base64EncodedString()
@@ -378,6 +489,7 @@ final class RealtimeTranslationClient: NSObject {
                 } else {
                     stats.audioFrames += 1
                     stats.audioBytes += audio.count
+                    lastAudioFrameAt = Date()
                     onTranslatedAudio?(audio)
                 }
             }
@@ -385,16 +497,23 @@ final class RealtimeTranslationClient: NSObject {
             if let delta = object["delta"] as? String {
                 stats.sourceDeltas += 1
                 stats.sourceChars += delta.count
+                lastSourceDeltaAt = Date()
                 onSourceTranscriptDelta?(delta)
             }
         case "session.output_transcript.delta":
             if let delta = object["delta"] as? String {
                 stats.translationDeltas += 1
                 stats.translationChars += delta.count
+                lastTranslationDeltaAt = Date()
                 onTranslatedTranscriptDelta?(delta)
             }
         case "session.created", "session.updated":
-            Log.info("[\(label)] \(type)")
+            // Full payload, not just the type: the ack is the only place the
+            // server states which config it actually applied, and a missing
+            // input-transcription echo is the root cause behind "translated
+            // audio but no source text".
+            Log.info("[\(label)] \(type): \(text.prefix(1500))")
+            if type == "session.updated" { recordSessionAck(object) }
         case "session.closed":
             // Server finished draining after our session.close — safe to
             // drop the socket now instead of waiting out the timeout.
@@ -405,6 +524,31 @@ final class RealtimeTranslationClient: NSObject {
             Log.error("[\(label)] Server error: \(text.prefix(2000))")
         default:
             Log.info("[\(label)] Unhandled event \(type): \(text.prefix(2000))")
+        }
+    }
+
+    /// Queue-confined. Inspect a session.updated ack for the source
+    /// transcription config we requested in session.update. The event schema
+    /// is newer than this client, so both the GA nesting
+    /// (session.audio.input.transcription) and the older flat key
+    /// (session.input_audio_transcription) are accepted.
+    private func recordSessionAck(_ object: [String: Any]) {
+        guard let session = object["session"] as? [String: Any] else {
+            transcriptionAck = .unparseable
+            Log.warn("[\(label)] session.updated ack has no parseable session object — cannot verify transcription config (payload logged above)")
+            return
+        }
+        let gaShape = (session["audio"] as? [String: Any])
+            .flatMap { $0["input"] as? [String: Any] }
+            .flatMap { $0["transcription"] as? [String: Any] }
+        let legacyShape = session["input_audio_transcription"] as? [String: Any]
+        if let transcription = gaShape ?? legacyShape {
+            let model = transcription["model"] as? String ?? "model unspecified"
+            transcriptionAck = .confirmed(model)
+            Log.info("[\(label)] server ack confirms source transcription (\(model)) — source text should arrive")
+        } else {
+            transcriptionAck = .absent
+            Log.warn("[\(label)] session.updated ack carries NO source transcription config — the server will send translation only, source (Chinese) text will never arrive for this connection; check the transcription model in SessionConfig against the logged ack payload")
         }
     }
 
@@ -432,6 +576,7 @@ final class RealtimeTranslationClient: NSObject {
             return
         }
         pingTicks += 1
+        checkStreamSymptoms()
         if pingTicks % 3 == 0 { logSummary(context: "periodic") }
         guard let task else { return }
         task.sendPing { [weak self] error in
@@ -454,19 +599,42 @@ final class RealtimeTranslationClient: NSObject {
         line += ", translation \(s.translationDeltas)Δ/\(s.translationChars)ch"
         line += ", audio \(s.audioFrames) frames/\(s.audioBytes / 1024)KB"
         line += ", \(s.heartbeatsDropped) heartbeats dropped"
+        line += String(format: "; speech sent %.0fs of %.0fs total",
+                       Double(s.speechBytesSent) / Self.billedBytesPerSecond,
+                       Double(s.audioBytesSent) / Self.billedBytesPerSecond)
         // Compare against the OpenAI usage dashboard to validate the meter.
         line += String(format: "; billed ~%.0fs (server clock %.0fs, sent %.0fs)",
                        reportedBilledSeconds,
                        maxElapsedMs / 1000.0,
                        Double(s.audioBytesSent) / Self.billedBytesPerSecond)
         Log.info("[\(label)] stats (\(context)): \(line)")
-        // ~10 s of sent audio is enough to expect both streams; call out the
-        // two symptom signatures explicitly.
-        guard s.audioChunksSent > 50 else { return }
-        if s.sourceDeltas == 0, s.translationDeltas + s.audioFrames > 0 {
-            Log.warn("[\(label)] translation flowing but NO source-transcript deltas — Chinese text will be missing; check session.updated ack / transcription config")
+    }
+
+    /// Queue-confined, runs every ping tick (20 s). The live answer to "the
+    /// gate is open but nothing shows up in the conversation": once ~10 s of
+    /// actual speech (not gate-silence) has been sent, each broken-stream
+    /// signature is called out once per connection, naming what it means for
+    /// the UI instead of leaving the user to diff counters.
+    private func checkStreamSymptoms() {
+        let speechSeconds = Double(stats.speechBytesSent) / Self.billedBytesPerSecond
+        guard speechSeconds >= 10 else { return }
+        if !warnedNoAck, transcriptionAck == .notReceived {
+            warnedNoAck = true
+            Log.warn("[\(label)] session.update was never acked — the server may be running defaults (source transcription off); if source text is missing, this is why")
         }
-        if s.audioFrames == 0, s.sourceDeltas > 0 {
+        if stats.sourceDeltas + stats.translationDeltas + stats.audioFrames == 0 {
+            if !warnedNothingReturned {
+                warnedNothingReturned = true
+                Log.warn("[\(label)] \(Int(speechSeconds))s of speech sent but NOTHING returned on any stream — audio is leaving the app and the session produces no output (wrong endpoint/config, or the gated audio is unintelligible; check the ack payloads above)")
+            }
+            return
+        }
+        if !warnedNoSourceText, stats.sourceDeltas == 0, stats.translationDeltas + stats.audioFrames > 0 {
+            warnedNoSourceText = true
+            Log.warn("[\(label)] translation flowing but NO source-transcript deltas — source (Chinese) text will be missing; transcription \(transcriptionAck.summary)")
+        }
+        if !warnedNoTranslatedAudio, stats.audioFrames == 0, stats.sourceDeltas > 0 {
+            warnedNoTranslatedAudio = true
             Log.warn("[\(label)] source transcript flowing but NO translated audio frames — playback will be silent for this lane")
         }
     }
@@ -488,6 +656,7 @@ extension RealtimeTranslationClient: URLSessionWebSocketDelegate {
         let latency = connectStartedAt.map { String(format: " (%.1fs)", Date().timeIntervalSince($0)) } ?? ""
         Log.info("[\(label)] WS open\(latency)")
         lastServerEventAt = Date()
+        openedAt = Date()
         // Marking open and flushing the pre-open queue is one queue block,
         // so concurrent sendAudio calls order strictly before or after it —
         // no chunk can overtake the queued speech or strand in the buffer.

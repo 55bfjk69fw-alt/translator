@@ -32,6 +32,23 @@ final class AppModel: ObservableObject {
     @Published private(set) var speakerOverrideActive = false
     @Published private(set) var pttLevel: Float = 0
 
+    /// One row of the Diagnostics "Translation pipeline" panel: everything
+    /// between the gate and the transcript for one lane, sampled at 1 Hz by
+    /// the UI timer. This is the tool for "the gate is open but nothing is
+    /// showing up" — it localizes the break to gate/session/server stream.
+    struct LanePipelineStatus: Identifiable {
+        let id: Int            // lane ID; SpeakerLane.userLaneID for PTT
+        var name: String
+        /// Gate currently passing this channel (mirror of the status dot);
+        /// for the PTT lane, whether the talk button is held.
+        var gateOpen: Bool
+        var secondsSinceSpeech: TimeInterval?
+        /// nil = no session right now (they open lazily on first speech).
+        var session: RealtimeTranslationClient.Snapshot?
+    }
+
+    @Published private(set) var pipelineStatuses: [LanePipelineStatus] = []
+
     let transcript: TranscriptStore
 
     /// Signal-tab analysis. Deliberately its own ObservableObject (not
@@ -66,6 +83,10 @@ final class AppModel: ObservableObject {
     /// Last logged voiced state per channel (audioQueue-confined) so
     /// speech start/end transitions land in the diagnostics log.
     private var voicedState: [Int: Bool] = [:]
+    /// Channels already warned about dropping gated speech for lack of a
+    /// resampler (audioQueue-confined) — a silent-drop path that otherwise
+    /// looks exactly like "gate open, nothing captured".
+    private var warnedMissingResampler: Set<Int> = []
 
     // Engine watchdog bookkeeping (main thread). The engine auto-stops on
     // configuration changes and interruptions; the watchdog brings it back.
@@ -178,6 +199,7 @@ final class AppModel: ObservableObject {
         sessionStates.removeAll()
         reconnectAttempts.removeAll()
         sessionOpenedAt.removeAll()
+        pipelineStatuses = []
         resetPlaybackState()
         UIApplication.shared.isIdleTimerDisabled = false
         refreshCost()
@@ -188,6 +210,7 @@ final class AppModel: ObservableObject {
         let rate = engineGraph.inputSampleRate
         audioQueue.sync {
             resamplers.removeAll()
+            warnedMissingResampler.removeAll()
             for channel in 0..<channelCount {
                 resamplers[channel] = StreamResampler(inputSampleRate: rate)
             }
@@ -269,7 +292,12 @@ final class AppModel: ObservableObject {
             // alone (pass implies genuine-or-hangover, which implies voiced).
             let speech = decision.pass && decision.voiced
             if speech { lastVoiceAt[channel] = Date() }
-            guard let resampler = resamplers[channel] else { continue }
+            guard let resampler = resamplers[channel] else {
+                if speech, warnedMissingResampler.insert(channel).inserted {
+                    Log.error("ch\(channel): gate passed speech but no resampler exists — audio is being dropped before the session (engine/route rebuild mismatch)")
+                }
+                continue
+            }
             guard let client = clients[channel] ?? lazyOpenSession(channel: channel, speech: speech) else { continue }
             let outgoing: AVAudioPCMBuffer?
             if decision.pass {
@@ -644,7 +672,39 @@ final class AppModel: ObservableObject {
             self.transcript.finalizeStale(timeout: 2.5)
             self.closeIdleSessions()
             self.watchdogEngineCheck()
+            self.refreshPipelineStatuses()
         }
+    }
+
+    /// Rebuild the Diagnostics pipeline rows from live client counters.
+    /// Main thread (UI timer); each snapshot() is a brief sync hop onto that
+    /// client's queue, and the clients dictionary is copied under audioQueue.
+    private func refreshPipelineStatuses() {
+        guard mode == .conversation || mode == .pushToTalk else {
+            if !pipelineStatuses.isEmpty { pipelineStatuses = [] }
+            return
+        }
+        let (clientsCopy, voiceTimes) = audioQueue.sync { (clients, lastVoiceAt) }
+        let now = Date()
+        var statuses: [LanePipelineStatus] = lanes.map { lane in
+            LanePipelineStatus(
+                id: lane.id,
+                name: lane.name,
+                gateOpen: lane.id < gateOpen.count ? gateOpen[lane.id] : false,
+                secondsSinceSpeech: voiceTimes[lane.id].map { now.timeIntervalSince($0) },
+                session: clientsCopy[lane.id]?.snapshot()
+            )
+        }
+        if let userClient = clientsCopy[SpeakerLane.userLaneID] {
+            statuses.append(LanePipelineStatus(
+                id: SpeakerLane.userLaneID,
+                name: laneName(SpeakerLane.userLaneID),
+                gateOpen: pttEngaged,
+                secondsSinceSpeech: voiceTimes[SpeakerLane.userLaneID].map { now.timeIntervalSince($0) },
+                session: userClient.snapshot()
+            ))
+        }
+        pipelineStatuses = statuses
     }
 
     /// AVAudioEngine auto-stops on configuration changes (Bluetooth codec

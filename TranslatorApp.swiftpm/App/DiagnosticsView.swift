@@ -15,6 +15,7 @@ struct DiagnosticsView: View {
             List {
                 routeSection
                 metersSection
+                pipelineSection
                 benchSection
                 logSection
             }
@@ -88,6 +89,23 @@ struct DiagnosticsView: View {
         }
     }
 
+    /// Per-lane trace of gate → session → server streams, refreshed at 1 Hz
+    /// during a conversation. Built to answer "the gate is open but nothing
+    /// shows up in the conversation" (which link is dead?) and "why is the
+    /// Chinese text missing" (was source transcription even acknowledged?).
+    private var pipelineSection: some View {
+        Section("Translation pipeline") {
+            if model.pipelineStatuses.isEmpty {
+                Text("Start a conversation to trace each speaker's audio from the gate through their session to the transcript.")
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(model.pipelineStatuses) { status in
+                    LanePipelineRow(status: status)
+                }
+            }
+        }
+    }
+
     private var benchSection: some View {
         Section("Bench test") {
             if model.mode == .idle {
@@ -140,6 +158,120 @@ struct DiagnosticsView: View {
         case .warn: return .orange
         case .error: return .red
         }
+    }
+}
+
+private struct LanePipelineRow: View {
+    let status: AppModel.LanePipelineStatus
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 8) {
+                Text(status.name)
+                    .font(.callout.bold())
+                Text(status.gateOpen ? "gate open" : "gate closed")
+                    .font(.caption2.bold())
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 1)
+                    .background(Capsule().fill(status.gateOpen ? Color.green.opacity(0.2) : Color.secondary.opacity(0.15)))
+                    .foregroundStyle(status.gateOpen ? .green : .secondary)
+                if let since = status.secondsSinceSpeech {
+                    Text("speech \(age(since))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Text(sessionStateText)
+                    .font(.caption.bold())
+                    .foregroundStyle(sessionStateColor)
+            }
+            if let session = status.session {
+                Text("Sent \(seconds(session.audioSecondsSent)) audio (\(seconds(session.speechSecondsSent)) speech)\(session.chunksQueuedPreOpen > 0 ? ", \(session.chunksQueuedPreOpen) chunks queued pre-open" : "")\(session.sendFailures > 0 ? ", \(session.sendFailures) SEND FAILURES" : "")")
+                    .font(.caption)
+                    .foregroundStyle(session.sendFailures > 0 ? .red : .secondary)
+                Text("Received: source \(session.sourceChars) ch (\(agePhrase(session.secondsSinceLastSourceDelta))) · translation \(session.translationChars) ch (\(agePhrase(session.secondsSinceLastTranslationDelta))) · audio \(seconds(session.audioSecondsReceived)) (\(agePhrase(session.secondsSinceLastAudioFrame)))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Source transcription: \(session.transcriptionAck.summary) · last server event \(age(session.secondsSinceLastServerEvent))")
+                    .font(.caption)
+                    .foregroundStyle(transcriptionColor(session.transcriptionAck))
+                ForEach(symptoms(session), id: \.self) { symptom in
+                    Label(symptom, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+            } else {
+                Text("No session — one opens on this lane's first detected speech.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    private var sessionStateText: String {
+        switch status.session?.state {
+        case .open:
+            if let openFor = status.session?.openForSeconds {
+                return "open \(age(openFor, suffix: ""))"
+            }
+            return "open"
+        case .connecting: return "connecting"
+        case .closed: return "closed"
+        case .idle: return "idle"
+        case nil: return "no session"
+        }
+    }
+
+    private var sessionStateColor: Color {
+        switch status.session?.state {
+        case .open: return .green
+        case .connecting: return .yellow
+        case .closed: return .red
+        case .idle, nil: return .secondary
+        }
+    }
+
+    private func transcriptionColor(_ ack: RealtimeTranslationClient.TranscriptionAck) -> Color {
+        switch ack {
+        case .confirmed: return .secondary
+        case .notReceived: return .secondary
+        case .absent, .unparseable: return .orange
+        }
+    }
+
+    /// The same broken-stream signatures the client warns about in the log,
+    /// pinned to the row so they're visible without scrolling the event log.
+    private func symptoms(_ session: RealtimeTranslationClient.Snapshot) -> [String] {
+        var lines: [String] = []
+        if case .absent = session.transcriptionAck {
+            lines.append("Server ack shows NO source transcription — source text will never arrive on this connection")
+        }
+        guard session.speechSecondsSent >= 10 else { return lines }
+        if session.sourceDeltas + session.translationDeltas + session.audioFrames == 0 {
+            lines.append("Speech is reaching the server but nothing is coming back on any stream")
+            return lines
+        }
+        if session.sourceDeltas == 0 {
+            lines.append("No source text returned — bubbles will show the translation only")
+        }
+        if session.audioFrames == 0, session.sourceDeltas > 0 {
+            lines.append("No translated audio returned — playback silent for this lane")
+        }
+        return lines
+    }
+
+    private func seconds(_ value: Double) -> String {
+        value >= 10 ? "\(Int(value))s" : String(format: "%.1fs", value)
+    }
+
+    private func age(_ interval: TimeInterval, suffix: String = " ago") -> String {
+        if interval < 60 { return "\(Int(interval))s\(suffix)" }
+        return "\(Int(interval / 60))m\(Int(interval.truncatingRemainder(dividingBy: 60)))s\(suffix)"
+    }
+
+    private func agePhrase(_ interval: TimeInterval?) -> String {
+        interval.map { age($0) } ?? "never"
     }
 }
 

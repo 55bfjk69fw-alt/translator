@@ -160,6 +160,27 @@ profile.
   `Realtime/SessionConfig.swift` and the event aliases in
   `Realtime/RealtimeTranslationClient.swift` — both are built to be tweaked from
   logged evidence.
+- **Gate shows open but nothing appears in the conversation** — open
+  Diagnostics → *Translation pipeline*. Each speaker row traces the whole
+  chain: gate state, session state, audio sent (total vs. actual speech —
+  a session streams silence while its speaker is quiet, so "60s audio, 0s
+  speech" means nothing was ever captured to translate), and what each
+  server stream has returned with per-stream freshness ("never" = that
+  stream has produced nothing this connection). Orange symptom lines call
+  out the broken link, and the same signatures land in the event log
+  within ~20 s of enough speech being sent.
+- **Translated audio arrives but the Chinese text is missing** — the source
+  transcript is a separate server stream that must be enabled via
+  `session.update`. Check *Source transcription* in the pipeline row:
+  "absent from server ack" means the server ignored or rejected the
+  transcription config, and that connection will never send source text —
+  the full `session.updated` ack payload is now logged in Diagnostics, so
+  the accepted schema can be read off it and `Realtime/SessionConfig.swift`
+  adjusted to match. "confirmed" with source chars at 0 means the config
+  was accepted but the stream is silent (the client logs a warning for
+  this too). Also note the Chinese transcript normally trails the English
+  translation by a couple of seconds and can arrive as one late burst —
+  bubbles fill in retroactively for up to 10 s after finalizing.
 - **Duplicate translations of one speaker** — mic bleed getting past the gate.
   The gate cross-correlates channels and keeps only the loudest copy of a shared
   voice, so duplicates should be rare; if they persist, enable per-TX noise

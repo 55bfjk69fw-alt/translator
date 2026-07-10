@@ -36,10 +36,17 @@ swiftc -O -o verify ../../TranslatorApp.swiftpm/Audio/SileroVAD.swift verify_har
 ./verify .
 ```
 
-Last verified (2026-07): model-level max probability difference 3.6e-6 over
+Last verified (2026-07): model-level max probability difference 1.6e-6 over
 1187 frames of speech/noise/silence with carried LSTM state; full 48 kHz
-pipeline (FIR decimator + re-blocking + model) 2.7e-6; ~64× realtime per
-channel single-threaded on a modest x86 VM.
+pipeline (FIR decimator + re-blocking + model) 1.8e-6.
+
+Performance note: Swift Playgrounds builds apps at -Onone, so SileroVAD.swift
+keeps its hot path out of interpreted Swift — flat manually-managed buffers,
+zero per-frame allocation, and all matrix work behind one gemv wrapper that
+uses Accelerate BLAS on device. Measured single-threaded, per channel:
+~12× realtime worst case (-Onone, no BLAS — the portable fallback), ~287×
+realtime with -Onone glue + optimized BLAS (device-like; measured against
+OpenBLAS, which also exercises the exact cblas_sgemv calls used on device).
 
 ## Weight blob format (`.svad`, version 1)
 

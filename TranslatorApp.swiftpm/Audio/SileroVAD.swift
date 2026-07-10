@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(Accelerate)
+import Accelerate
+#endif
 
 /// Pure-Swift port of the Silero VAD v5 model (16 kHz path), MIT-licensed by
 /// the Silero Team (https://github.com/snakers4/silero-vad).
@@ -10,6 +13,14 @@ import Foundation
 /// ReLU → 1×1 conv → sigmoid — is implemented directly. The forward pass
 /// was verified against onnxruntime on the official model file to within
 /// 1e-4 per frame with LSTM state carried across hundreds of frames.
+///
+/// Playgrounds builds apps WITHOUT optimization (-Onone), so this file is
+/// written for debug-build speed: weights and scratch live in flat
+/// manually-managed buffers (no nested arrays, no bounds checks, no
+/// per-frame allocation), and the matrix work goes through Accelerate's
+/// BLAS — precompiled, hence immune to -Onone — with an equivalent scalar
+/// path compiled where Accelerate is unavailable (the Linux verification
+/// harness in tools/silero/).
 ///
 /// The model consumes 512-sample frames at 16 kHz (32 ms) with 64 samples of
 /// leading context from the previous frame, and returns P(speech) per frame.
@@ -23,21 +34,34 @@ final class SileroVAD {
 
     // MARK: - Weights (shared, immutable)
 
-    /// Parsed weight blob, shared by every channel's instance.
+    /// Parsed weight blob, shared by every channel's instance. All tensors
+    /// are flat row-major buffers, manually managed so the hot path never
+    /// touches Array bridging or bounds checks.
     final class Weights {
-        // stft basis split into real/imag halves: [129][256]
-        var stftReal: [[Float]] = []
-        var stftImag: [[Float]] = []
-        // encoder convs: weight [out][in][3], bias [out]
-        var convW: [[[[Float]]]] = []   // 4 layers
-        var convB: [[Float]] = []
-        // LSTM cell, PyTorch gate order (i, f, g, o) stacked in rows of 4×128
-        var lstmWih: [[Float]] = []     // [512][128]
-        var lstmWhh: [[Float]] = []     // [512][128]
-        var lstmBias: [Float] = []      // [512] = bias_ih + bias_hh, pre-summed
-        // final 1×1 conv
-        var outW: [Float] = []          // [128]
-        var outB: Float = 0
+        /// STFT basis, 258×256: rows 0..<129 real, 129..<258 imaginary.
+        let stftBasis: UnsafeMutablePointer<Float>
+        /// Encoder convs re-laid out per kernel tap at load time:
+        /// convTaps[layer][k] is a dense [cout × cin] matrix, so each conv
+        /// runs as three strided BLAS gemv accumulations with no im2col
+        /// packing loop (Playgrounds builds -Onone; scalar packing is the
+        /// kind of loop that dies there).
+        let convTaps: [[UnsafeMutablePointer<Float>]]
+        let convB: [UnsafeMutablePointer<Float>]
+        static let convDims: [(cout: Int, cin: Int)] = [(128, 129), (64, 128), (64, 64), (128, 64)]
+        /// LSTM cell, PyTorch gate order (i, f, g, o): [512 × 128] each.
+        let lstmWih: UnsafeMutablePointer<Float>
+        let lstmWhh: UnsafeMutablePointer<Float>
+        /// bias_ih + bias_hh pre-summed, [512].
+        let lstmBias: UnsafeMutablePointer<Float>
+        /// Final 1×1 conv, [128] + scalar bias.
+        let outW: UnsafeMutablePointer<Float>
+        let outB: Float
+
+        private let allocations: [UnsafeMutablePointer<Float>]
+
+        deinit {
+            for p in allocations { p.deallocate() }
+        }
 
         /// Parse the .svad container written by tools/silero/extract_and_verify.py:
         /// "SVAD", u32 version, u32 tensor count, then per tensor
@@ -82,176 +106,206 @@ final class SileroVAD {
                 tensors[name] = (dims, values)
             }
 
-            func rows(_ name: String, _ expected: [Int]) -> [[Float]]? {
+            var owned: [UnsafeMutablePointer<Float>] = []
+            /// Copy a validated tensor into a fresh flat buffer.
+            func flat(_ name: String, _ expected: [Int]) -> UnsafeMutablePointer<Float>? {
                 guard let t = tensors[name], t.dims == expected else { return nil }
-                let cols = expected[1]
-                return (0..<expected[0]).map { Array(t.values[$0 * cols..<($0 + 1) * cols]) }
+                let p = UnsafeMutablePointer<Float>.allocate(capacity: t.values.count)
+                t.values.withUnsafeBufferPointer { p.update(from: $0.baseAddress!, count: $0.count) }
+                owned.append(p)
+                return p
             }
-            // STFT basis (258, 1, 256) -> real 0..<129, imag 129..<258
-            guard let stft = tensors["stft.forward_basis_buffer"], stft.dims == [258, 1, 256] else { return nil }
-            for r in 0..<129 { stftReal.append(Array(stft.values[r * 256..<(r + 1) * 256])) }
-            for r in 129..<258 { stftImag.append(Array(stft.values[r * 256..<(r + 1) * 256])) }
 
-            let convShapes = [[128, 129, 3], [64, 128, 3], [64, 64, 3], [128, 64, 3]]
-            for (layer, shape) in convShapes.enumerated() {
-                guard let w = tensors["encoder.\(layer).reparam_conv.weight"], w.dims == shape,
-                      let b = tensors["encoder.\(layer).reparam_conv.bias"], b.dims == [shape[0]]
-                else { return nil }
-                let (cout, cin, k) = (shape[0], shape[1], shape[2])
-                var weight: [[[Float]]] = []
-                weight.reserveCapacity(cout)
-                for o in 0..<cout {
-                    var perIn: [[Float]] = []
-                    perIn.reserveCapacity(cin)
-                    for i in 0..<cin {
-                        let base = (o * cin + i) * k
-                        perIn.append(Array(w.values[base..<base + k]))
+            guard let basis = flat("stft.forward_basis_buffer", [258, 1, 256]) else { return nil }
+            var convTapsAll: [[UnsafeMutablePointer<Float>]] = []
+            var convBs: [UnsafeMutablePointer<Float>] = []
+            for (layer, dims) in Self.convDims.enumerated() {
+                guard let t = tensors["encoder.\(layer).reparam_conv.weight"],
+                      t.dims == [dims.cout, dims.cin, 3],
+                      let b = flat("encoder.\(layer).reparam_conv.bias", [dims.cout])
+                else { for p in owned { p.deallocate() }; return nil }
+                // Split [cout][cin][3] into three dense [cout × cin] tap matrices.
+                var taps: [UnsafeMutablePointer<Float>] = []
+                for k in 0..<3 {
+                    let p = UnsafeMutablePointer<Float>.allocate(capacity: dims.cout * dims.cin)
+                    t.values.withUnsafeBufferPointer { src in
+                        for oi in 0..<(dims.cout * dims.cin) { p[oi] = src[oi * 3 + k] }
                     }
-                    weight.append(perIn)
+                    owned.append(p)
+                    taps.append(p)
                 }
-                convW.append(weight)
-                convB.append(b.values)
+                convTapsAll.append(taps)
+                convBs.append(b)
             }
-
-            guard let wih = rows("decoder.rnn.weight_ih", [512, 128]),
-                  let whh = rows("decoder.rnn.weight_hh", [512, 128]),
+            guard let wih = flat("decoder.rnn.weight_ih", [512, 128]),
+                  let whh = flat("decoder.rnn.weight_hh", [512, 128]),
                   let bih = tensors["decoder.rnn.bias_ih"], bih.dims == [512],
                   let bhh = tensors["decoder.rnn.bias_hh"], bhh.dims == [512],
-                  let ow = tensors["decoder.decoder.2.weight"], ow.dims == [1, 128, 1],
+                  let ow = flat("decoder.decoder.2.weight", [1, 128, 1]),
                   let ob = tensors["decoder.decoder.2.bias"], ob.dims == [1]
-            else { return nil }
+            else { for p in owned { p.deallocate() }; return nil }
+
+            let bias = UnsafeMutablePointer<Float>.allocate(capacity: 512)
+            for k in 0..<512 { bias[k] = bih.values[k] + bhh.values[k] }
+            owned.append(bias)
+
+            stftBasis = basis
+            convTaps = convTapsAll
+            convB = convBs
             lstmWih = wih
             lstmWhh = whh
-            lstmBias = zip(bih.values, bhh.values).map(+)
-            outW = ow.values
+            lstmBias = bias
+            outW = ow
             outB = ob.values[0]
+            allocations = owned
         }
     }
 
-    // MARK: - Per-channel state
+    // MARK: - Per-channel state and scratch
 
     private let weights: Weights
-    private var context = [Float](repeating: 0, count: SileroVAD.contextLength)
-    private var hidden = [Float](repeating: 0, count: 128)
-    private var cell = [Float](repeating: 0, count: 128)
+    /// One manually-managed slab: context/hidden/cell state plus every
+    /// intermediate of the forward pass. Layout below; nothing in process()
+    /// allocates or touches an Array.
+    private let slab: UnsafeMutablePointer<Float>
+    private static let slabCount = 64 + 128 + 128        // context, hidden, cell
+        + 640                                            // padded input
+        + 258 * 4                                        // spectrum
+        + 129 * 4                                        // ping buffer (mag / activations)
+        + 129 * 4                                        // pong buffer
+        + 512                                            // LSTM gates
+
+    private var context: UnsafeMutablePointer<Float> { slab }
+    private var hidden: UnsafeMutablePointer<Float> { slab + 64 }
+    private var cell: UnsafeMutablePointer<Float> { slab + 192 }
+    private var x: UnsafeMutablePointer<Float> { slab + 320 }
+    private var spec: UnsafeMutablePointer<Float> { slab + 960 }
+    private var ping: UnsafeMutablePointer<Float> { slab + 1992 }
+    private var pong: UnsafeMutablePointer<Float> { slab + 2508 }
+    private var gates: UnsafeMutablePointer<Float> { slab + 3024 }
 
     init(weights: Weights) {
         self.weights = weights
+        slab = UnsafeMutablePointer<Float>.allocate(capacity: Self.slabCount)
+        slab.update(repeating: 0, count: Self.slabCount)
+    }
+
+    deinit {
+        slab.deallocate()
     }
 
     func reset() {
-        context = [Float](repeating: 0, count: Self.contextLength)
-        hidden = [Float](repeating: 0, count: 128)
-        cell = [Float](repeating: 0, count: 128)
+        slab.update(repeating: 0, count: 320)   // context + hidden + cell
+    }
+
+    /// Convenience for callers holding an Array (verification harness).
+    func process(frame: [Float]) -> Float {
+        precondition(frame.count == Self.frameLength)
+        return frame.withUnsafeBufferPointer { process($0.baseAddress!) }
     }
 
     /// Speech probability for one 512-sample 16 kHz frame. Carries LSTM
     /// state and the trailing 64 samples of context to the next call.
-    func process(frame: [Float]) -> Float {
-        precondition(frame.count == Self.frameLength)
-        var x = context + frame                                // 576
-        context = Array(frame.suffix(Self.contextLength))
+    func process(_ frame: UnsafePointer<Float>) -> Float {
+        let w = weights
 
-        // Reflect-pad right by 64: x[576+i] = x[574-i]
-        x.reserveCapacity(640)
-        for i in 0..<64 { x.append(x[574 - i]) }
+        // Assemble input: context ++ frame, reflect-padded right by 64
+        // (x[576+i] = x[574-i]).
+        x.update(from: context, count: 64)
+        (x + 64).update(from: frame, count: 512)
+        for i in 0..<64 { x[576 + i] = x[574 - i] }
+        context.update(from: frame + 448, count: 64)
 
-        // STFT as strided conv (kernel 256, hop 128) -> magnitude [129][4]
-        var mag = [[Float]](repeating: [Float](repeating: 0, count: 4), count: 129)
-        x.withUnsafeBufferPointer { px in
-            for f in 0..<4 {
-                let start = f * 128
-                for bin in 0..<129 {
-                    var re: Float = 0
-                    var im: Float = 0
-                    weights.stftReal[bin].withUnsafeBufferPointer { pr in
-                        weights.stftImag[bin].withUnsafeBufferPointer { pi in
-                            for k in 0..<256 {
-                                let s = px[start + k]
-                                re += pr[k] * s
-                                im += pi[k] * s
-                            }
-                        }
-                    }
-                    mag[bin][f] = (re * re + im * im).squareRoot()
+        // STFT as strided conv (kernel 256, hop 128) over 4 frames: one
+        // 258×256 gemv per frame, straight off the padded input (the frame
+        // windows are contiguous, so nothing needs packing); then magnitude
+        // [129][4] row-major.
+        for f in 0..<4 {
+            Self.gemv(a: w.stftBasis, rows: 258, cols: 256,
+                      x: x + f * 128, incX: 1, y: spec + f, incY: 4, accumulate: false)
+        }
+        for bin in 0..<129 {
+            let re = spec + bin * 4
+            let im = spec + (bin + 129) * 4
+            let dst = ping + bin * 4
+            for f in 0..<4 { dst[f] = (re[f] * re[f] + im[f] * im[f]).squareRoot() }
+        }
+
+        // Encoder: Conv1d(k=3, pad=1) + ReLU with strides 1,2,2,1. Each
+        // output column accumulates one gemv per in-range kernel tap, using
+        // strides to read input columns / write output columns in place —
+        // no packing loops. Time lengths: 4 → 4 → 2 → 1 → 1.
+        var input = ping
+        var output = pong
+        var t = 4
+        for (layer, dims) in Weights.convDims.enumerated() {
+            let stride = layer == 1 || layer == 2 ? 2 : 1
+            let tout = (t + 2 - 3) / stride + 1
+            let bias = w.convB[layer]
+            for o in 0..<dims.cout {
+                let row = output + o * tout
+                for ot in 0..<tout { row[ot] = bias[o] }
+            }
+            for ot in 0..<tout {
+                for k in 0..<3 {
+                    let idx = ot * stride - 1 + k
+                    guard idx >= 0 && idx < t else { continue }   // zero pad
+                    Self.gemv(a: w.convTaps[layer][k], rows: dims.cout, cols: dims.cin,
+                              x: input + idx, incX: t, y: output + ot, incY: tout, accumulate: true)
                 }
             }
+            for o in 0..<(dims.cout * tout) { output[o] = max(output[o], 0) }
+            swap(&input, &output)
+            t = tout
         }
+        let xt = input   // [128 × 1]
 
-        // Encoder: Conv1d(k=3, pad=1) + ReLU, strides 1,2,2,1
-        var act = mag
-        for layer in 0..<4 {
-            act = Self.convReLU(act, weight: weights.convW[layer], bias: weights.convB[layer],
-                                stride: layer == 1 || layer == 2 ? 2 : 1)
-        }
-        // act is now [128][1]
-        let xt = act.map { $0[0] }
-
-        // LSTM cell, PyTorch gate order i,f,g,o
-        var gates = weights.lstmBias
-        for row in 0..<512 {
-            var sum: Float = 0
-            weights.lstmWih[row].withUnsafeBufferPointer { pw in
-                for k in 0..<128 { sum += pw[k] * xt[k] }
-            }
-            weights.lstmWhh[row].withUnsafeBufferPointer { pw in
-                for k in 0..<128 { sum += pw[k] * hidden[k] }
-            }
-            gates[row] += sum
-        }
+        // LSTM cell, PyTorch gate order i,f,g,o.
+        gates.update(from: w.lstmBias, count: 512)
+        Self.gemv(a: w.lstmWih, rows: 512, cols: 128, x: xt, incX: 1, y: gates, incY: 1, accumulate: true)
+        Self.gemv(a: w.lstmWhh, rows: 512, cols: 128, x: hidden, incX: 1, y: gates, incY: 1, accumulate: true)
         for k in 0..<128 {
             let i = Self.sigmoid(gates[k])
             let f = Self.sigmoid(gates[128 + k])
-            let g = Self.tanhf(gates[256 + k])
+            let g = Foundation.tanh(gates[256 + k])
             let o = Self.sigmoid(gates[384 + k])
             cell[k] = f * cell[k] + i * g
-            hidden[k] = o * Self.tanhf(cell[k])
+            hidden[k] = o * Foundation.tanh(cell[k])
         }
 
-        // ReLU -> 1x1 conv -> sigmoid
+        // ReLU → 1×1 conv → sigmoid.
         var logit = weights.outB
-        for k in 0..<128 { logit += weights.outW[k] * max(hidden[k], 0) }
+        for k in 0..<128 { logit += w.outW[k] * max(hidden[k], 0) }
         return Self.sigmoid(logit)
     }
 
     // MARK: - Math
 
-    /// Conv1d with kernel 3, zero padding 1, given stride, then ReLU.
-    private static func convReLU(_ input: [[Float]], weight: [[[Float]]], bias: [Float], stride: Int) -> [[Float]] {
-        let cin = input.count
-        let t = input[0].count
-        let cout = weight.count
-        let tout = (t + 2 - 3) / stride + 1
-        var out = [[Float]](repeating: [Float](repeating: 0, count: tout), count: cout)
-        for o in 0..<cout {
-            let wo = weight[o]
-            for ot in 0..<tout {
-                let base = ot * stride - 1        // input index of kernel tap 0
-                var sum = bias[o]
-                for i in 0..<cin {
-                    let wi = wo[i]
-                    let row = input[i]
-                    if base >= 0 && base + 2 < t {
-                        sum += wi[0] * row[base] + wi[1] * row[base + 1] + wi[2] * row[base + 2]
-                    } else {
-                        for k in 0..<3 {
-                            let idx = base + k
-                            if idx >= 0 && idx < t { sum += wi[k] * row[idx] }
-                        }
-                    }
-                }
-                out[o][ot] = max(sum, 0)
-            }
+    /// y[r·incY] (+)= A[rows×cols] · x[c·incX], A row-major dense. All the
+    /// model's heavy math funnels through this one call so the device build
+    /// spends its time inside BLAS (precompiled, immune to Playgrounds'
+    /// -Onone) rather than in interpreted Swift loops.
+    @inline(__always)
+    private static func gemv(a: UnsafePointer<Float>, rows: Int, cols: Int,
+                             x: UnsafePointer<Float>, incX: Int,
+                             y: UnsafeMutablePointer<Float>, incY: Int, accumulate: Bool) {
+        #if canImport(Accelerate)
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, Int32(rows), Int32(cols),
+                    1, a, Int32(cols), x, Int32(incX), accumulate ? 1 : 0, y, Int32(incY))
+        #else
+        for row in 0..<rows {
+            let arow = a + row * cols
+            var sum: Float = 0
+            for kk in 0..<cols { sum += arow[kk] * x[kk * incX] }
+            let dst = y + row * incY
+            dst.pointee = accumulate ? dst.pointee + sum : sum
         }
-        return out
+        #endif
     }
 
+    @inline(__always)
     private static func sigmoid(_ v: Float) -> Float {
         1 / (1 + Foundation.exp(-v))
-    }
-
-    private static func tanhf(_ v: Float) -> Float {
-        Foundation.tanh(v)
     }
 }
 
@@ -269,6 +323,8 @@ final class StreamingVAD {
     private var fir: [Float] = []
     /// Trailing input samples carried between buffers for FIR history.
     private var history: [Float] = []
+    /// Reused per-buffer workspace (history ++ new samples).
+    private var work: [Float] = []
     /// Input-sample phase within the current decimation stride.
     private var phase = 0
     /// 16 kHz samples accumulated toward the next 512-sample frame.
@@ -312,13 +368,16 @@ final class StreamingVAD {
         }
 
         var maxProbability: Float?
-        while pending.count >= SileroVAD.frameLength {
-            let frame = Array(pending.prefix(SileroVAD.frameLength))
-            pending.removeFirst(SileroVAD.frameLength)
-            probability = vad.process(frame: frame)
-            onFrame?(probability)
-            maxProbability = max(maxProbability ?? 0, probability)
+        var consumed = 0
+        pending.withUnsafeBufferPointer { p in
+            while pending.count - consumed >= SileroVAD.frameLength {
+                probability = vad.process(p.baseAddress! + consumed)
+                consumed += SileroVAD.frameLength
+                onFrame?(probability)
+                maxProbability = max(maxProbability ?? 0, probability)
+            }
         }
+        if consumed > 0 { pending.removeFirst(consumed) }
         return maxProbability ?? probability
     }
 
@@ -350,20 +409,30 @@ final class StreamingVAD {
 
     private func decimate(_ samples: UnsafePointer<Float>, count: Int) {
         let taps = fir.count
-        var input = history
-        input.append(contentsOf: UnsafeBufferPointer(start: samples, count: count))
+        work.removeAll(keepingCapacity: true)
+        work.append(contentsOf: history)
+        work.append(contentsOf: UnsafeBufferPointer(start: samples, count: count))
         // Each *new* sample advances the decimation phase; when the phase
         // hits 0 and a full FIR window is available, emit one output sample.
         // (The first taps-1 samples of the stream produce no output: a
         // ~1.3 ms startup transient, irrelevant to gating.)
-        let base = input.count - count
-        input.withUnsafeBufferPointer { pi in
+        let base = work.count - count
+        work.withUnsafeBufferPointer { pi in
             fir.withUnsafeBufferPointer { pk in
+                let signal = pi.baseAddress!
+                let kernel = pk.baseAddress!
                 for j in 0..<count {
                     let index = base + j
                     if phase == 0 && index >= taps - 1 {
+                        // Convolution against a symmetric kernel == forward
+                        // dot product over the window (fir is palindromic).
                         var acc: Float = 0
-                        for k in 0..<taps { acc += pk[k] * pi[index - k] }
+                        let window = signal + index - (taps - 1)
+                        #if canImport(Accelerate)
+                        vDSP_dotpr(window, 1, kernel, 1, &acc, vDSP_Length(taps))
+                        #else
+                        for k in 0..<taps { acc += kernel[k] * window[k] }
+                        #endif
                         pending.append(acc)
                     }
                     phase = (phase + 1) % factor
@@ -371,6 +440,8 @@ final class StreamingVAD {
             }
         }
         // Keep the last taps-1 samples as FIR history for the next buffer.
-        history = Array(input.suffix(taps - 1))
+        let keep = min(taps - 1, work.count)
+        history.removeAll(keepingCapacity: true)
+        history.append(contentsOf: work.suffix(keep))
     }
 }

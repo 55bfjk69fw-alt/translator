@@ -13,6 +13,7 @@ enum AppSettings {
     static let showPinyinKey = "showPinyin"
 
     static func speakerNameKey(_ channel: Int) -> String { "speakerName\(channel)" }
+    static func speakerEnabledKey(_ channel: Int) -> String { "speakerEnabled\(channel)" }
 
     static var endpointTemplate: String {
         let value = UserDefaults.standard.string(forKey: endpointTemplateKey) ?? ""
@@ -45,6 +46,15 @@ enum AppSettings {
     static var idleCloseSeconds: Double {
         if UserDefaults.standard.object(forKey: idleCloseSecondsKey) == nil { return 120 }
         return UserDefaults.standard.double(forKey: idleCloseSecondsKey)
+    }
+
+    /// Whether a DJI channel participates at all (default on). Disabled
+    /// channels are hard-muted: never voiced, never open a session. Read
+    /// per buffer so toggling in Settings applies mid-conversation.
+    static func speakerEnabled(_ channel: Int) -> Bool {
+        UserDefaults.standard.object(forKey: speakerEnabledKey(channel)) == nil
+            ? true
+            : UserDefaults.standard.bool(forKey: speakerEnabledKey(channel))
     }
 
     static func speakerName(_ channel: Int) -> String {

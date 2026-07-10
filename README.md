@@ -93,6 +93,12 @@ The app disables the screen-idle timer while a conversation is running.
 - **A quiet speaker gets cut off mid-sentence** — raise their TX gain (or move the
   mic closer to their mouth) rather than lowering the minimum voice threshold; the
   gate adapts to the room's noise floor automatically.
+- **Every mic reads as active with noise cancelling off** — with NC disabled the
+  TXs pass constant hiss/room noise. The gate reclassifies any channel that stays
+  "voiced" for 6 s without a single pause as steady noise and raises its floor
+  past it, so channels settle down within ~10 s of Start. For mics you aren't
+  using at all, switch them off in Settings → Speakers — a disabled channel is
+  hard-muted and never opens a session.
 
 ## Roadmap
 

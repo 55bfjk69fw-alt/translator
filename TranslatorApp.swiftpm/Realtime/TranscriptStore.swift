@@ -75,8 +75,7 @@ final class TranscriptStore: ObservableObject {
         }
     }
 
-    func appendTranslatedAudio(lane: Int, audio: Data, keepAudio: Bool) {
-        guard keepAudio else { return }
+    func appendTranslatedAudio(lane: Int, audio: Data) {
         reopenRecentIfNeeded(lane: lane, stream: .audio)
         withOpenUtterance(lane: lane, stream: .audio) {
             var existing = $0.translatedAudio ?? Data()

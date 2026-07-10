@@ -47,12 +47,17 @@ final class Log: ObservableObject {
         DispatchQueue.main.async { self.entries.removeAll() }
     }
 
-    /// Full log as plain text, oldest first — for copy/share out of the app.
-    func exportText() -> String {
+    private static let exportFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss.SSS"
-        return entries
-            .map { "\(formatter.string(from: $0.date)) [\($0.level.rawValue)] \($0.message)" }
+        return formatter
+    }()
+
+    /// Full log as plain text, oldest first — for copy/share out of the app.
+    /// Called from view bodies, so no per-call formatter allocation.
+    func exportText() -> String {
+        entries
+            .map { "\(Self.exportFormatter.string(from: $0.date)) [\($0.level.rawValue)] \($0.message)" }
             .joined(separator: "\n")
     }
 }

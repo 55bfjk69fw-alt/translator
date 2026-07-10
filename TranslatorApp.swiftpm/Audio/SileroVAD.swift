@@ -275,10 +275,9 @@ final class StreamingVAD {
     private var pending: [Float] = []
     /// Most recent model output.
     private(set) var probability: Float = 0
-    /// Total completed 32 ms frames since the last reset.
-    private(set) var frameCount = 0
     /// Invoked once per completed 32 ms frame with that frame's probability
-    /// (a single feed() can complete several frames).
+    /// (a single feed() can complete several frames). Unused by the app;
+    /// tools/silero/verify_harness.swift depends on it.
     var onFrame: ((Float) -> Void)?
 
     init(weights: SileroVAD.Weights) {
@@ -291,7 +290,6 @@ final class StreamingVAD {
         pending.removeAll(keepingCapacity: true)
         phase = 0
         probability = 0
-        frameCount = 0
     }
 
     /// Feed one buffer of mono samples. Returns the highest probability among
@@ -318,7 +316,6 @@ final class StreamingVAD {
             let frame = Array(pending.prefix(SileroVAD.frameLength))
             pending.removeFirst(SileroVAD.frameLength)
             probability = vad.process(frame: frame)
-            frameCount += 1
             onFrame?(probability)
             maxProbability = max(maxProbability ?? 0, probability)
         }

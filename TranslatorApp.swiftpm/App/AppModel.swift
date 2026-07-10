@@ -33,7 +33,6 @@ final class AppModel: ObservableObject {
     @Published private(set) var pttLevel: Float = 0
 
     let transcript: TranscriptStore
-    let log = Log.shared
 
     /// Signal-tab analysis. Deliberately its own ObservableObject (not
     /// forwarded through objectWillChange) so its 5-10 Hz snapshot churn
@@ -113,6 +112,10 @@ final class AppModel: ObservableObject {
         }
         errorBanner = nil
         stopping = false
+        // The estimate next to the lane dots reads as "this conversation's
+        // cost" — start it from zero.
+        costMeter.reset()
+        refreshCost()
 
         do {
             try audioSession.configureForConversation()
@@ -172,6 +175,13 @@ final class AppModel: ObservableObject {
             clients.removeAll()
             resamplers.removeAll()
         }
+        // Cost bookkeeping happens here, not in onStateChange: the clients
+        // were just deregistered, so their async .closed events are dropped
+        // by the identity guard and would never decrement the meter.
+        for (_, state) in sessionStates where state == .open {
+            costMeter.sessionClosed()
+        }
+        sessionStates.removeAll()
         reconnectAttempts.removeAll()
         sessionOpenedAt.removeAll()
         resetPlaybackState()
@@ -256,11 +266,17 @@ final class AppModel: ObservableObject {
                     Log.info("ch\(channel) speech ended")
                 }
             }
-            // Keyed on pass (not voiced): bleed from another speaker must
-            // neither open a session for this lane nor keep it alive.
-            if decision.pass { lastVoiceAt[channel] = Date() }
+            // Keyed on pass AND voiced: bleed from another speaker must
+            // neither open a session for this lane nor keep it alive
+            // (pass is false for bleed), and with the gate disabled — where
+            // pass is unconditionally true, silence included — only detected
+            // speech may open sessions or defeat the idle-close timer.
+            // With the gate enabled the conjunction is identical to pass
+            // alone (pass implies genuine-or-hangover, which implies voiced).
+            let speech = decision.pass && decision.voiced
+            if speech { lastVoiceAt[channel] = Date() }
             guard let resampler = resamplers[channel] else { continue }
-            guard let client = clients[channel] ?? lazyOpenSession(channel: channel, speech: decision.pass) else { continue }
+            guard let client = clients[channel] ?? lazyOpenSession(channel: channel, speech: speech) else { continue }
             let outgoing: AVAudioPCMBuffer?
             if decision.pass {
                 outgoing = buffers[channel]
@@ -514,7 +530,7 @@ final class AppModel: ObservableObject {
     // MARK: - Chinese (user lane) playback (main thread)
 
     private func handleChineseAudio(_ audio: Data) {
-        transcript.appendTranslatedAudio(lane: SpeakerLane.userLaneID, audio: audio, keepAudio: true)
+        transcript.appendTranslatedAudio(lane: SpeakerLane.userLaneID, audio: audio)
         if AppSettings.autoPlayChinese {
             playChineseOverSpeaker(audio)
         }
@@ -610,7 +626,10 @@ final class AppModel: ObservableObject {
         signalAnalyzer.startSession()
         installInputHandler()
         // Bench mode has no clients; processConversationBuffers still runs
-        // and drives the meters, sends go nowhere.
+        // and drives the meters, sends go nowhere. The UI timer runs so the
+        // engine watchdog can recover from config-change auto-stops — bench
+        // is the mode used to provoke exactly those (replugs, BT churn).
+        startUITimer()
         refreshRoute()
         mode = .bench
         Log.info("Bench test running: \(channelCount) channel(s) at \(Int(engineGraph.inputSampleRate)) Hz")
@@ -635,7 +654,7 @@ final class AppModel: ObservableObject {
     /// continues after a pause" failure. Restart it whenever it's found dead
     /// outside an active interruption.
     private func watchdogEngineCheck() {
-        guard mode == .conversation, !pttEngaged, !engineGraph.engine.isRunning else { return }
+        guard mode == .conversation || mode == .bench, !pttEngaged, !engineGraph.engine.isRunning else { return }
         // During an interruption the session can't be reactivated; wait for
         // the .ended notification, but only up to 60 s — it famously doesn't
         // always arrive.
@@ -671,7 +690,13 @@ final class AppModel: ObservableObject {
             }
         }
         for lane in closedLanes {
+            // Decrement here, keyed on the state we last displayed: the
+            // client was deregistered before close(), so its async .closed
+            // event is dropped by the identity guard in onStateChange and
+            // would never balance the meter.
+            if sessionStates[lane] == .open { costMeter.sessionClosed() }
             sessionStates[lane] = .idle
+            sessionOpenedAt[lane] = nil
             reconnectAttempts[lane] = 0
             if disabledLanes.contains(lane) {
                 Log.info("Closed session for \(laneName(lane)) — mic disabled in Settings")
@@ -731,7 +756,7 @@ final class AppModel: ObservableObject {
 
     private func handleRouteChange(_ notification: Notification) {
         refreshRoute()
-        guard mode == .conversation, !pttEngaged else { return }
+        guard mode == .conversation || mode == .bench, !pttEngaged else { return }
         guard let raw = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
               let reason = AVAudioSession.RouteChangeReason(rawValue: raw) else { return }
         switch reason {
@@ -761,13 +786,17 @@ final class AppModel: ObservableObject {
     }
 
     private func restartEngineForCurrentRoute() {
-        guard mode == .conversation else { return }
+        guard mode == .conversation || mode == .bench else { return }
         engineGraph.stop()
         resetPlaybackState()
         do {
             try audioSession.configureForConversation()
-            try engineGraph.start(playerCount: zhPlaybackLane + 1)
-            buildResamplers(channelCount: lanes.count)
+            // Mirror what each mode's start built: bench runs one throwaway
+            // player and no resamplers (nothing is sent anywhere).
+            try engineGraph.start(playerCount: mode == .bench ? 1 : zhPlaybackLane + 1)
+            if mode == .conversation {
+                buildResamplers(channelCount: lanes.count)
+            }
             audioQueue.sync { gate.reset() }
             refreshRoute()
         } catch {

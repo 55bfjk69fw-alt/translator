@@ -6,6 +6,19 @@ import Foundation
 /// translation session event schema is newer than this client; any event we
 /// don't recognize is logged so the schema can be corrected from
 /// DiagnosticsView evidence rather than guesswork.
+///
+/// Threading: ALL mutable state is confined to `queue`, which is also the
+/// underlying queue of the URLSession delegate queue. Delegate callbacks,
+/// receive/send/ping completions, the ping timer, and the public entry
+/// points (which hop onto it) are therefore mutually serialized — including
+/// across reconnects, since the same queue backs every connection's
+/// delegate callbacks. Two invariants this buys:
+///  - Audio queued while connecting is flushed on open as one queue block,
+///    so a chunk arriving mid-flush can neither jump ahead of the queued
+///    speech nor strand itself in the pending buffer.
+///  - Late callbacks from a cancelled connection are identity-checked
+///    against the current task and dropped, so they can't clobber a newer
+///    connection's state.
 final class RealtimeTranslationClient: NSObject {
 
     enum State: Equatable {
@@ -20,9 +33,15 @@ final class RealtimeTranslationClient: NSObject {
     private let apiKey: String
     private let endpointTemplate: String
 
+    /// Confines all mutable state below; see the class comment.
+    private let queue: DispatchQueue
+    private let delegateQueue: OperationQueue
+
+    // MARK: - State (queue-confined)
+
     private var task: URLSessionWebSocketTask?
     private var urlSession: URLSession?
-    private var pingTimer: Timer?
+    private var pingTimer: DispatchSourceTimer?
     private var intentionallyClosed = false
     /// Event types seen this connection; each is logged once so the log
     /// records the actual server schema without flooding.
@@ -45,7 +64,6 @@ final class RealtimeTranslationClient: NSObject {
         var audioBytes = 0
         var heartbeatsDropped = 0
     }
-    private let statsLock = NSLock()
     private var stats = Stats()
     private var lastServerEventAt = Date()
     private var connectStartedAt: Date?
@@ -54,7 +72,6 @@ final class RealtimeTranslationClient: NSObject {
     // Audio arriving while the socket is still connecting is queued and
     // flushed on open, so lazily-opened sessions don't drop the words that
     // triggered them. Bounded to ~30 s of 24 kHz PCM16.
-    private let pendingLock = NSLock()
     private var pendingAudio: [Data] = []
     private var pendingBytes = 0
     private let maxPendingBytes = 1_500_000
@@ -68,7 +85,8 @@ final class RealtimeTranslationClient: NSObject {
         }
     }
 
-    // Callbacks fire on an arbitrary queue; consumers hop to main as needed.
+    // Callbacks fire on the client's private queue; consumers hop to main
+    // as needed.
     // Note: translation sessions emit NO done/completed transcript events and
     // no segment boundaries — deltas are append-only, ordered, correlated
     // only by elapsed_ms. Utterance segmentation is the consumer's job
@@ -84,12 +102,40 @@ final class RealtimeTranslationClient: NSObject {
         self.config = config
         self.apiKey = apiKey
         self.endpointTemplate = endpointTemplate
+        let queue = DispatchQueue(label: "translator.ws.client")
+        self.queue = queue
+        let delegateQueue = OperationQueue()
+        delegateQueue.underlyingQueue = queue
+        delegateQueue.maxConcurrentOperationCount = 1
+        self.delegateQueue = delegateQueue
         super.init()
     }
 
-    // MARK: - Lifecycle
+    // MARK: - Lifecycle (public entry points hop onto the queue)
 
     func connect() {
+        queue.async { self.connectOnQueue() }
+    }
+
+    /// Graceful shutdown: session.close asks the server to flush pending
+    /// input and emit remaining translated output; we keep reading until the
+    /// session.closed ack (bounded by a timeout) — dropping the socket
+    /// immediately loses output still draining from the session.
+    func close() {
+        queue.async { self.closeOnQueue() }
+    }
+
+    /// Append 24 kHz mono PCM16 audio to the session's input buffer.
+    /// Translation sessions accept exactly: session.update,
+    /// session.input_audio_buffer.append, session.close — note the
+    /// "session." prefix on all client events.
+    func sendAudio(_ pcm16: Data) {
+        queue.async { self.sendAudioOnQueue(pcm16) }
+    }
+
+    // MARK: - Lifecycle (queue-confined)
+
+    private func connectOnQueue() {
         guard state == .idle || stateIsClosed else { return }
         guard let url = config.url(endpointTemplate: endpointTemplate) else {
             state = .closed("Bad endpoint URL")
@@ -97,10 +143,8 @@ final class RealtimeTranslationClient: NSObject {
         }
         intentionallyClosed = false
         seenEventTypes.removeAll()
-        statsLock.lock()
         stats = Stats()
         lastServerEventAt = Date()
-        statsLock.unlock()
         connectStartedAt = Date()
         pingTicks = 0
         state = .connecting
@@ -113,9 +157,11 @@ final class RealtimeTranslationClient: NSObject {
         // beta_api_shape_disabled (beta shut down 2026-05-12).
 
         // URLSession retains its delegate until invalidated; reconnects must
-        // release the previous session or every retry leaks one.
+        // release the previous session or every retry leaks one. Late
+        // callbacks from the cancelled connection still land on this queue
+        // and are dropped by the task-identity checks below.
         urlSession?.invalidateAndCancel()
-        let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+        let session = URLSession(configuration: .default, delegate: self, delegateQueue: delegateQueue)
         urlSession = session
         let task = session.webSocketTask(with: request)
         self.task = task
@@ -123,17 +169,13 @@ final class RealtimeTranslationClient: NSObject {
         receiveLoop()
     }
 
-    /// Graceful shutdown: session.close asks the server to flush pending
-    /// input and emit remaining translated output; we keep reading until the
-    /// session.closed ack (bounded by a timeout) — dropping the socket
-    /// immediately loses output still draining from the session.
-    func close() {
+    private func closeOnQueue() {
         guard !intentionallyClosed else { return }
         intentionallyClosed = true
         stopPing()
         if state == .open {
             sendJSON(["type": "session.close"])
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            queue.asyncAfter(deadline: .now() + 3) { [weak self] in
                 self?.forceClose()
             }
         } else {
@@ -141,17 +183,14 @@ final class RealtimeTranslationClient: NSObject {
         }
     }
 
+    /// Queue-confined. Reachable from the session.closed ack, the
+    /// drain-timeout, and closeOnQueue; idempotent.
     private func forceClose() {
-        // Serialized on main: reachable from the receive thread
-        // (session.closed), the drain-timeout timer, and close() callers.
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.task?.cancel(with: .normalClosure, reason: nil)
-            self.task = nil
-            self.urlSession?.invalidateAndCancel()
-            self.urlSession = nil
-            if self.state != .idle { self.state = .closed(nil) }
-        }
+        task?.cancel(with: .normalClosure, reason: nil)
+        task = nil
+        urlSession?.invalidateAndCancel()
+        urlSession = nil
+        if state != .idle { state = .closed(nil) }
     }
 
     private var stateIsClosed: Bool {
@@ -159,36 +198,26 @@ final class RealtimeTranslationClient: NSObject {
         return false
     }
 
-    // MARK: - Sending
+    // MARK: - Sending (queue-confined)
 
-    /// Append 24 kHz mono PCM16 audio to the session's input buffer.
-    /// Translation sessions accept exactly: session.update,
-    /// session.input_audio_buffer.append, session.close — note the
-    /// "session." prefix on all client events.
-    func sendAudio(_ pcm16: Data) {
+    private func sendAudioOnQueue(_ pcm16: Data) {
         // Appending after session.close is a protocol violation.
         guard !intentionallyClosed else { return }
         if state == .open {
             sendAppendEvent(pcm16)
         } else {
-            pendingLock.lock()
             pendingAudio.append(pcm16)
             pendingBytes += pcm16.count
             while pendingBytes > maxPendingBytes, !pendingAudio.isEmpty {
                 pendingBytes -= pendingAudio.removeFirst().count
             }
-            pendingLock.unlock()
-            statsLock.lock()
             stats.chunksQueuedPreOpen += 1
-            statsLock.unlock()
         }
     }
 
     private func sendAppendEvent(_ pcm16: Data) {
-        statsLock.lock()
         stats.audioChunksSent += 1
         stats.audioBytesSent += pcm16.count
-        statsLock.unlock()
         sendJSON([
             "type": "session.input_audio_buffer.append",
             "audio": pcm16.base64EncodedString()
@@ -202,11 +231,9 @@ final class RealtimeTranslationClient: NSObject {
     }
 
     private func flushPendingAudio() {
-        pendingLock.lock()
         let queued = pendingAudio
         pendingAudio.removeAll()
         pendingBytes = 0
-        pendingLock.unlock()
         if !queued.isEmpty {
             let bytes = queued.reduce(0) { $0 + $1.count }
             Log.info("[\(label)] flushing \(queued.count) chunks (\(bytes / 1024)KB) queued while connecting")
@@ -219,10 +246,9 @@ final class RealtimeTranslationClient: NSObject {
               let data = try? JSONSerialization.data(withJSONObject: object),
               let text = String(data: data, encoding: .utf8) else { return }
         task.send(.string(text)) { [weak self] error in
-            guard let error, let self, !self.intentionallyClosed else { return }
-            self.statsLock.lock()
+            // Completion runs on the delegate queue (= self.queue).
+            guard let error, let self, task === self.task, !self.intentionallyClosed else { return }
             self.stats.sendFailures += 1
-            self.statsLock.unlock()
             // A failed send means the socket is broken even though receive()
             // may hang without erroring — fail fast so the lane reconnects
             // instead of staying "open" and permanently silent.
@@ -230,8 +256,9 @@ final class RealtimeTranslationClient: NSObject {
         }
     }
 
-    /// Tear down a connection we've decided is dead (failed send/ping, event
-    /// stall) so the closed state triggers AppModel's reconnect path.
+    /// Queue-confined. Tear down a connection we've decided is dead (failed
+    /// send/ping, event stall) so the closed state triggers AppModel's
+    /// reconnect path.
     private func failConnection(_ reason: String) {
         guard !intentionallyClosed, !stateIsClosed else { return }
         Log.error("[\(label)] \(reason) — dropping socket to trigger reconnect")
@@ -241,11 +268,14 @@ final class RealtimeTranslationClient: NSObject {
         state = .closed(reason)
     }
 
-    // MARK: - Receiving
+    // MARK: - Receiving (queue-confined)
 
     private func receiveLoop() {
-        task?.receive { [weak self] result in
-            guard let self else { return }
+        guard let task else { return }
+        task.receive { [weak self] result in
+            // Completion runs on the delegate queue (= self.queue). A late
+            // result from a replaced connection must not touch state.
+            guard let self, task === self.task else { return }
             switch result {
             case .success(let message):
                 switch message {
@@ -284,9 +314,7 @@ final class RealtimeTranslationClient: NSObject {
         if seenEventTypes.insert(type).inserted {
             Log.info("[\(label)] first \(type)")
         }
-        statsLock.lock()
         lastServerEventAt = Date()
-        statsLock.unlock()
 
         switch type {
         case "session.output_audio.delta":
@@ -297,31 +325,23 @@ final class RealtimeTranslationClient: NSObject {
             if let base64 = object["delta"] as? String,
                let audio = Data(base64Encoded: base64) {
                 if Self.isPureSilence(audio) {
-                    statsLock.lock()
                     stats.heartbeatsDropped += 1
-                    statsLock.unlock()
                 } else {
-                    statsLock.lock()
                     stats.audioFrames += 1
                     stats.audioBytes += audio.count
-                    statsLock.unlock()
                     onTranslatedAudio?(audio)
                 }
             }
         case "session.input_transcript.delta":
             if let delta = object["delta"] as? String {
-                statsLock.lock()
                 stats.sourceDeltas += 1
                 stats.sourceChars += delta.count
-                statsLock.unlock()
                 onSourceTranscriptDelta?(delta)
             }
         case "session.output_transcript.delta":
             if let delta = object["delta"] as? String {
-                statsLock.lock()
                 stats.translationDeltas += 1
                 stats.translationChars += delta.count
-                statsLock.unlock()
                 onTranslatedTranscriptDelta?(delta)
             }
         case "session.created", "session.updated":
@@ -339,43 +359,42 @@ final class RealtimeTranslationClient: NSObject {
         }
     }
 
-    // MARK: - Keepalive
+    // MARK: - Keepalive (queue-confined)
 
     private func startPing() {
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.pingTimer?.invalidate()
-            self.pingTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
-                guard let self, self.state == .open else { return }
-                // The server sends events continuously while a session is
-                // healthy (heartbeat audio frames every ~200 ms). A long
-                // event gap on an "open" socket means it's half-dead —
-                // receive() can hang for minutes without erroring, and a
-                // lost pong never invokes the sendPing handler either.
-                self.statsLock.lock()
-                let eventGap = Date().timeIntervalSince(self.lastServerEventAt)
-                self.statsLock.unlock()
-                if eventGap > 75 {
-                    self.failConnection("no server events for \(Int(eventGap))s — connection presumed dead")
-                    return
-                }
-                self.pingTicks += 1
-                if self.pingTicks % 3 == 0 { self.logSummary(context: "periodic") }
-                self.task?.sendPing { [weak self] error in
-                    if let error {
-                        self?.failConnection("ping failed: \(error.localizedDescription)")
-                    }
-                }
-            }
+        pingTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 20, repeating: 20)
+        timer.setEventHandler { [weak self] in self?.pingTick() }
+        timer.resume()
+        pingTimer = timer
+    }
+
+    private func pingTick() {
+        guard state == .open else { return }
+        // The server sends events continuously while a session is
+        // healthy (heartbeat audio frames every ~200 ms). A long
+        // event gap on an "open" socket means it's half-dead —
+        // receive() can hang for minutes without erroring, and a
+        // lost pong never invokes the sendPing handler either.
+        let eventGap = Date().timeIntervalSince(lastServerEventAt)
+        if eventGap > 75 {
+            failConnection("no server events for \(Int(eventGap))s — connection presumed dead")
+            return
+        }
+        pingTicks += 1
+        if pingTicks % 3 == 0 { logSummary(context: "periodic") }
+        guard let task else { return }
+        task.sendPing { [weak self] error in
+            guard let self, let error, task === self.task else { return }
+            self.failConnection("ping failed: \(error.localizedDescription)")
         }
     }
 
     /// One-line traffic summary, logged every ~60 s while open and once on
     /// close. Reads as: what we sent vs. what each server stream returned.
     private func logSummary(context: String) {
-        statsLock.lock()
         let s = stats
-        statsLock.unlock()
         // A handshake that never carried traffic has nothing to summarize.
         guard s.audioChunksSent + s.chunksQueuedPreOpen + s.sourceDeltas
             + s.translationDeltas + s.audioFrames + s.heartbeatsDropped > 0 else { return }
@@ -399,22 +418,25 @@ final class RealtimeTranslationClient: NSObject {
     }
 
     private func stopPing() {
-        DispatchQueue.main.async { [weak self] in
-            self?.pingTimer?.invalidate()
-            self?.pingTimer = nil
-        }
+        pingTimer?.cancel()
+        pingTimer = nil
     }
 }
 
 extension RealtimeTranslationClient: URLSessionWebSocketDelegate {
+    // All delegate callbacks run on delegateQueue (= self.queue); each is
+    // identity-checked so late callbacks from a cancelled connection are
+    // ignored.
     func urlSession(_ session: URLSession,
                     webSocketTask: URLSessionWebSocketTask,
                     didOpenWithProtocol protocol: String?) {
+        guard webSocketTask === task else { return }
         let latency = connectStartedAt.map { String(format: " (%.1fs)", Date().timeIntervalSince($0)) } ?? ""
         Log.info("[\(label)] WS open\(latency)")
-        statsLock.lock()
         lastServerEventAt = Date()
-        statsLock.unlock()
+        // Marking open and flushing the pre-open queue is one queue block,
+        // so concurrent sendAudio calls order strictly before or after it —
+        // no chunk can overtake the queued speech or strand in the buffer.
         state = .open
         sendJSON(config.sessionUpdateEvent())
         flushPendingAudio()
@@ -424,6 +446,7 @@ extension RealtimeTranslationClient: URLSessionWebSocketDelegate {
     func urlSession(_ session: URLSession,
                     task: URLSessionTask,
                     didCompleteWithError error: Error?) {
+        guard task === self.task else { return }
         // A rejected handshake (401/403/404) surfaces here with the HTTP
         // status on task.response rather than as a WebSocket close frame.
         if let http = task.response as? HTTPURLResponse, http.statusCode != 101 {
@@ -438,6 +461,7 @@ extension RealtimeTranslationClient: URLSessionWebSocketDelegate {
                     webSocketTask: URLSessionWebSocketTask,
                     didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
                     reason: Data?) {
+        guard webSocketTask === task else { return }
         let reasonText = reason.flatMap { String(data: $0, encoding: .utf8) }
         if !intentionallyClosed {
             Log.warn("[\(label)] WS closed (\(closeCode.rawValue)) \(reasonText ?? "")")

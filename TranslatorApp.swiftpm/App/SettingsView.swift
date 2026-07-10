@@ -131,12 +131,18 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    // Re-apply to the live gate on change, matching the
+                    // Signal tab's tuning panel — without this the toggles
+                    // only took effect at the next Start.
                     Toggle("Cross-channel noise gate", isOn: $noiseGateEnabled)
+                        .onChange(of: noiseGateEnabled) { model.applyGateTuning() }
                     Toggle("Neural voice detection", isOn: $neuralVADEnabled)
+                        .onChange(of: neuralVADEnabled) { model.applyGateTuning() }
                     VStack(alignment: .leading) {
                         Text(String(format: "Minimum voice threshold: %.3f", vadThreshold))
                             .font(.callout)
                         Slider(value: $vadThreshold, in: 0.002...0.05)
+                            .onChange(of: vadThreshold) { model.applyGateTuning() }
                     }
                     Picker("Server noise reduction", selection: $noiseReduction) {
                         Text("Near field (lav mics)").tag("near_field")

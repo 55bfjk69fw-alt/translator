@@ -47,10 +47,12 @@ final class EngineGraph {
         // hiccup) — often during quiet periods. Nothing else reports this,
         // so log it loudly and clear isRunning; AppModel's watchdog restarts
         // the graph.
+        // queue: .main so isRunning is only ever touched on the main thread
+        // (the notification posts on an internal CoreAudio thread otherwise).
         configChangeObserver = NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange,
             object: engine,
-            queue: nil
+            queue: .main
         ) { [weak self] _ in
             guard let self, self.isRunning else { return }
             self.isRunning = false
@@ -123,12 +125,16 @@ final class EngineGraph {
         let frames = Int(buffer.frameLength)
         guard frames > 0 else { return }
 
-        if let floatData = buffer.floatChannelData {
-            // Non-interleaved float32: pass channel pointers straight through.
+        // Interleaved multichannel float32 would still return non-nil
+        // floatChannelData, but only index 0 is a valid pointer — fanning
+        // out per-channel pointers from it reads garbage. iOS input taps
+        // are deinterleaved in practice; drop loudly if that ever changes.
+        if let floatData = buffer.floatChannelData,
+           !buffer.format.isInterleaved || buffer.format.channelCount == 1 {
             let channels = (0..<Int(buffer.format.channelCount)).map { UnsafePointer(floatData[$0]) }
             onInputChannels?(channels, frames, buffer.format.sampleRate)
         } else {
-            Log.warn("Unexpected input buffer layout (no floatChannelData); dropping buffer")
+            Log.warn("Unexpected input buffer layout (interleaved or no floatChannelData); dropping buffer")
         }
     }
 
@@ -158,12 +164,6 @@ final class EngineGraph {
     func setLaneVolume(_ volume: Float, lane: Int) {
         guard players.indices.contains(lane) else { return }
         players[lane].volume = volume
-    }
-
-    func stopLane(_ lane: Int) {
-        guard players.indices.contains(lane) else { return }
-        players[lane].stop()
-        players[lane].play()
     }
 
     static func pcm16ToFloatBuffer(_ data: Data, format: AVAudioFormat, gain: Float = 1) -> AVAudioPCMBuffer? {

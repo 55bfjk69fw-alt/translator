@@ -118,7 +118,7 @@ struct ConversationView: View {
     private var pttBar: some View {
         VStack(spacing: 4) {
             if model.speakerOverrideActive {
-                Label("Playing Chinese over speaker", systemImage: "speaker.wave.2.fill")
+                Label("Playing translation over speaker", systemImage: "speaker.wave.2.fill")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -253,7 +253,7 @@ private struct PushToTalkButton: View {
 
     var body: some View {
         Label(
-            isTalking ? "Speaking… (release to translate)" : "Hold to speak English",
+            isTalking ? "Speaking… (release to translate)" : "Hold to speak",
             systemImage: "mic.fill"
         )
         .font(.headline)

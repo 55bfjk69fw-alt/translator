@@ -270,7 +270,7 @@ final class AppModel: ObservableObject {
     private func lazyOpenSession(channel: Int, speech: Bool) -> RealtimeTranslationClient? {
         guard speech, pipelineActive, let apiKey = sessionAPIKey else { return nil }
         Log.info("Speech on channel \(channel) — opening translation session")
-        let client = makeClient(lane: channel, outputLanguage: "en", apiKey: apiKey)
+        let client = makeClient(lane: channel, outputLanguage: AppSettings.outputLanguage, apiKey: apiKey)
         clients[channel] = client
         client.connect()
         return client
@@ -310,7 +310,8 @@ final class AppModel: ObservableObject {
     private func makeClient(lane: Int, outputLanguage: String, apiKey: String) -> RealtimeTranslationClient {
         var config = SessionConfig(outputLanguage: outputLanguage)
         config.model = AppSettings.modelName
-        let label = lane == SpeakerLane.userLaneID ? "me→zh" : "ch\(lane)→\(outputLanguage)"
+        config.noiseReduction = AppSettings.noiseReduction
+        let label = lane == SpeakerLane.userLaneID ? "me→\(outputLanguage)" : "ch\(lane)→\(outputLanguage)"
         let client = RealtimeTranslationClient(
             label: label,
             config: config,
@@ -459,7 +460,7 @@ final class AppModel: ObservableObject {
                 self.resamplers[SpeakerLane.userLaneID] = StreamResampler(inputSampleRate: rate)
             }
             if self.audioQueue.sync(execute: { self.clients[SpeakerLane.userLaneID] }) == nil {
-                self.openClient(lane: SpeakerLane.userLaneID, outputLanguage: "zh", apiKey: apiKey)
+                self.openClient(lane: SpeakerLane.userLaneID, outputLanguage: AppSettings.pttOutputLanguage, apiKey: apiKey)
             }
             self.refreshRoute()
         }

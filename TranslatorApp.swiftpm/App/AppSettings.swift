@@ -11,6 +11,7 @@ enum AppSettings {
     static let userNameKey = "userName"
     static let idleCloseSecondsKey = "idleCloseSeconds"
     static let showPinyinKey = "showPinyin"
+    static let outputGainKey = "outputGain"
 
     static func speakerNameKey(_ channel: Int) -> String { "speakerName\(channel)" }
 
@@ -39,6 +40,13 @@ enum AppSettings {
     static var vadThreshold: Float {
         let value = UserDefaults.standard.float(forKey: vadThresholdKey)
         return value > 0 ? value : 0.004
+    }
+
+    /// Master playback volume (1.0 = 100%). Below 1 attenuates on the
+    /// mixer; above 1 digitally boosts translated audio before playback.
+    static var outputGain: Float {
+        let value = UserDefaults.standard.float(forKey: outputGainKey)
+        return value > 0 ? value : 1.0
     }
 
     /// Seconds of channel silence before its session is closed (0 = never).

@@ -20,6 +20,21 @@ final class EngineGraph {
         interleaved: false
     )!
 
+    /// Master playback volume (1.0 = unity). Attenuation below 1 goes on
+    /// the main mixer and applies instantly, including to already-scheduled
+    /// audio; boost above 1 is baked into each subsequent buffer (the mixer
+    /// can't exceed unity) with samples clamped at full scale. Main-thread
+    /// only, like schedule(). Survives engine rebuilds.
+    var outputGain: Float = 1.0 {
+        didSet { applyMixerGain() }
+    }
+
+    private var boostFactor: Float { max(1, outputGain) }
+
+    private func applyMixerGain() {
+        engine.mainMixerNode.outputVolume = min(1, max(0, outputGain))
+    }
+
     private(set) var inputChannelCount = 0
     private(set) var inputSampleRate: Double = 48_000
     private(set) var isRunning = false
@@ -81,6 +96,7 @@ final class EngineGraph {
             self?.handleInput(buffer: buffer)
         }
 
+        applyMixerGain()
         engine.prepare()
         try engine.start()
         players.forEach { $0.play() }
@@ -121,7 +137,7 @@ final class EngineGraph {
     /// Schedule translated audio (24 kHz mono PCM16) on a playback lane.
     func schedule(pcm16: Data, lane: Int, completion: (() -> Void)? = nil) {
         guard players.indices.contains(lane),
-              let buffer = Self.pcm16ToFloatBuffer(pcm16, format: playbackFormat) else {
+              let buffer = Self.pcm16ToFloatBuffer(pcm16, format: playbackFormat, gain: boostFactor) else {
             completion?()
             return
         }
@@ -150,7 +166,7 @@ final class EngineGraph {
         players[lane].play()
     }
 
-    static func pcm16ToFloatBuffer(_ data: Data, format: AVAudioFormat) -> AVAudioPCMBuffer? {
+    static func pcm16ToFloatBuffer(_ data: Data, format: AVAudioFormat, gain: Float = 1) -> AVAudioPCMBuffer? {
         let sampleCount = data.count / MemoryLayout<Int16>.size
         guard sampleCount > 0,
               let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(sampleCount)) else {
@@ -158,10 +174,11 @@ final class EngineGraph {
         }
         buffer.frameLength = AVAudioFrameCount(sampleCount)
         guard let target = buffer.floatChannelData?[0] else { return nil }
+        let scale = gain / 32768.0
         data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             let samples = raw.bindMemory(to: Int16.self)
             for i in 0..<sampleCount {
-                target[i] = Float(Int16(littleEndian: samples[i])) / 32768.0
+                target[i] = max(-1, min(1, Float(Int16(littleEndian: samples[i])) * scale))
             }
         }
         return buffer

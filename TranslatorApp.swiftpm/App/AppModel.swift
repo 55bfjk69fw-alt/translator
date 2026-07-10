@@ -94,6 +94,7 @@ final class AppModel: ObservableObject {
 
     init() {
         transcript = TranscriptStore()
+        engineGraph.outputGain = AppSettings.outputGain
         // Nested ObservableObject: forward its changes so views observing
         // AppModel re-render on transcript updates.
         transcript.objectWillChange
@@ -235,7 +236,10 @@ final class AppModel: ObservableObject {
             guard let data = buffer.floatChannelData else { return }
             channels.append(UnsafePointer(data[0]))
         }
-        let decisions = gate.evaluate(channels: channels, frames: frames, sampleRate: sampleRate)
+        // UserDefaults is thread-safe; reading per buffer means a Settings
+        // toggle mutes/unmutes a mic mid-conversation.
+        let enabledMask = (0..<channels.count).map { AppSettings.speakerEnabled($0) }
+        let decisions = gate.evaluate(channels: channels, frames: frames, sampleRate: sampleRate, channelEnabled: enabledMask)
         // Fan out to the Signal tab. When the tab is hidden this is a flag
         // check and return; otherwise the buffers are retained (no copy)
         // onto the analyzer's lower-priority queue.
@@ -415,6 +419,11 @@ final class AppModel: ObservableObject {
     func lane(for laneID: Int) -> SpeakerLane {
         if laneID == SpeakerLane.userLaneID { return SpeakerLane.userLane(name: AppSettings.userName) }
         return lanes.first(where: { $0.id == laneID }) ?? SpeakerLane.djiLane(channel: max(0, laneID))
+    }
+
+    /// Live update from the Settings volume slider (main thread).
+    func setOutputGain(_ gain: Float) {
+        engineGraph.outputGain = gain
     }
 
     // MARK: - English playback with overlap ducking (main thread)
@@ -637,16 +646,23 @@ final class AppModel: ObservableObject {
 
     /// Close sessions whose channel has been silent past the idle timeout —
     /// they reopen automatically on the next detected speech. Stops billing
-    /// for quiet channels and for the PTT lane between uses.
+    /// for quiet channels and for the PTT lane between uses. Sessions on
+    /// mics disabled in Settings close immediately, timeout or not.
     private func closeIdleSessions() {
+        guard mode != .idle else { return }
         let timeout = AppSettings.idleCloseSeconds
-        guard timeout > 0, mode != .idle else { return }
         let now = Date()
         var closedLanes: [Int] = []
+        var disabledLanes: Set<Int> = []
         audioQueue.sync {
             for (lane, client) in clients {
                 if lane == SpeakerLane.userLaneID && pttEngaged { continue }
-                guard let last = lastVoiceAt[lane], now.timeIntervalSince(last) > timeout else { continue }
+                if lane >= 0 && !AppSettings.speakerEnabled(lane) {
+                    disabledLanes.insert(lane)
+                } else {
+                    guard timeout > 0, let last = lastVoiceAt[lane],
+                          now.timeIntervalSince(last) > timeout else { continue }
+                }
                 clients[lane] = nil
                 client.close()
                 closedLanes.append(lane)
@@ -655,7 +671,11 @@ final class AppModel: ObservableObject {
         for lane in closedLanes {
             sessionStates[lane] = .idle
             reconnectAttempts[lane] = 0
-            Log.info("Closed idle session for \(laneName(lane)) (silent \(Int(timeout))s) — reopens on speech")
+            if disabledLanes.contains(lane) {
+                Log.info("Closed session for \(laneName(lane)) — mic disabled in Settings")
+            } else {
+                Log.info("Closed idle session for \(laneName(lane)) (silent \(Int(timeout))s) — reopens on speech")
+            }
         }
     }
 

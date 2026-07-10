@@ -28,7 +28,13 @@ let package = Package(
                 .landscapeLeft
             ],
             capabilities: [
-                .microphone(purposeString: "Captures audio from the DJI Mic receiver and AirPods to translate conversations in real time.")
+                .microphone(purposeString: "Captures audio from the DJI Mic receiver and AirPods to translate conversations in real time."),
+                // The staged pipeline transcribes on-device via
+                // SpeechAnalyzer/SpeechTranscriber, which reportedly needs no
+                // speech-recognition authorization — the purpose string is
+                // cheap insurance. If this case is missing from the
+                // Playgrounds toolchain's AppleProductTypes, drop it.
+                .speechRecognition(purposeString: "Transcribes speech on-device for the staged translation pipeline.")
             ],
             appCategory: .productivity
         )

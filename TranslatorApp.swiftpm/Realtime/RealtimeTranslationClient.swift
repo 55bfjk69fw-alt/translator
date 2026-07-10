@@ -19,14 +19,11 @@ import Foundation
 ///  - Late callbacks from a cancelled connection are identity-checked
 ///    against the current task and dropped, so they can't clobber a newer
 ///    connection's state.
-final class RealtimeTranslationClient: NSObject {
+final class RealtimeTranslationClient: NSObject, TranslationLaneSession {
 
-    enum State: Equatable {
-        case idle
-        case connecting
-        case open
-        case closed(String?)
-    }
+    /// Hoisted to LaneSessionState so the staged pipeline can share it;
+    /// aliased here to keep existing call sites reading naturally.
+    typealias State = LaneSessionState
 
     let label: String
     private let config: SessionConfig
@@ -112,6 +109,15 @@ final class RealtimeTranslationClient: NSObject {
     /// max(server elapsed_ms, input audio appended), so it keeps counting
     /// through the post-close drain and the pre-open queue flush.
     var onBilledSeconds: ((Double) -> Void)?
+
+    // Segment-keyed callbacks from TranslationLaneSession: the realtime
+    // protocol has no segment boundaries, so these are stored but never
+    // fired — only the staged pipeline uses them.
+    var onSegmentSource: ((UUID, String, Bool) -> Void)?
+    var onSegmentTranslation: ((UUID, String) -> Void)?
+    var onSegmentAudio: ((UUID, Data) -> Void)?
+    var onSegmentCompleted: ((UUID) -> Void)?
+    var onCostDollars: ((Double) -> Void)?
 
     init(label: String, config: SessionConfig, apiKey: String, endpointTemplate: String) {
         self.label = label

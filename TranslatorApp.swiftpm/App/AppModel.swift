@@ -25,7 +25,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var lanes: [SpeakerLane] = []
     @Published private(set) var meters: [Float] = []
     @Published private(set) var gateOpen: [Bool] = []
-    @Published private(set) var sessionStates: [Int: RealtimeTranslationClient.State] = [:]
+    @Published private(set) var sessionStates: [Int: LaneSessionState] = [:]
     @Published private(set) var route: AudioSessionController.RouteSnapshot?
     @Published private(set) var estimatedCost: Double = 0
     @Published var errorBanner: String?
@@ -47,12 +47,17 @@ final class AppModel: ObservableObject {
     private let costMeter = CostMeter()
     private let audioQueue = DispatchQueue(label: "translator.audio.pipeline", qos: .userInitiated)
 
+    /// Apple Translation framework broker (staged pipeline's on-device
+    /// translation provider). The broker is pure queue plumbing — only the
+    /// bridge views that serve it are iOS 18-gated.
+    let translationBroker = AppleTranslationBroker()
+
     /// laneID -> client. DJI lanes are 0..<channelCount; the user's
     /// push-to-talk lane is SpeakerLane.userLaneID.
     /// `clients`, `resamplers`, and `gate` internals are confined to
     /// audioQueue (mutations from the main thread hop via audioQueue.sync)
     /// because the tap pipeline reads them concurrently.
-    private var clients: [Int: RealtimeTranslationClient] = [:]
+    private var clients: [Int: any TranslationLaneSession] = [:]
     private var resamplers: [Int: StreamResampler] = [:]
     private var reconnectAttempts: [Int: Int] = [:]
     private var sessionOpenedAt: [Int: Date] = [:]
@@ -62,6 +67,12 @@ final class AppModel: ObservableObject {
     // never opens one) and are closed again after idle timeout.
     private var pipelineActive = false
     private var sessionAPIKey: String?
+    /// Pipeline mode + staged provider configuration snapshotted at Start:
+    /// lanes opened mid-conversation must match what the Start-time key
+    /// check validated (a Settings flip applies on the next Start).
+    /// audioQueue-confined like sessionAPIKey.
+    private var sessionPipelineMode: AppSettings.PipelineMode = .realtime
+    private var sessionStagedConfig: AppSettings.StagedConfig?
     private var lastVoiceAt: [Int: Date] = [:]
     /// Last logged voiced state per channel (audioQueue-confined) so
     /// speech start/end transitions land in the diagnostics log.
@@ -106,8 +117,23 @@ final class AppModel: ObservableObject {
 
     func startConversation() {
         guard mode == .idle else { return }
-        guard let apiKey = KeychainStore.loadAPIKey(), !apiKey.isEmpty else {
+        let pipelineMode = AppSettings.pipelineMode
+        let stagedConfig = pipelineMode == .staged ? AppSettings.stagedConfig() : nil
+        let apiKey = KeychainStore.loadAPIKey()
+        // The staged pipeline only needs a key for its OpenAI stages; an
+        // all-on-device configuration starts without one.
+        let needsKey = pipelineMode == .realtime || (stagedConfig?.needsOpenAIKey ?? false)
+        if needsKey, (apiKey ?? "").isEmpty {
             errorBanner = "Add your OpenAI API key in Settings first."
+            return
+        }
+        // Pre-flight the one staged configuration that can't translate at
+        // all: Apple Intelligence unavailable with no key to fall back to.
+        if #available(iOS 26.0, *),
+           stagedConfig?.translationProvider == .appleIntelligence,
+           (apiKey ?? "").isEmpty,
+           let problem = FoundationModelsTranslator.availabilityProblem {
+            errorBanner = "Apple Intelligence is unavailable (\(problem)). Add an OpenAI key for fallback or pick another translator."
             return
         }
         errorBanner = nil
@@ -142,13 +168,15 @@ final class AppModel: ObservableObject {
             gate.reset()
             pipelineActive = true
             sessionAPIKey = apiKey
+            sessionPipelineMode = pipelineMode
+            sessionStagedConfig = stagedConfig
             lastVoiceAt.removeAll()
             voicedState.removeAll()
         }
         buildResamplers(channelCount: channelCount)
         // Sessions are opened lazily on first speech per channel, not here —
         // a disconnected/powered-off TX never opens a billed session.
-        sessionStates = Dictionary(uniqueKeysWithValues: (0..<channelCount).map { ($0, RealtimeTranslationClient.State.idle) })
+        sessionStates = Dictionary(uniqueKeysWithValues: (0..<channelCount).map { ($0, LaneSessionState.idle) })
 
         signalAnalyzer.startSession()
         installInputHandler()
@@ -170,6 +198,7 @@ final class AppModel: ObservableObject {
         audioQueue.sync {
             pipelineActive = false
             sessionAPIKey = nil
+            sessionStagedConfig = nil
             lastVoiceAt.removeAll()
             for (_, client) in clients { client.close() }
             clients.removeAll()
@@ -290,10 +319,12 @@ final class AppModel: ObservableObject {
     /// time genuine (non-bleed) speech is detected on it; the client queues
     /// audio while the socket connects, so the triggering words are
     /// translated too.
-    private func lazyOpenSession(channel: Int, speech: Bool) -> RealtimeTranslationClient? {
-        guard speech, pipelineActive, let apiKey = sessionAPIKey else { return nil }
+    private func lazyOpenSession(channel: Int, speech: Bool) -> (any TranslationLaneSession)? {
+        guard speech, pipelineActive else { return nil }
         Log.info("Speech on channel \(channel) — opening translation session")
-        let client = makeClient(lane: channel, outputLanguage: AppSettings.outputLanguage, apiKey: apiKey)
+        let client = makeClient(lane: channel, outputLanguage: AppSettings.outputLanguage,
+                                apiKey: sessionAPIKey, pipelineMode: sessionPipelineMode,
+                                stagedConfig: sessionStagedConfig)
         clients[channel] = client
         client.connect()
         return client
@@ -328,31 +359,91 @@ final class AppModel: ObservableObject {
 
     // MARK: - Sessions
 
-    /// Create and wire a client without registering or connecting it.
-    /// Safe to call from any thread (settings/keychain are thread-safe).
-    private func makeClient(lane: Int, outputLanguage: String, apiKey: String) -> RealtimeTranslationClient {
-        var config = SessionConfig(outputLanguage: outputLanguage)
-        config.model = AppSettings.modelName
-        config.noiseReduction = AppSettings.noiseReduction
+    /// Create and wire a client for the active pipeline mode without
+    /// registering or connecting it. Safe to call from any thread
+    /// (settings/keychain are thread-safe).
+    private func makeClient(lane: Int, outputLanguage: String, apiKey: String?,
+                            pipelineMode: AppSettings.PipelineMode,
+                            stagedConfig: AppSettings.StagedConfig?) -> any TranslationLaneSession {
         let label = lane == SpeakerLane.userLaneID ? "me→\(outputLanguage)" : "ch\(lane)→\(outputLanguage)"
-        let client = RealtimeTranslationClient(
-            label: label,
-            config: config,
-            apiKey: apiKey,
-            endpointTemplate: AppSettings.endpointTemplate
-        )
+        let client: any TranslationLaneSession
+        if #available(iOS 26.0, *), pipelineMode == .staged, let stagedConfig {
+            client = makeStagedClient(lane: lane, label: label, outputLanguage: outputLanguage,
+                                      apiKey: apiKey, config: stagedConfig)
+        } else {
+            var config = SessionConfig(outputLanguage: outputLanguage)
+            config.model = AppSettings.modelName
+            config.noiseReduction = AppSettings.noiseReduction
+            client = RealtimeTranslationClient(
+                label: label,
+                config: config,
+                apiKey: apiKey ?? "",
+                endpointTemplate: AppSettings.endpointTemplate
+            )
+        }
         wireClient(client, lane: lane)
         return client
     }
 
+    /// Assemble the staged pipeline (on-device STT → translator → TTS) from
+    /// the configuration snapshotted at Start.
+    @available(iOS 26.0, *)
+    private func makeStagedClient(lane: Int, label: String, outputLanguage: String,
+                                  apiKey: String?, config: AppSettings.StagedConfig) -> any TranslationLaneSession {
+        let translator: any UtteranceTranslator
+        switch config.translationProvider {
+        case .openAIText:
+            translator = OpenAITextTranslator(apiKey: apiKey ?? "", model: config.textModelName)
+        case .appleTranslation:
+            translator = AppleTranslationTranslator(broker: translationBroker)
+        case .appleIntelligence:
+            if let onDevice = FoundationModelsTranslator() {
+                translator = onDevice
+            } else if let apiKey, !apiKey.isEmpty {
+                Log.warn("[\(label)] Apple Intelligence unavailable — falling back to OpenAI text translation")
+                translator = OpenAITextTranslator(apiKey: apiKey, model: config.textModelName)
+            } else {
+                // Start pre-flights this; reachable only if availability
+                // changed mid-conversation. Segments degrade to source-only.
+                translator = UnavailableTranslator(reason: "Apple Intelligence is unavailable on this device and no OpenAI key is saved")
+            }
+        }
+        let synthesizer: (any SpeechSynthesisStage)?
+        switch config.ttsProvider {
+        case .onDevice:
+            synthesizer = OnDeviceSynthesizer()
+        case .openAI:
+            synthesizer = OpenAISynthesizer(
+                apiKey: apiKey ?? "",
+                model: config.openAITTSModel,
+                voice: config.openAITTSVoice
+            )
+        case .none:
+            synthesizer = nil
+        }
+        let sourceLocale = lane == SpeakerLane.userLaneID
+            ? config.userLanguage
+            : config.sourceLanguage
+        return StagedTranslationClient(
+            label: label,
+            sourceLocaleIdentifier: sourceLocale,
+            targetLanguage: outputLanguage,
+            translator: translator,
+            synthesizer: synthesizer
+        )
+    }
+
     /// Main-thread path (push-to-talk lane): register + connect.
-    private func openClient(lane: Int, outputLanguage: String, apiKey: String) {
-        let client = makeClient(lane: lane, outputLanguage: outputLanguage, apiKey: apiKey)
+    private func openClient(lane: Int, outputLanguage: String, apiKey: String?) {
+        let (pipelineMode, stagedConfig) = audioQueue.sync { (sessionPipelineMode, sessionStagedConfig) }
+        let client = makeClient(lane: lane, outputLanguage: outputLanguage,
+                                apiKey: apiKey, pipelineMode: pipelineMode,
+                                stagedConfig: stagedConfig)
         audioQueue.sync { clients[lane] = client }
         client.connect()
     }
 
-    private func wireClient(_ client: RealtimeTranslationClient, lane: Int) {
+    private func wireClient(_ client: any TranslationLaneSession, lane: Int) {
         let isUserLane = lane == SpeakerLane.userLaneID
 
         client.onStateChange = { [weak self, weak client] state in
@@ -402,6 +493,42 @@ final class AppModel: ObservableObject {
                     self.playEnglishAudio(audio, lane: lane)
                 }
             }
+        }
+
+        // Staged-pipeline callbacks. The realtime client stores these but
+        // never fires them; the staged client uses them instead of the
+        // append-only delta callbacks above.
+        client.onSegmentSource = { [weak self] segmentID, text, isFinal in
+            DispatchQueue.main.async {
+                self?.transcript.upsertSegmentSource(lane: lane, segmentID: segmentID, text: text, isFinal: isFinal)
+            }
+        }
+        client.onSegmentTranslation = { [weak self] segmentID, delta in
+            DispatchQueue.main.async {
+                self?.transcript.appendSegmentTranslation(lane: lane, segmentID: segmentID, text: delta)
+            }
+        }
+        client.onSegmentAudio = { [weak self] segmentID, audio in
+            guard let self else { return }
+            DispatchQueue.main.async {
+                if isUserLane {
+                    self.handleUserLaneAudio(audio) {
+                        self.transcript.appendSegmentAudio(lane: lane, segmentID: segmentID, audio: audio)
+                    }
+                } else {
+                    self.playEnglishAudio(audio, lane: lane)
+                }
+            }
+        }
+        client.onSegmentCompleted = { [weak self] segmentID in
+            DispatchQueue.main.async {
+                self?.transcript.finalizeSegment(segmentID)
+            }
+        }
+        // Like onBilledSeconds: thread-safe meter, no identity guard, no
+        // main hop — cost reported during a close drain must still count.
+        client.onCostDollars = { [weak self] dollars in
+            self?.costMeter.addDollars(dollars)
         }
     }
 
@@ -464,7 +591,12 @@ final class AppModel: ObservableObject {
 
     func pttPressed() {
         guard mode == .conversation else { return }
-        guard let apiKey = KeychainStore.loadAPIKey(), !apiKey.isEmpty else { return }
+        let apiKey = KeychainStore.loadAPIKey()
+        // Same rule as Start, against the Start-time snapshot: only the
+        // OpenAI-backed stages need a key.
+        let (pipelineMode, stagedConfig) = audioQueue.sync { (sessionPipelineMode, sessionStagedConfig) }
+        let needsKey = pipelineMode == .realtime || (stagedConfig?.needsOpenAIKey ?? false)
+        if needsKey, (apiKey ?? "").isEmpty { return }
         mode = .pushToTalk
         pttEngaged = true
         Log.info("PTT engaged — switching input to AirPods mic")
@@ -526,7 +658,16 @@ final class AppModel: ObservableObject {
     // MARK: - Chinese (user lane) playback (main thread)
 
     private func handleChineseAudio(_ audio: Data) {
-        transcript.appendTranslatedAudio(lane: SpeakerLane.userLaneID, audio: audio)
+        handleUserLaneAudio(audio) {
+            transcript.appendTranslatedAudio(lane: SpeakerLane.userLaneID, audio: audio)
+        }
+    }
+
+    /// User-lane playback policy, shared by both pipelines: store the audio
+    /// for replay (the caller picks the transcript keying) and auto-play it
+    /// over the speaker if enabled.
+    private func handleUserLaneAudio(_ audio: Data, attach: () -> Void) {
+        attach()
         if AppSettings.autoPlayChinese {
             playChineseOverSpeaker(audio)
         }

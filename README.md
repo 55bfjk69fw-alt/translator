@@ -71,6 +71,36 @@ channels to iPadOS (DJI certifies it for GarageBand on iOS; this app is the seco
 Keep the app in the foreground: Swift Playgrounds apps can't run background audio.
 The app disables the screen-idle timer while a conversation is running.
 
+## Pipelines — Realtime vs Staged (iPadOS 26)
+
+Settings → **Pipeline** picks how a lane's speech becomes translated output:
+
+- **Realtime (combined, default)** — the original single OpenAI
+  `gpt-realtime-translate` session per speaker: fastest (~0.5–1.5 s), voice
+  mimicry, $0.034/min per active speaker.
+- **Staged (STT → translate → speak)** — splits the pipeline into three
+  independently selectable stages, prioritizing translation quality and using
+  the iPad where it's faster/free:
+  - **Speech recognition** always runs on-device (Apple SpeechAnalyzer). The
+    live transcript appears in italics immediately and settles when you pause.
+    Spoken languages must be declared in Settings (no auto-detect); language
+    models download on first use.
+  - **Translation**: OpenAI text model (default — best quality, streamed over
+    HTTPS, pennies per conversation), Apple Translation (on-device, free,
+    prompts to download language packs), or Apple Intelligence (on-device,
+    experimental).
+  - **Speech output**: on-device voice (instant, free, default), OpenAI voice
+    (more natural, adds a round-trip), or text only.
+
+  Translation runs on finished sentences with rolling conversational context —
+  slower to speak than Realtime, but noticeably better on tricky Mandarin,
+  and it handles code-switched English instead of skipping it. An
+  all-on-device configuration (Apple Translation + on-device voice) works with
+  no API key and no network, and the cost meter reads $0.00.
+
+Both pipelines share the mic gating, lanes, transcript, and playback ducking;
+pipeline and provider changes apply on the next Start.
+
 ## Signal tab — seeing and tuning the gate
 
 The **Signal** tab is a live workbench for the multi-mic pipeline. It works during

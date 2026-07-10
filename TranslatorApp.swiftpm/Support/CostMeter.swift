@@ -15,6 +15,10 @@ final class CostMeter {
     static let dollarsPerSessionMinute = 0.034
 
     private var billedSeconds: Double = 0
+    /// Directly-estimated dollars from the staged pipeline (translation
+    /// tokens, TTS characters). On-device stages report nothing, so an
+    /// all-on-device staged conversation correctly reads $0.00.
+    private var directDollars: Double = 0
     private let lock = NSLock()
 
     /// Thread-safe; clients report increments from their socket queues.
@@ -24,14 +28,22 @@ final class CostMeter {
         billedSeconds += seconds
     }
 
+    /// Thread-safe; staged stages report token/character-based estimates.
+    func addDollars(_ dollars: Double) {
+        guard dollars > 0 else { return }
+        lock.lock(); defer { lock.unlock() }
+        directDollars += dollars
+    }
+
     /// Total estimated dollars so far.
     var estimatedDollars: Double {
         lock.lock(); defer { lock.unlock() }
-        return billedSeconds / 60.0 * Self.dollarsPerSessionMinute
+        return billedSeconds / 60.0 * Self.dollarsPerSessionMinute + directDollars
     }
 
     func reset() {
         lock.lock(); defer { lock.unlock() }
         billedSeconds = 0
+        directDollars = 0
     }
 }

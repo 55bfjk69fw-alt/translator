@@ -228,8 +228,12 @@ private struct UtteranceBubble: View {
                     }
                 }
                 if !utterance.sourceText.isEmpty {
+                    // Staged bubbles stream a volatile transcript that the
+                    // on-device recognizer keeps revising — italic until it
+                    // settles (at the pause, not after translation/TTS).
                     Text(utterance.sourceText)
                         .font(.body)
+                        .italic(!utterance.sourceSettled)
                     if showPinyin, let pinyin = utterance.sourceText.pinyin {
                         Text(pinyin)
                             .font(.footnote.italic())

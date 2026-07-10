@@ -100,6 +100,10 @@ struct SettingsView: View {
                     Text("Volume of translated audio, on top of the iPad's hardware volume. Above 100% is a digital boost for loud rooms — the very top of the range can distort. Takes effect immediately.")
                 }
 
+                if #available(iOS 26.0, *) {
+                    PipelineSection()
+                }
+
                 Section {
                     Picker("Speakers translate to", selection: $outputLanguage) {
                         ForEach(Self.outputLanguages) { option in
@@ -200,6 +204,85 @@ struct SettingsView: View {
                 .opacity(enabled.wrappedValue ? 1 : 0.4)
             Toggle(placeholder, isOn: enabled)
                 .labelsHidden()
+        }
+    }
+}
+
+/// Pipeline mode + per-stage provider mixer for the staged pipeline.
+/// iOS 26-only: the staged pipeline's on-device STT requires SpeechAnalyzer
+/// (and AppSettings.pipelineMode clamps to realtime below that anyway).
+@available(iOS 26.0, *)
+private struct PipelineSection: View {
+    @AppStorage(AppSettings.pipelineModeKey) private var pipelineModeRaw = AppSettings.PipelineMode.realtime.rawValue
+    @AppStorage(AppSettings.translationProviderKey) private var translationProviderRaw = AppSettings.TranslationProvider.openAIText.rawValue
+    @AppStorage(AppSettings.ttsProviderKey) private var ttsProviderRaw = AppSettings.TTSProvider.onDevice.rawValue
+    @AppStorage(AppSettings.textModelNameKey) private var textModelName = ""
+    @AppStorage(AppSettings.stagedSourceLanguageKey) private var stagedSourceLanguage = "zh-CN"
+    @AppStorage(AppSettings.userSpokenLanguageKey) private var userSpokenLanguage = "en-US"
+
+    private var isStaged: Bool { pipelineModeRaw == AppSettings.PipelineMode.staged.rawValue }
+    private var translationProvider: AppSettings.TranslationProvider {
+        AppSettings.TranslationProvider(rawValue: translationProviderRaw) ?? .openAIText
+    }
+
+    /// Spoken-language roster for on-device STT, mirroring the output
+    /// languages the app already offers (BCP-47 with region, which is what
+    /// SpeechTranscriber's locale matching expects).
+    private static let sourceLocales: [(code: String, name: String)] = [
+        ("zh-CN", "Chinese (Mandarin, Simplified)"),
+        ("zh-TW", "Chinese (Mandarin, Traditional)"),
+        ("en-US", "English (US)"),
+        ("en-GB", "English (UK)"),
+        ("es-ES", "Spanish"),
+        ("fr-FR", "French"),
+        ("de-DE", "German"),
+        ("it-IT", "Italian"),
+        ("pt-BR", "Portuguese (Brazil)"),
+        ("ja-JP", "Japanese"),
+        ("ko-KR", "Korean"),
+        ("ar-SA", "Arabic")
+    ]
+
+    var body: some View {
+        Section {
+            Picker("Translation pipeline", selection: $pipelineModeRaw) {
+                ForEach(AppSettings.PipelineMode.allCases) { mode in
+                    Text(mode.displayName).tag(mode.rawValue)
+                }
+            }
+            if isStaged {
+                Picker("Translate with", selection: $translationProviderRaw) {
+                    ForEach(AppSettings.TranslationProvider.allCases) { provider in
+                        Text(provider.displayName).tag(provider.rawValue)
+                    }
+                }
+                if translationProvider == .openAIText {
+                    TextField("Text model", text: $textModelName, prompt: Text("gpt-5.1"))
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                }
+                Picker("Speech output", selection: $ttsProviderRaw) {
+                    ForEach(AppSettings.TTSProvider.allCases) { provider in
+                        Text(provider.displayName).tag(provider.rawValue)
+                    }
+                }
+                Picker("Speakers speak", selection: $stagedSourceLanguage) {
+                    ForEach(Self.sourceLocales, id: \.code) { locale in
+                        Text(locale.name).tag(locale.code)
+                    }
+                }
+                Picker("I speak", selection: $userSpokenLanguage) {
+                    ForEach(Self.sourceLocales, id: \.code) { locale in
+                        Text(locale.name).tag(locale.code)
+                    }
+                }
+            }
+        } header: {
+            Text("Pipeline")
+        } footer: {
+            Text(isStaged
+                 ? "Staged mode transcribes speech on this iPad (Apple's on-device recognizer — the spoken languages must be declared above, unlike Realtime's auto-detect), then translates finished sentences with the selected provider, then speaks them with the selected voice. Speech models download on first use. OpenAI translation is the quality pick; the Apple options run entirely on-device. Provider changes apply on the next Start. Costs shown for staged mode are estimates."
+                 : "Realtime translates continuously over one OpenAI session per speaker (~0.5–1.5 s behind, $0.034/min per active speaker). Staged mode splits the work into on-device speech recognition, a translation model of your choice, and a voice of your choice — cheaper, often better translations, at the cost of waiting for whole sentences.")
         }
     }
 }

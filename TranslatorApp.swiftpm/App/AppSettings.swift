@@ -22,6 +22,14 @@ enum AppSettings {
     static let outputLanguageKey = "outputLanguage"
     static let pttOutputLanguageKey = "pttOutputLanguage"
     static let noiseReductionKey = "noiseReduction"
+    static let pipelineModeKey = "pipelineMode"
+    static let translationProviderKey = "translationProvider"
+    static let ttsProviderKey = "ttsProvider"
+    static let textModelNameKey = "textModelName"
+    static let openAITTSModelKey = "openAITTSModel"
+    static let openAITTSVoiceKey = "openAITTSVoice"
+    static let stagedSourceLanguageKey = "stagedSourceLanguage"
+    static let userSpokenLanguageKey = "userSpokenLanguage"
 
     static func speakerNameKey(_ channel: Int) -> String { "speakerName\(channel)" }
     static func speakerEnabledKey(_ channel: Int) -> String { "speakerEnabled\(channel)" }
@@ -256,6 +264,147 @@ enum AppSettings {
     static var noiseReduction: String? {
         let value = noiseReductionSetting(for: micProfile)
         return value == "off" ? nil : value
+    }
+
+    // MARK: - Pipeline mode (realtime combined vs staged STT→MT→TTS)
+
+    /// Which pipeline a lane's session runs. `realtime` is the original
+    /// single-WebSocket gpt-realtime-translate session; `staged` splits the
+    /// work into on-device STT (SpeechTranscriber), a selectable translator,
+    /// and a selectable TTS stage.
+    enum PipelineMode: String, CaseIterable, Identifiable {
+        case realtime
+        case staged
+        var id: String { rawValue }
+        var displayName: String {
+            switch self {
+            case .realtime: return "Realtime (combined)"
+            case .staged: return "Staged (STT → translate → speak)"
+            }
+        }
+    }
+
+    /// Clamped to .realtime below iOS 26: the staged pipeline's on-device
+    /// STT (SpeechAnalyzer) doesn't exist there, so a stale persisted
+    /// "staged" value must never select an unbuildable pipeline.
+    static var pipelineMode: PipelineMode {
+        guard #available(iOS 26.0, *) else { return .realtime }
+        return PipelineMode(rawValue: UserDefaults.standard.string(forKey: pipelineModeKey) ?? "") ?? .realtime
+    }
+
+    /// Translation stage provider for the staged pipeline. Quality is the
+    /// priority, so the network OpenAI text model is the default; the two
+    /// Apple options trade quality for on-device latency/privacy.
+    enum TranslationProvider: String, CaseIterable, Identifiable {
+        case openAIText
+        case appleTranslation
+        case appleIntelligence
+        var id: String { rawValue }
+        var displayName: String {
+            switch self {
+            case .openAIText: return "OpenAI (best quality)"
+            case .appleTranslation: return "Apple Translation (on-device)"
+            case .appleIntelligence: return "Apple Intelligence (experimental)"
+            }
+        }
+    }
+
+    static var translationProvider: TranslationProvider {
+        TranslationProvider(rawValue: UserDefaults.standard.string(forKey: translationProviderKey) ?? "") ?? .openAIText
+    }
+
+    /// TTS stage provider for the staged pipeline. On-device is the default
+    /// for latency (and it's free); OpenAI reads more naturally.
+    enum TTSProvider: String, CaseIterable, Identifiable {
+        case onDevice
+        case openAI
+        case none
+        var id: String { rawValue }
+        var displayName: String {
+            switch self {
+            case .onDevice: return "On-device voice (fastest)"
+            case .openAI: return "OpenAI voice (best quality)"
+            case .none: return "Text only"
+            }
+        }
+    }
+
+    static var ttsProvider: TTSProvider {
+        TTSProvider(rawValue: UserDefaults.standard.string(forKey: ttsProviderKey) ?? "") ?? .onDevice
+    }
+
+    /// OpenAI text model for the staged translation stage. Defaults to the
+    /// flagship (quality above all); overridable like the realtime model.
+    static var textModelName: String {
+        let value = UserDefaults.standard.string(forKey: textModelNameKey) ?? ""
+        return value.isEmpty ? "gpt-5.1" : value
+    }
+
+    static var openAITTSModel: String {
+        let value = UserDefaults.standard.string(forKey: openAITTSModelKey) ?? ""
+        return value.isEmpty ? "gpt-4o-mini-tts" : value
+    }
+
+    static var openAITTSVoice: String {
+        let value = UserDefaults.standard.string(forKey: openAITTSVoiceKey) ?? ""
+        return value.isEmpty ? "alloy" : value
+    }
+
+    /// BCP-47 locale the DJI speakers talk in. On-device STT transcribes one
+    /// declared language per lane — unlike the realtime session, which
+    /// auto-detects the input language.
+    static var stagedSourceLanguage: String {
+        let value = UserDefaults.standard.string(forKey: stagedSourceLanguageKey) ?? ""
+        return value.isEmpty ? "zh-CN" : value
+    }
+
+    /// BCP-47 locale the user speaks during push-to-talk (staged mode).
+    static var userSpokenLanguage: String {
+        let value = UserDefaults.standard.string(forKey: userSpokenLanguageKey) ?? ""
+        return value.isEmpty ? "en-US" : value
+    }
+
+    /// The staged pipeline's full provider configuration, snapshotted at
+    /// Start so a mid-conversation Settings flip can't assemble a lane the
+    /// Start-time checks never validated (e.g. an OpenAI translator with no
+    /// key). Provider changes apply on the next Start.
+    struct StagedConfig {
+        let translationProvider: TranslationProvider
+        let ttsProvider: TTSProvider
+        let textModelName: String
+        let openAITTSModel: String
+        let openAITTSVoice: String
+        let sourceLanguage: String
+        let userLanguage: String
+
+        /// Whether this configuration needs the OpenAI key to start.
+        /// Exhaustive over the providers so a new case can't silently skip
+        /// the pre-flight. Apple Intelligence doesn't require one (a key
+        /// merely enables its OpenAI fallback when the model is
+        /// unavailable).
+        var needsOpenAIKey: Bool {
+            switch translationProvider {
+            case .openAIText:
+                return true
+            case .appleTranslation, .appleIntelligence:
+                switch ttsProvider {
+                case .openAI: return true
+                case .onDevice, .none: return false
+                }
+            }
+        }
+    }
+
+    static func stagedConfig() -> StagedConfig {
+        StagedConfig(
+            translationProvider: translationProvider,
+            ttsProvider: ttsProvider,
+            textModelName: textModelName,
+            openAITTSModel: openAITTSModel,
+            openAITTSVoice: openAITTSVoice,
+            sourceLanguage: stagedSourceLanguage,
+            userLanguage: userSpokenLanguage
+        )
     }
 
     static func speakerName(_ channel: Int) -> String {

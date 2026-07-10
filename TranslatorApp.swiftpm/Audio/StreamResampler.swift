@@ -16,16 +16,24 @@ final class StreamResampler {
     private let converter: AVAudioConverter
     let inputFormat: AVAudioFormat
 
-    init?(inputSampleRate: Double) {
+    convenience init?(inputSampleRate: Double) {
         guard let inFormat = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
             sampleRate: inputSampleRate,
             channels: 1,
             interleaved: false
-        ), let converter = AVAudioConverter(from: inFormat, to: Self.targetFormat) else {
+        ) else { return nil }
+        self.init(inputFormat: inFormat)
+    }
+
+    /// Arbitrary input format (e.g. whatever AVSpeechSynthesizer.write
+    /// renders in, which varies by voice) — anything AVAudioConverter can
+    /// take to 24 kHz mono Int16.
+    init?(inputFormat: AVAudioFormat) {
+        guard let converter = AVAudioConverter(from: inputFormat, to: Self.targetFormat) else {
             return nil
         }
-        self.inputFormat = inFormat
+        self.inputFormat = inputFormat
         self.converter = converter
     }
 

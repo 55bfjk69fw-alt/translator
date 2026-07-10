@@ -14,5 +14,13 @@ struct ContentView: View {
             SettingsView()
                 .tabItem { Label("Settings", systemImage: "gearshape") }
         }
+        .background {
+            // Invisible host for Apple Translation sessions (the framework
+            // only vends them through a SwiftUI modifier). Lives at the root
+            // so sessions survive tab switches.
+            if #available(iOS 18.0, *) {
+                TranslationBridgeView(broker: model.translationBroker)
+            }
+        }
     }
 }

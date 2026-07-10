@@ -69,6 +69,17 @@ final class RealtimeTranslationClient: NSObject {
     private var connectStartedAt: Date?
     private var pingTicks = 0
 
+    /// 24 kHz mono PCM16 → billed audio bytes per second, both directions.
+    private static let billedBytesPerSecond = 48_000.0
+    /// Highest `elapsed_ms` seen on any server event this connection — the
+    /// server's own session-audio clock, which is the billing basis
+    /// ("realtime audio duration"). Advances ~5×/s via heartbeat frames,
+    /// including while the server drains output after session.close.
+    private var maxElapsedMs: Double = 0
+    /// Billed seconds already delivered to onBilledSeconds this connection,
+    /// so progress is reported as monotonic increments.
+    private var reportedBilledSeconds: Double = 0
+
     // Audio arriving while the socket is still connecting is queued and
     // flushed on open, so lazily-opened sessions don't drop the words that
     // triggered them. Bounded to ~30 s of 24 kHz PCM16.
@@ -96,6 +107,11 @@ final class RealtimeTranslationClient: NSObject {
     var onTranslatedTranscriptDelta: ((String) -> Void)?
     /// 24 kHz mono PCM16 little-endian audio of the translated speech.
     var onTranslatedAudio: ((Data) -> Void)?
+    /// Incremental billed-audio seconds: the best estimate of this
+    /// connection's billed duration advanced by this much. The estimate is
+    /// max(server elapsed_ms, input audio appended), so it keeps counting
+    /// through the post-close drain and the pre-open queue flush.
+    var onBilledSeconds: ((Double) -> Void)?
 
     init(label: String, config: SessionConfig, apiKey: String, endpointTemplate: String) {
         self.label = label
@@ -144,6 +160,10 @@ final class RealtimeTranslationClient: NSObject {
         intentionallyClosed = false
         seenEventTypes.removeAll()
         stats = Stats()
+        // Each connection is a fresh billed session server-side: elapsed_ms
+        // restarts at zero, so the billed-progress baseline must too.
+        maxElapsedMs = 0
+        reportedBilledSeconds = 0
         lastServerEventAt = Date()
         connectStartedAt = Date()
         pingTicks = 0
@@ -227,6 +247,22 @@ final class RealtimeTranslationClient: NSObject {
             "type": "session.input_audio_buffer.append",
             "audio": pcm16.base64EncodedString()
         ])
+        reportBilledProgress()
+    }
+
+    /// Queue-confined. Billed duration is "realtime audio duration"; the
+    /// best live estimate is the max of the server's session clock and the
+    /// audio we've appended (audio queued while connecting flushes as a
+    /// burst, so bytes sent can briefly lead the server clock, and the
+    /// server clock keeps running through engine stalls and the close
+    /// drain). Emits only the monotonic increment.
+    private func reportBilledProgress() {
+        let billed = max(maxElapsedMs / 1000.0,
+                         Double(stats.audioBytesSent) / Self.billedBytesPerSecond)
+        guard billed > reportedBilledSeconds else { return }
+        let delta = billed - reportedBilledSeconds
+        reportedBilledSeconds = billed
+        onBilledSeconds?(delta)
     }
 
     static func isPureSilence(_ pcm16: Data) -> Bool {
@@ -321,6 +357,14 @@ final class RealtimeTranslationClient: NSObject {
         }
         lastServerEventAt = Date()
 
+        // Every delta event (heartbeat frames included) carries the
+        // session-audio timestamp; parsed for all types defensively.
+        if let elapsed = (object["elapsed_ms"] as? NSNumber)?.doubleValue,
+           elapsed > maxElapsedMs {
+            maxElapsedMs = elapsed
+            reportBilledProgress()
+        }
+
         switch type {
         case "session.output_audio.delta":
             // The stream interleaves pure-zero heartbeat frames (~every
@@ -410,6 +454,11 @@ final class RealtimeTranslationClient: NSObject {
         line += ", translation \(s.translationDeltas)Δ/\(s.translationChars)ch"
         line += ", audio \(s.audioFrames) frames/\(s.audioBytes / 1024)KB"
         line += ", \(s.heartbeatsDropped) heartbeats dropped"
+        // Compare against the OpenAI usage dashboard to validate the meter.
+        line += String(format: "; billed ~%.0fs (server clock %.0fs, sent %.0fs)",
+                       reportedBilledSeconds,
+                       maxElapsedMs / 1000.0,
+                       Double(s.audioBytesSent) / Self.billedBytesPerSecond)
         Log.info("[\(label)] stats (\(context)): \(line)")
         // ~10 s of sent audio is enough to expect both streams; call out the
         // two symptom signatures explicitly.

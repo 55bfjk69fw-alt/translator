@@ -110,8 +110,11 @@ Realtime API. Confidence noted where it matters.
     $0.034/min ("realtime audio duration"; streamed-vs-connected not
     disambiguated — since silence must be streamed, they converge).
 - Reported end-to-end: ~300–800 ms speech → translated audio.
-- Pricing: **$0.034/min per session** → 5 sessions ≈ **$10.20/hr ceiling**
-  (billing basis wall-clock vs active speech unconfirmed — the app meters it).
+- Pricing: **$0.034/min per session** → 5 sessions ≈ **$10.20/hr ceiling**.
+  The app meters billed duration per connection as max(server `elapsed_ms`
+  session clock, seconds of audio appended) rather than wall-clock-while-open
+  (`Support/CostMeter.swift`); the periodic client stats line logs all three
+  so the estimate can be validated against the OpenAI usage dashboard.
   Rate limits: minutes-of-audio/min (Tier 1 = 50) — 5 streams is comfortably within.
 - Transcription-only fallback: `gpt-realtime-whisper` ($0.017/min, streaming, tunable
   delay) or `gpt-4o-transcribe` (~$0.006/min); cascade (STT→LLM→TTS) lands ~2–3 s.

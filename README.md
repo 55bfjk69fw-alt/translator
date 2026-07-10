@@ -90,7 +90,10 @@ Settings → **Pipeline** picks how a lane's speech becomes translated output:
     prompts to download language packs), or Apple Intelligence (on-device,
     experimental).
   - **Speech output**: on-device voice (instant, free, default), OpenAI voice
-    (more natural, adds a round-trip), or text only.
+    (more natural, adds a round-trip), or text only. Every speaker (and your
+    push-to-talk voice) gets a **different voice automatically** so you can
+    tell them apart by ear; pick specific voices per speaker — with preview
+    buttons — in Settings → Voices.
 
   Translation runs on finished sentences with rolling conversational context —
   slower to speak than Realtime, but noticeably better on tricky Mandarin,

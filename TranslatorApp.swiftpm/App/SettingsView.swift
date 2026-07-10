@@ -1,4 +1,5 @@
 import SwiftUI
+import AVFoundation
 
 struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
@@ -102,6 +103,7 @@ struct SettingsView: View {
 
                 if #available(iOS 26.0, *) {
                     PipelineSection()
+                    VoiceSection()
                 }
 
                 Section {
@@ -283,6 +285,217 @@ private struct PipelineSection: View {
             Text(isStaged
                  ? "Staged mode transcribes speech on this iPad (Apple's on-device recognizer — the spoken languages must be declared above, unlike Realtime's auto-detect), then translates finished sentences with the selected provider, then speaks them with the selected voice. Speech models download on first use. OpenAI translation is the quality pick; the Apple options run entirely on-device. Provider changes apply on the next Start. Costs shown for staged mode are estimates."
                  : "Realtime translates continuously over one OpenAI session per speaker (~0.5–1.5 s behind, $0.034/min per active speaker). Staged mode splits the work into on-device speech recognition, a translation model of your choice, and a voice of your choice — cheaper, often better translations, at the cost of waiting for whole sentences.")
+        }
+    }
+}
+
+/// Per-lane voice pickers for the staged TTS stage: one row per enabled
+/// speaker plus "My voice" (the PTT lane), each with a preview button.
+/// Auto (distinct) rotates every lane onto a different voice; explicit
+/// picks win. Hidden unless the staged pipeline with a voice is selected.
+@available(iOS 26.0, *)
+private struct VoiceSection: View {
+    @EnvironmentObject private var model: AppModel
+    @StateObject private var preview = VoicePreviewController()
+
+    @AppStorage(AppSettings.pipelineModeKey) private var pipelineModeRaw = AppSettings.PipelineMode.realtime.rawValue
+    @AppStorage(AppSettings.ttsProviderKey) private var ttsProviderRaw = AppSettings.TTSProvider.onDevice.rawValue
+    @AppStorage(AppSettings.outputLanguageKey) private var outputLanguage = "en"
+    @AppStorage(AppSettings.pttOutputLanguageKey) private var pttOutputLanguage = "zh"
+    // Live bindings to the Speakers section above, so renames/disables
+    // update the voice rows immediately.
+    @AppStorage("speakerName0") private var speakerName0 = ""
+    @AppStorage("speakerName1") private var speakerName1 = ""
+    @AppStorage("speakerName2") private var speakerName2 = ""
+    @AppStorage("speakerName3") private var speakerName3 = ""
+    @AppStorage("speakerEnabled0") private var speakerEnabled0 = true
+    @AppStorage("speakerEnabled1") private var speakerEnabled1 = true
+    @AppStorage("speakerEnabled2") private var speakerEnabled2 = true
+    @AppStorage("speakerEnabled3") private var speakerEnabled3 = true
+
+    private var isStaged: Bool { pipelineModeRaw == AppSettings.PipelineMode.staged.rawValue }
+    private var ttsProvider: AppSettings.TTSProvider {
+        AppSettings.TTSProvider(rawValue: ttsProviderRaw) ?? .onDevice
+    }
+    private var speakerNames: [String] { [speakerName0, speakerName1, speakerName2, speakerName3] }
+    private var speakersEnabled: [Bool] { [speakerEnabled0, speakerEnabled1, speakerEnabled2, speakerEnabled3] }
+
+    var body: some View {
+        if isStaged, ttsProvider != .none {
+            // Enumerating the voice registry per body evaluation is fine
+            // here (Settings, not a hot path); one list per language keeps
+            // the rows from each doing it. The exclusion set mirrors the
+            // runtime rotation rule (auto lanes skip explicit picks) so
+            // previews play exactly what a lane would.
+            let speakerRoster = OnDeviceSynthesizer.installedVoices(for: outputLanguage)
+            let userRoster = OnDeviceSynthesizer.installedVoices(for: pttOutputLanguage)
+            let voiceLanes = [0, 1, 2, 3, SpeakerLane.userLaneID]
+            let excludedVoices: Set<String> = ttsProvider == .onDevice
+                ? Set(voiceLanes.map { AppSettings.onDeviceVoiceSetting(lane: $0) }.filter { !$0.isEmpty })
+                : Set(voiceLanes.map { AppSettings.openAIVoiceSetting(lane: $0) }.filter { !$0.isEmpty })
+            Section {
+                ForEach(0..<4, id: \.self) { channel in
+                    if speakersEnabled[channel] {
+                        VoiceRow(
+                            label: speakerNames[channel].isEmpty ? "Speaker \(channel + 1)" : speakerNames[channel],
+                            storageKey: ttsProvider == .onDevice
+                                ? AppSettings.speakerVoiceOnDeviceKey(channel)
+                                : AppSettings.speakerVoiceOpenAIKey(channel),
+                            laneIndex: channel,
+                            languageCode: outputLanguage,
+                            provider: ttsProvider,
+                            ttsModel: AppSettings.openAITTSModel,
+                            appIsIdle: model.mode == .idle,
+                            onDeviceRoster: speakerRoster,
+                            excludedVoices: excludedVoices,
+                            preview: preview
+                        )
+                        .id("voice-\(channel)-\(ttsProviderRaw)-\(outputLanguage)")
+                    }
+                }
+                VoiceRow(
+                    label: "My voice",
+                    storageKey: ttsProvider == .onDevice
+                        ? AppSettings.userVoiceOnDeviceKey
+                        : AppSettings.userVoiceOpenAIKey,
+                    laneIndex: 4,
+                    languageCode: pttOutputLanguage,
+                    provider: ttsProvider,
+                    ttsModel: AppSettings.openAITTSModel,
+                    appIsIdle: model.mode == .idle,
+                    onDeviceRoster: userRoster,
+                    excludedVoices: excludedVoices,
+                    preview: preview
+                )
+                .id("voice-user-\(ttsProviderRaw)-\(pttOutputLanguage)")
+                if let error = preview.lastError {
+                    Text(error)
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                }
+            } header: {
+                Text("Voices")
+            } footer: {
+                Text(ttsProvider == .onDevice
+                     ? "With Auto, each speaker gets a different on-device voice so you can tell them apart by ear; your picks override. Extra voices install under iPadOS Settings → Accessibility → Spoken Content. Voice changes apply on the next Start."
+                     : "With Auto, each speaker gets a different OpenAI voice so you can tell them apart by ear; your picks override. Each preview makes a small paid TTS request (a fraction of a cent, not counted in the conversation estimate). Voice changes apply on the next Start.")
+            }
+            // Deliberately no onDisappear stop: Form sections fire it on
+            // scroll-out, which would cut previews mid-sample; previews are
+            // a few seconds and self-terminate. Provider/language switches
+            // DO stop them — the rows rebuild and would orphan the audio
+            // with no stop button.
+            .onChange(of: ttsProviderRaw) { preview.stop() }
+            .onChange(of: outputLanguage) { preview.stop() }
+            .onChange(of: pttOutputLanguage) { preview.stop() }
+        }
+    }
+}
+
+/// One voice picker + preview button, bound to the lane's storage key.
+@available(iOS 26.0, *)
+private struct VoiceRow: View {
+    let label: String
+    let laneIndex: Int
+    let languageCode: String
+    let provider: AppSettings.TTSProvider
+    let ttsModel: String
+    let appIsIdle: Bool
+    let onDeviceRoster: [AVSpeechSynthesisVoice]
+    let excludedVoices: Set<String>
+    @ObservedObject var preview: VoicePreviewController
+
+    @AppStorage private var voiceID: String
+    private let rowID: String
+
+    init(label: String, storageKey: String, laneIndex: Int, languageCode: String,
+         provider: AppSettings.TTSProvider, ttsModel: String,
+         appIsIdle: Bool, onDeviceRoster: [AVSpeechSynthesisVoice],
+         excludedVoices: Set<String>, preview: VoicePreviewController) {
+        self.label = label
+        self.laneIndex = laneIndex
+        self.languageCode = languageCode
+        self.provider = provider
+        self.ttsModel = ttsModel
+        self.appIsIdle = appIsIdle
+        self.onDeviceRoster = onDeviceRoster
+        self.excludedVoices = excludedVoices
+        self.preview = preview
+        self.rowID = storageKey
+        _voiceID = AppStorage(wrappedValue: "", storageKey)
+    }
+
+    private var isPlaying: Bool { preview.activeRowID == rowID }
+
+    /// A stored pick that isn't in the current roster (voice uninstalled,
+    /// language switched) displays as Auto WITHOUT clobbering storage —
+    /// matching the runtime resolver's fallback; picking anything writes a
+    /// valid value again.
+    private var safeSelection: Binding<String> {
+        let known: Set<String> = provider == .onDevice
+            ? Set(onDeviceRoster.map(\.identifier)).union([""])
+            : Set(OpenAISynthesizer.voiceRoster).union([""])
+        return Binding(
+            get: { known.contains(voiceID) ? voiceID : "" },
+            set: { voiceID = $0 }
+        )
+    }
+
+    var body: some View {
+        HStack {
+            Picker(label, selection: safeSelection) {
+                Text("Auto (distinct)").tag("")
+                if provider == .onDevice {
+                    ForEach(onDeviceRoster, id: \.identifier) { voice in
+                        Text(displayName(voice)).tag(voice.identifier)
+                    }
+                } else {
+                    ForEach(OpenAISynthesizer.voiceRoster, id: \.self) { voice in
+                        Text(voice.capitalized).tag(voice)
+                    }
+                }
+            }
+            // Borderless so the tap doesn't hijack the whole Form row.
+            // Always enabled: a missing API key surfaces as the section's
+            // error text on tap (a disabled flag here goes stale when the
+            // key is saved in the section above without this view leaving
+            // the screen).
+            Button {
+                togglePreview()
+            } label: {
+                Image(systemName: isPlaying ? "stop.circle.fill" : "speaker.wave.2")
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel(isPlaying ? "Stop preview" : "Preview \(label) voice")
+        }
+    }
+
+    private func togglePreview() {
+        if isPlaying {
+            preview.stop()
+            return
+        }
+        let explicit = voiceID.isEmpty ? nil : voiceID
+        switch provider {
+        case .onDevice:
+            preview.previewOnDevice(rowID: rowID, explicitVoiceID: explicit,
+                                    laneIndex: laneIndex, languageCode: languageCode,
+                                    excludedVoices: excludedVoices, appIsIdle: appIsIdle)
+        case .openAI:
+            preview.previewOpenAI(rowID: rowID, explicitVoice: explicit,
+                                  laneIndex: laneIndex, languageCode: languageCode,
+                                  model: ttsModel, excludedVoices: excludedVoices,
+                                  appIsIdle: appIsIdle)
+        case .none:
+            break
+        }
+    }
+
+    private func displayName(_ voice: AVSpeechSynthesisVoice) -> String {
+        switch voice.quality {
+        case .enhanced: return "\(voice.name) (Enhanced)"
+        case .premium: return "\(voice.name) (Premium)"
+        default: return voice.name
         }
     }
 }

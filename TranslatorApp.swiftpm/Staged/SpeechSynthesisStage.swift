@@ -25,10 +25,24 @@ protocol SpeechSynthesisStage: AnyObject {
 final class OnDeviceSynthesizer: NSObject, SpeechSynthesisStage {
 
     private let synthesizer = AVSpeechSynthesizer()
+    /// Explicit per-lane voice pick (AVSpeechSynthesisVoice identifier);
+    /// nil = auto-distinct rotation by laneIndex, skipping voices other
+    /// lanes explicitly picked.
+    private let explicitVoiceIdentifier: String?
+    private let laneIndex: Int
+    private let excludedVoiceIdentifiers: Set<String>
     private var warnedMissingVoice = false
-    /// One lane synthesizes one target language; the prefix-match fallback
-    /// enumerates the whole installed-voice registry, so resolve once.
+    private var warnedExplicitFallback = false
+    /// One lane synthesizes one target language; resolution can enumerate
+    /// the whole installed-voice registry, so resolve once and cache.
     private var cachedVoice: (language: String, voice: AVSpeechSynthesisVoice?)?
+
+    init(explicitVoiceIdentifier: String?, laneIndex: Int, excludedVoiceIdentifiers: Set<String> = []) {
+        self.explicitVoiceIdentifier = explicitVoiceIdentifier
+        self.laneIndex = laneIndex
+        self.excludedVoiceIdentifiers = excludedVoiceIdentifiers
+        super.init()
+    }
 
     func synthesize(text: String, languageCode: String) -> AsyncThrowingStream<TTSChunk, Error> {
         AsyncThrowingStream { continuation in
@@ -38,7 +52,18 @@ final class OnDeviceSynthesizer: NSObject, SpeechSynthesisStage {
                 return
             }
             if cachedVoice?.language != languageCode {
-                cachedVoice = (languageCode, Self.voice(for: languageCode))
+                if let explicitVoiceIdentifier,
+                   !Self.explicitVoiceIsUsable(explicitVoiceIdentifier, languageCode: languageCode),
+                   !warnedExplicitFallback {
+                    warnedExplicitFallback = true
+                    Log.warn("[tts] lane voice '\(explicitVoiceIdentifier)' missing or wrong language for '\(languageCode)' — using auto voice")
+                }
+                cachedVoice = (languageCode, Self.resolveVoice(
+                    explicitIdentifier: explicitVoiceIdentifier,
+                    laneIndex: laneIndex,
+                    languageCode: languageCode,
+                    excluding: excludedVoiceIdentifiers
+                ))
             }
             guard let voice = cachedVoice?.voice else {
                 if !warnedMissingVoice {
@@ -85,9 +110,57 @@ final class OnDeviceSynthesizer: NSObject, SpeechSynthesisStage {
         }
     }
 
-    /// Best on-device voice for a target language given as ISO-639-1
-    /// ("en", "zh"): exact BCP-47 match first, then any installed voice
-    /// whose language shares the prefix, preferring higher quality.
+    // MARK: - Voice resolution (shared with the Settings preview so the
+    // preview plays exactly what the lane will use)
+
+    /// The voice a lane speaks `languageCode` (ISO-639-1) with: the explicit
+    /// identifier if it exists and matches the language, else the
+    /// auto-distinct pick — the lane's slot in the installed-voice rotation,
+    /// with other lanes' explicit picks (`excluding`) removed so a pick
+    /// can't collide with an auto lane's slot.
+    static func resolveVoice(explicitIdentifier: String?, laneIndex: Int,
+                             languageCode: String,
+                             excluding excluded: Set<String> = []) -> AVSpeechSynthesisVoice? {
+        if let explicitIdentifier,
+           let voice = AVSpeechSynthesisVoice(identifier: explicitIdentifier),
+           languageMatches(voice.language, languageCode) {
+            return voice
+        }
+        let roster = installedVoices(for: languageCode)
+        let rotation = roster.filter { !excluded.contains($0.identifier) }
+        let pool = rotation.isEmpty ? roster : rotation
+        if !pool.isEmpty {
+            return pool[laneIndex % pool.count]
+        }
+        return voice(for: languageCode)
+    }
+
+    /// Deterministic per-language roster used for both auto-distinct
+    /// rotation and the Settings picker (same order, so what you see is
+    /// what rotates). Novelty voices ("Bells", "Bad News"…) and Personal
+    /// Voice are excluded — they'd otherwise occupy rotation slots.
+    static func installedVoices(for languageCode: String) -> [AVSpeechSynthesisVoice] {
+        AVSpeechSynthesisVoice.speechVoices()
+            .filter { languageMatches($0.language, languageCode) }
+            .filter { !$0.voiceTraits.contains(.isNoveltyVoice) && !$0.voiceTraits.contains(.isPersonalVoice) }
+            .sorted {
+                if $0.quality.rawValue != $1.quality.rawValue {
+                    return $0.quality.rawValue > $1.quality.rawValue
+                }
+                return $0.identifier < $1.identifier
+            }
+    }
+
+    /// Primary-subtag comparison: "zh-CN" matches "zh", "en-GB" matches "en".
+    private static func languageMatches(_ voiceLanguage: String, _ languageCode: String) -> Bool {
+        let voicePrimary = voiceLanguage.lowercased().split(separator: "-").first ?? ""
+        let wantedPrimary = languageCode.lowercased().split(separator: "-").first ?? ""
+        return !wantedPrimary.isEmpty && voicePrimary == wantedPrimary
+    }
+
+    /// Last-resort fallback when the filtered roster is empty: exact BCP-47
+    /// match, then any installed voice sharing the prefix (novelty included
+    /// — a strange voice beats silence).
     static func voice(for languageCode: String) -> AVSpeechSynthesisVoice? {
         if let exact = AVSpeechSynthesisVoice(language: languageCode) {
             return exact
@@ -99,6 +172,13 @@ final class OnDeviceSynthesizer: NSObject, SpeechSynthesisStage {
             a.quality.rawValue < b.quality.rawValue
         }
     }
+
+    /// Whether an explicit pick would actually be used (drives the one-shot
+    /// fallback warning).
+    private static func explicitVoiceIsUsable(_ identifier: String, languageCode: String) -> Bool {
+        guard let voice = AVSpeechSynthesisVoice(identifier: identifier) else { return false }
+        return languageMatches(voice.language, languageCode)
+    }
 }
 
 /// OpenAI TTS over HTTPS. `response_format: "pcm"` returns 24 kHz mono
@@ -106,6 +186,12 @@ final class OnDeviceSynthesizer: NSObject, SpeechSynthesisStage {
 final class OpenAISynthesizer: SpeechSynthesisStage {
 
     static let defaultEndpoint = "https://api.openai.com/v1/audio/speech"
+
+    /// Voices accepted by POST /v1/audio/speech, ordered for auto-distinct
+    /// lane rotation (also feeds the Settings picker). Verify against the
+    /// current docs when touching this — a stale entry fails soft (HTTP 400
+    /// → segment logs "TTS failed", translation still displays).
+    static let voiceRoster = ["alloy", "echo", "shimmer", "ash", "coral", "sage", "ballad", "fable"]
 
     private let apiKey: String
     private let model: String
@@ -117,10 +203,23 @@ final class OpenAISynthesizer: SpeechSynthesisStage {
     /// magnitude across the TTS models).
     private static let dollarsPerCharacter = 15.0 / 1_000_000
 
-    init(apiKey: String, model: String, voice: String, endpoint: String = OpenAISynthesizer.defaultEndpoint) {
+    /// nil explicitVoice = auto-distinct: the lane's slot in the roster,
+    /// skipping voices other lanes explicitly picked so a pick can't
+    /// collide with an auto lane. A stored voice that's no longer in the
+    /// roster falls back to auto too — matching what the Settings picker
+    /// displays (it shows unknown values as Auto).
+    init(apiKey: String, model: String, explicitVoice: String?, laneIndex: Int,
+         excludedVoices: Set<String> = [],
+         endpoint: String = OpenAISynthesizer.defaultEndpoint) {
         self.apiKey = apiKey
         self.model = model
-        self.voice = voice
+        if let explicitVoice, Self.voiceRoster.contains(explicitVoice) {
+            self.voice = explicitVoice
+        } else {
+            let available = Self.voiceRoster.filter { !excludedVoices.contains($0) }
+            let rotation = available.isEmpty ? Self.voiceRoster : available
+            self.voice = rotation[laneIndex % rotation.count]
+        }
         self.endpoint = endpoint
     }
 

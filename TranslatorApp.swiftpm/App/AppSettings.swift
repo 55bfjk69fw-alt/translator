@@ -27,12 +27,15 @@ enum AppSettings {
     static let ttsProviderKey = "ttsProvider"
     static let textModelNameKey = "textModelName"
     static let openAITTSModelKey = "openAITTSModel"
-    static let openAITTSVoiceKey = "openAITTSVoice"
+    static let userVoiceOnDeviceKey = "userVoiceOnDevice"
+    static let userVoiceOpenAIKey = "userVoiceOpenAI"
     static let stagedSourceLanguageKey = "stagedSourceLanguage"
     static let userSpokenLanguageKey = "userSpokenLanguage"
 
     static func speakerNameKey(_ channel: Int) -> String { "speakerName\(channel)" }
     static func speakerEnabledKey(_ channel: Int) -> String { "speakerEnabled\(channel)" }
+    static func speakerVoiceOnDeviceKey(_ channel: Int) -> String { "speakerVoiceOnDevice\(channel)" }
+    static func speakerVoiceOpenAIKey(_ channel: Int) -> String { "speakerVoiceOpenAI\(channel)" }
 
     static var endpointTemplate: String {
         let value = UserDefaults.standard.string(forKey: endpointTemplateKey) ?? ""
@@ -345,9 +348,21 @@ enum AppSettings {
         return value.isEmpty ? "gpt-4o-mini-tts" : value
     }
 
-    static var openAITTSVoice: String {
-        let value = UserDefaults.standard.string(forKey: openAITTSVoiceKey) ?? ""
-        return value.isEmpty ? "alloy" : value
+    // MARK: - Per-lane TTS voices (staged pipeline)
+
+    /// Stored voice pick for a lane's on-device synthesizer
+    /// (AVSpeechSynthesisVoice identifier). Empty = "Auto (distinct)": each
+    /// lane rotates onto a different installed voice.
+    static func onDeviceVoiceSetting(lane: Int) -> String {
+        let key = lane == SpeakerLane.userLaneID ? userVoiceOnDeviceKey : speakerVoiceOnDeviceKey(lane)
+        return UserDefaults.standard.string(forKey: key) ?? ""
+    }
+
+    /// Stored voice pick for a lane's OpenAI synthesizer (voice name).
+    /// Empty = "Auto (distinct)".
+    static func openAIVoiceSetting(lane: Int) -> String {
+        let key = lane == SpeakerLane.userLaneID ? userVoiceOpenAIKey : speakerVoiceOpenAIKey(lane)
+        return UserDefaults.standard.string(forKey: key) ?? ""
     }
 
     /// BCP-47 locale the DJI speakers talk in. On-device STT transcribes one
@@ -373,9 +388,22 @@ enum AppSettings {
         let ttsProvider: TTSProvider
         let textModelName: String
         let openAITTSModel: String
-        let openAITTSVoice: String
         let sourceLanguage: String
         let userLanguage: String
+        /// laneID (0..3 + userLaneID) → voice pick, "" = auto-distinct.
+        let onDeviceVoices: [Int: String]
+        let openAIVoices: [Int: String]
+
+        /// nil = auto (the synthesizer rotates a distinct voice per lane).
+        func onDeviceVoice(forLane lane: Int) -> String? {
+            let value = onDeviceVoices[lane] ?? ""
+            return value.isEmpty ? nil : value
+        }
+
+        func openAIVoice(forLane lane: Int) -> String? {
+            let value = openAIVoices[lane] ?? ""
+            return value.isEmpty ? nil : value
+        }
 
         /// Whether this configuration needs the OpenAI key to start.
         /// Exhaustive over the providers so a new case can't silently skip
@@ -396,14 +424,16 @@ enum AppSettings {
     }
 
     static func stagedConfig() -> StagedConfig {
-        StagedConfig(
+        let voiceLanes = [0, 1, 2, 3, SpeakerLane.userLaneID]
+        return StagedConfig(
             translationProvider: translationProvider,
             ttsProvider: ttsProvider,
             textModelName: textModelName,
             openAITTSModel: openAITTSModel,
-            openAITTSVoice: openAITTSVoice,
             sourceLanguage: stagedSourceLanguage,
-            userLanguage: userSpokenLanguage
+            userLanguage: userSpokenLanguage,
+            onDeviceVoices: Dictionary(uniqueKeysWithValues: voiceLanes.map { ($0, onDeviceVoiceSetting(lane: $0)) }),
+            openAIVoices: Dictionary(uniqueKeysWithValues: voiceLanes.map { ($0, openAIVoiceSetting(lane: $0)) })
         )
     }
 

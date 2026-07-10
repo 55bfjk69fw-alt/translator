@@ -408,15 +408,26 @@ final class AppModel: ObservableObject {
                 translator = UnavailableTranslator(reason: "Apple Intelligence is unavailable on this device and no OpenAI key is saved")
             }
         }
+        // Dense 0..4 index for the auto-distinct voice rotation, stable
+        // regardless of which TXs are attached (4 = the PTT user lane).
+        // Explicit picks (any lane's) are excluded from the rotation so an
+        // auto lane can't land on a voice someone was given by name.
+        let laneIndex = lane == SpeakerLane.userLaneID ? 4 : lane
         let synthesizer: (any SpeechSynthesisStage)?
         switch config.ttsProvider {
         case .onDevice:
-            synthesizer = OnDeviceSynthesizer()
+            synthesizer = OnDeviceSynthesizer(
+                explicitVoiceIdentifier: config.onDeviceVoice(forLane: lane),
+                laneIndex: laneIndex,
+                excludedVoiceIdentifiers: Set(config.onDeviceVoices.values.filter { !$0.isEmpty })
+            )
         case .openAI:
             synthesizer = OpenAISynthesizer(
                 apiKey: apiKey ?? "",
                 model: config.openAITTSModel,
-                voice: config.openAITTSVoice
+                explicitVoice: config.openAIVoice(forLane: lane),
+                laneIndex: laneIndex,
+                excludedVoices: Set(config.openAIVoices.values.filter { !$0.isEmpty })
             )
         case .none:
             synthesizer = nil

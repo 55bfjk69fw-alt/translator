@@ -34,9 +34,11 @@ enum AppSettings {
             : UserDefaults.standard.bool(forKey: noiseGateEnabledKey)
     }
 
+    /// Minimum RMS for the gate to ever open. The gate's adaptive noise
+    /// floor raises the effective threshold above this in noisy rooms.
     static var vadThreshold: Float {
         let value = UserDefaults.standard.float(forKey: vadThresholdKey)
-        return value > 0 ? value : 0.010
+        return value > 0 ? value : 0.004
     }
 
     /// Seconds of channel silence before its session is closed (0 = never).

@@ -8,7 +8,7 @@ struct SettingsView: View {
 
     @AppStorage(AppSettings.autoPlayChineseKey) private var autoPlayChinese = false
     @AppStorage(AppSettings.noiseGateEnabledKey) private var noiseGateEnabled = true
-    @AppStorage(AppSettings.vadThresholdKey) private var vadThreshold = 0.010
+    @AppStorage(AppSettings.vadThresholdKey) private var vadThreshold = 0.004
     @AppStorage(AppSettings.userNameKey) private var userName = ""
     @AppStorage("speakerName0") private var speakerName0 = ""
     @AppStorage("speakerName1") private var speakerName1 = ""
@@ -61,14 +61,14 @@ struct SettingsView: View {
                 Section {
                     Toggle("Cross-channel noise gate", isOn: $noiseGateEnabled)
                     VStack(alignment: .leading) {
-                        Text(String(format: "Voice threshold: %.3f", vadThreshold))
+                        Text(String(format: "Minimum voice threshold: %.3f", vadThreshold))
                             .font(.callout)
                         Slider(value: $vadThreshold, in: 0.002...0.05)
                     }
                 } header: {
                     Text("Signal quality")
                 } footer: {
-                    Text("The gate replaces mic bleed with silence so one speaker doesn't produce four duplicate translations. Raise the threshold in noisy rooms; also enable each transmitter's onboard noise cancelling (Basic/Strong) from the DJI receiver.")
+                    Text("The gate learns each channel's noise floor automatically and opens when speech rises above it; the slider sets the quietest level it will ever open at. When several mics pick up the same voice, only the loudest copy is sent — people genuinely talking at the same time all pass. Also enable each transmitter's onboard noise cancelling (Basic/Strong) from the DJI receiver.")
                 }
 
                 Section {

@@ -130,7 +130,7 @@ final class AppModel: ObservableObject {
 
         audioQueue.sync {
             gate.enabled = AppSettings.noiseGateEnabled
-            gate.voiceThreshold = AppSettings.vadThreshold
+            gate.minimumVoiceThreshold = AppSettings.vadThreshold
             gate.reset()
             pipelineActive = true
             sessionAPIKey = apiKey
@@ -211,20 +211,26 @@ final class AppModel: ObservableObject {
             } else {
                 let laneCount = min(4, channelPointers.count)
                 var buffers: [AVAudioPCMBuffer] = []
-                var rmsValues: [Float] = []
                 for index in 0..<laneCount {
                     guard let buffer = EngineGraph.monoBuffer(from: channelPointers[index], frames: frames, sampleRate: sampleRate) else { return }
                     buffers.append(buffer)
-                    rmsValues.append(ChannelGate.rms(samples: channelPointers[index], count: frames))
                 }
-                self.audioQueue.async { self.processConversationBuffers(buffers, rmsValues: rmsValues, frames: frames, sampleRate: sampleRate) }
+                self.audioQueue.async { self.processConversationBuffers(buffers, frames: frames, sampleRate: sampleRate) }
             }
         }
     }
 
     /// Runs on audioQueue.
-    private func processConversationBuffers(_ buffers: [AVAudioPCMBuffer], rmsValues: [Float], frames: Int, sampleRate: Double) {
-        let decisions = gate.evaluate(rmsPerChannel: rmsValues)
+    private func processConversationBuffers(_ buffers: [AVAudioPCMBuffer], frames: Int, sampleRate: Double) {
+        // The gate needs the samples (not just levels) to cross-correlate
+        // channels for bleed rejection; the buffers stay alive for the call.
+        var channels: [UnsafePointer<Float>] = []
+        channels.reserveCapacity(buffers.count)
+        for buffer in buffers {
+            guard let data = buffer.floatChannelData else { return }
+            channels.append(UnsafePointer(data[0]))
+        }
+        let decisions = gate.evaluate(channels: channels, frames: frames, sampleRate: sampleRate)
         for (channel, decision) in decisions.enumerated() {
             // Log utterance-level transitions (the hangover smooths word
             // gaps) so missing translations can be correlated with whether
@@ -232,14 +238,16 @@ final class AppModel: ObservableObject {
             if decision.voiced != (voicedState[channel] ?? false) {
                 voicedState[channel] = decision.voiced
                 if decision.voiced {
-                    Log.info("ch\(channel) speech started (rms \(String(format: "%.4f", decision.rms)), gate \(decision.pass ? "pass" : "SUPPRESSED by louder channel"))")
+                    Log.info("ch\(channel) speech started (rms \(String(format: "%.4f", decision.rms)), gate \(decision.pass ? "pass" : (decision.bleed ? "SUPPRESSED as bleed" : "suppressed")))")
                 } else {
                     Log.info("ch\(channel) speech ended")
                 }
             }
-            if decision.voiced { lastVoiceAt[channel] = Date() }
+            // Keyed on pass (not voiced): bleed from another speaker must
+            // neither open a session for this lane nor keep it alive.
+            if decision.pass { lastVoiceAt[channel] = Date() }
             guard let resampler = resamplers[channel] else { continue }
-            guard let client = clients[channel] ?? lazyOpenSession(channel: channel, voiced: decision.voiced) else { continue }
+            guard let client = clients[channel] ?? lazyOpenSession(channel: channel, speech: decision.pass) else { continue }
             let outgoing: AVAudioPCMBuffer?
             if decision.pass {
                 outgoing = buffers[channel]
@@ -256,10 +264,11 @@ final class AppModel: ObservableObject {
     }
 
     /// Runs on audioQueue. Opens a channel's translation session the first
-    /// time speech is detected on it; the client queues audio while the
-    /// socket connects, so the triggering words are translated too.
-    private func lazyOpenSession(channel: Int, voiced: Bool) -> RealtimeTranslationClient? {
-        guard voiced, pipelineActive, let apiKey = sessionAPIKey else { return nil }
+    /// time genuine (non-bleed) speech is detected on it; the client queues
+    /// audio while the socket connects, so the triggering words are
+    /// translated too.
+    private func lazyOpenSession(channel: Int, speech: Bool) -> RealtimeTranslationClient? {
+        guard speech, pipelineActive, let apiKey = sessionAPIKey else { return nil }
         Log.info("Speech on channel \(channel) — opening translation session")
         let client = makeClient(lane: channel, outputLanguage: "en", apiKey: apiKey)
         clients[channel] = client

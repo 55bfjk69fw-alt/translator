@@ -8,11 +8,13 @@ enum AppSettings {
     static let autoPlayChineseKey = "autoPlayChinese"
     static let noiseGateEnabledKey = "noiseGateEnabled"
     static let neuralVADEnabledKey = "neuralVADEnabled"
+    static let micProfileKey = "micProfile"
     static let vadThresholdKey = "vadThreshold"
     static let snrFactorKey = "gateSnrFactor"
     static let bleedCorrelationKey = "gateBleedCorrelation"
     static let takeoverMarginKey = "gateTakeoverMargin"
     static let gateHangoverKey = "gateHangover"
+    static let vadOnProbabilityKey = "gateVadOnProbability"
     static let userNameKey = "userName"
     static let idleCloseSecondsKey = "idleCloseSeconds"
     static let showPinyinKey = "showPinyin"
@@ -52,57 +54,156 @@ enum AppSettings {
             : UserDefaults.standard.bool(forKey: neuralVADEnabledKey)
     }
 
+    // MARK: - Mic placement profiles
+
+    /// How the mics are being used, which picks the gate tuning that makes
+    /// sense physically. `worn` is the original setup — a lav clipped to
+    /// each speaker's chest, where far-field speech is *someone else's* and
+    /// must be suppressed. `ambient` inverts that: one carried/worn mic (or
+    /// a chest mic plus a second in hand) listening to conversations around
+    /// the wearer, where far-field speech is exactly the signal.
+    ///
+    /// Each profile has its own defaults *and* its own persisted tuning —
+    /// the worn profile keeps the original UserDefaults keys, so switching
+    /// to ambient and back restores the worn setup untouched.
+    enum MicProfile: String, CaseIterable, Identifiable {
+        case worn
+        case ambient
+        var id: String { rawValue }
+        var displayName: String {
+            switch self {
+            case .worn: return "Worn on speakers"
+            case .ambient: return "Ambient (carried)"
+            }
+        }
+    }
+
+    static var micProfile: MicProfile {
+        MicProfile(rawValue: UserDefaults.standard.string(forKey: micProfileKey) ?? "") ?? .worn
+    }
+
+    /// Storage key for a tunable under a profile. The worn profile owns the
+    /// bare (pre-profile) keys so existing tuning survives the upgrade.
+    static func profileKey(_ base: String, _ profile: MicProfile) -> String {
+        profile == .worn ? base : "\(base).\(profile.rawValue)"
+    }
+
     /// Single source of truth for the gate-tunable defaults: the accessors
-    /// below, the Signal tab's @AppStorage sliders, and ChannelGate must all
+    /// below, the tuning sliders' @AppStorage, and ChannelGate must all
     /// agree, and they all read these. Double because @AppStorage stores
     /// Double; the Float accessors convert.
-    enum GateDefaults {
-        static let vadThreshold = 0.004
-        static let snrFactor = 3.0
-        static let bleedCorrelation = 0.55
-        static let takeoverMargin = 1.25
-        static let hangover = 1.5
+    struct GateDefaults {
+        var vadThreshold: Double
+        var snrFactor: Double
+        var bleedCorrelation: Double
+        var takeoverMargin: Double
+        var hangover: Double
+        var vadOnProbability: Double
+        var sustainedVoiceTimeout: Double
+        var noiseReduction: String
+    }
+
+    static func gateDefaults(for profile: MicProfile) -> GateDefaults {
+        switch profile {
+        case .worn:
+            // The original chest-lav tuning, unchanged: the wearer's mouth
+            // is ~20 cm from the capsule, so anything faint is bleed.
+            return GateDefaults(
+                vadThreshold: 0.004,
+                snrFactor: 3.0,
+                bleedCorrelation: 0.55,
+                takeoverMargin: 1.25,
+                hangover: 1.5,
+                vadOnProbability: 0.5,
+                sustainedVoiceTimeout: 6,
+                noiseReduction: "near_field"
+            )
+        case .ambient:
+            // Target speech is 1-4 m away — roughly 15-25 dB quieter than
+            // mouth-distance speech — so the absolute floor drops, the VAD
+            // opens on lower confidence (Silero scores far speech lower),
+            // the hangover stretches (low-SNR speech reads as choppier),
+            // and OpenAI's far-field noise reduction replaces near-field.
+            // The steady-noise timeout doubles: surrounding chatter can run
+            // well past 6 s without the channel ever going unvoiced.
+            return GateDefaults(
+                vadThreshold: 0.001,
+                snrFactor: 2.0,
+                bleedCorrelation: 0.55,
+                takeoverMargin: 1.25,
+                hangover: 2.0,
+                vadOnProbability: 0.35,
+                sustainedVoiceTimeout: 12,
+                noiseReduction: "far_field"
+            )
+        }
     }
 
     /// Minimum RMS for the gate to ever open. The gate's adaptive noise
     /// floor raises the effective threshold above this in noisy rooms.
-    static var vadThreshold: Float {
-        let value = UserDefaults.standard.float(forKey: vadThresholdKey)
-        return value > 0 ? value : Float(GateDefaults.vadThreshold)
+    static func vadThreshold(for profile: MicProfile) -> Float {
+        let value = UserDefaults.standard.float(forKey: profileKey(vadThresholdKey, profile))
+        return value > 0 ? value : Float(gateDefaults(for: profile).vadThreshold)
     }
+    static var vadThreshold: Float { vadThreshold(for: micProfile) }
 
     /// Voiced when RMS exceeds the tracked noise floor by this factor.
-    static var snrFactor: Float {
-        let value = UserDefaults.standard.float(forKey: snrFactorKey)
-        return value > 0 ? value : Float(GateDefaults.snrFactor)
+    static func snrFactor(for profile: MicProfile) -> Float {
+        let value = UserDefaults.standard.float(forKey: profileKey(snrFactorKey, profile))
+        return value > 0 ? value : Float(gateDefaults(for: profile).snrFactor)
     }
+    static var snrFactor: Float { snrFactor(for: micProfile) }
 
     /// Peak cross-correlation at or above which two voiced channels count
     /// as one acoustic source (bleed).
-    static var bleedCorrelation: Float {
-        let value = UserDefaults.standard.float(forKey: bleedCorrelationKey)
-        return value > 0 ? value : Float(GateDefaults.bleedCorrelation)
+    static func bleedCorrelation(for profile: MicProfile) -> Float {
+        let value = UserDefaults.standard.float(forKey: profileKey(bleedCorrelationKey, profile))
+        return value > 0 ? value : Float(gateDefaults(for: profile).bleedCorrelation)
     }
+    static var bleedCorrelation: Float { bleedCorrelation(for: micProfile) }
 
     /// RMS factor a channel must beat the incumbent by to take over a
     /// correlated pair.
-    static var takeoverMargin: Float {
-        let value = UserDefaults.standard.float(forKey: takeoverMarginKey)
-        return value > 0 ? value : Float(GateDefaults.takeoverMargin)
+    static func takeoverMargin(for profile: MicProfile) -> Float {
+        let value = UserDefaults.standard.float(forKey: profileKey(takeoverMarginKey, profile))
+        return value > 0 ? value : Float(gateDefaults(for: profile).takeoverMargin)
     }
+    static var takeoverMargin: Float { takeoverMargin(for: micProfile) }
 
     /// Seconds the gate stays open after genuine speech (0 is a valid value).
-    static var gateHangover: Double {
-        if UserDefaults.standard.object(forKey: gateHangoverKey) == nil { return GateDefaults.hangover }
-        return UserDefaults.standard.double(forKey: gateHangoverKey)
+    static func gateHangover(for profile: MicProfile) -> Double {
+        let key = profileKey(gateHangoverKey, profile)
+        if UserDefaults.standard.object(forKey: key) == nil { return gateDefaults(for: profile).hangover }
+        return UserDefaults.standard.double(forKey: key)
+    }
+    static var gateHangover: Double { gateHangover(for: micProfile) }
+
+    /// Silero probability that opens voicing; the close threshold is
+    /// derived 0.15 below it, the same split the official iterator uses.
+    static func vadOnProbability(for profile: MicProfile) -> Float {
+        let value = UserDefaults.standard.float(forKey: profileKey(vadOnProbabilityKey, profile))
+        return value > 0 ? value : Float(gateDefaults(for: profile).vadOnProbability)
+    }
+    static var vadOnProbability: Float { vadOnProbability(for: micProfile) }
+    static var vadOffProbability: Float { max(0.05, vadOnProbability - 0.15) }
+
+    /// Unbroken voicing longer than this is reclassified as steady noise.
+    /// Per-profile constant (no slider): ambient surroundings legitimately
+    /// stay voiced far longer than a single worn mic ever should.
+    static var sustainedVoiceTimeout: Double {
+        gateDefaults(for: micProfile).sustainedVoiceTimeout
     }
 
-    /// Remove all persisted gate tunables so the defaults apply again.
-    static func resetGateTuning() {
+    /// Remove the active profile's persisted gate tunables (and the global
+    /// gate/VAD toggles) so its defaults apply again. The other profile's
+    /// tuning is untouched.
+    static func resetGateTuning(profile: MicProfile) {
         let defaults = UserDefaults.standard
-        for key in [noiseGateEnabledKey, neuralVADEnabledKey, vadThresholdKey,
-                    snrFactorKey, bleedCorrelationKey, takeoverMarginKey, gateHangoverKey] {
-            defaults.removeObject(forKey: key)
+        defaults.removeObject(forKey: noiseGateEnabledKey)
+        defaults.removeObject(forKey: neuralVADEnabledKey)
+        for base in [vadThresholdKey, snrFactorKey, bleedCorrelationKey,
+                     takeoverMarginKey, gateHangoverKey, vadOnProbabilityKey] {
+            defaults.removeObject(forKey: profileKey(base, profile))
         }
     }
 
@@ -142,11 +243,18 @@ enum AppSettings {
         return value.isEmpty ? "zh" : value
     }
 
-    /// Server-side noise reduction type ("near_field"/"far_field"), or nil
+    /// Server-side noise reduction type ("near_field"/"far_field"/"off") as
+    /// stored for a profile, defaulting per profile (worn = near_field,
+    /// ambient = far_field).
+    static func noiseReductionSetting(for profile: MicProfile) -> String {
+        let value = UserDefaults.standard.string(forKey: profileKey(noiseReductionKey, profile)) ?? ""
+        return value.isEmpty ? gateDefaults(for: profile).noiseReduction : value
+    }
+
+    /// The active profile's noise reduction for the session payload, or nil
     /// when the user turned it off (stored as "off").
     static var noiseReduction: String? {
-        let value = UserDefaults.standard.string(forKey: noiseReductionKey) ?? ""
-        if value.isEmpty { return "near_field" }
+        let value = noiseReductionSetting(for: micProfile)
         return value == "off" ? nil : value
     }
 

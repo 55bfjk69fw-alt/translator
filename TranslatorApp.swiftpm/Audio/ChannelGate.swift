@@ -46,7 +46,9 @@ final class ChannelGate {
     /// Silero probability that opens voicing, and the lower level it must
     /// drop below to close it — hysteresis so probabilities hovering around
     /// the threshold don't chatter mid-utterance. Same split as the official
-    /// silero-vad iterator (threshold / threshold − 0.15).
+    /// silero-vad iterator (threshold / threshold − 0.15). User-adjustable
+    /// per mic profile: the ambient profile opens lower because Silero
+    /// scores far-field speech less confidently.
     var vadOnProbability: Float = 0.5
     var vadOffProbability: Float = 0.35
     /// Settings toggle: use the neural VAD when its weights are available.
@@ -72,6 +74,9 @@ final class ChannelGate {
     /// 200 ms buffer — is carrying steady noise (mic hiss with onboard NC
     /// off, ventilation), not speech: speakers always pause to breathe.
     /// Past the timeout the floor unfreezes so it can climb over the noise.
+    /// Profile-dependent: the ambient profile doubles it, since surrounding
+    /// multi-person chatter legitimately stays voiced far longer than one
+    /// worn mic's wearer ever does.
     var sustainedVoiceTimeout: TimeInterval = 6
     var enabled = true
 

@@ -9,7 +9,7 @@ struct SettingsView: View {
     @AppStorage(AppSettings.autoPlayChineseKey) private var autoPlayChinese = false
     @AppStorage(AppSettings.noiseGateEnabledKey) private var noiseGateEnabled = true
     @AppStorage(AppSettings.neuralVADEnabledKey) private var neuralVADEnabled = true
-    @AppStorage(AppSettings.vadThresholdKey) private var vadThreshold = AppSettings.GateDefaults.vadThreshold
+    @AppStorage(AppSettings.micProfileKey) private var micProfileRaw = AppSettings.MicProfile.worn.rawValue
     @AppStorage(AppSettings.userNameKey) private var userName = ""
     @AppStorage("speakerName0") private var speakerName0 = ""
     @AppStorage("speakerName1") private var speakerName1 = ""
@@ -26,7 +26,10 @@ struct SettingsView: View {
     @AppStorage(AppSettings.outputGainKey) private var outputGain = 1.0
     @AppStorage(AppSettings.outputLanguageKey) private var outputLanguage = "en"
     @AppStorage(AppSettings.pttOutputLanguageKey) private var pttOutputLanguage = "zh"
-    @AppStorage(AppSettings.noiseReductionKey) private var noiseReduction = "near_field"
+
+    private var micProfile: AppSettings.MicProfile {
+        AppSettings.MicProfile(rawValue: micProfileRaw) ?? .worn
+    }
 
     private struct LanguageOption: Identifiable {
         let code: String
@@ -131,6 +134,12 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    Picker("Mic placement", selection: $micProfileRaw) {
+                        ForEach(AppSettings.MicProfile.allCases) { profile in
+                            Text(profile.displayName).tag(profile.rawValue)
+                        }
+                    }
+                    .onChange(of: micProfileRaw) { model.applyGateTuning() }
                     // Re-apply to the live gate on change, matching the
                     // Signal tab's tuning panel — without this the toggles
                     // only took effect at the next Start.
@@ -138,21 +147,14 @@ struct SettingsView: View {
                         .onChange(of: noiseGateEnabled) { model.applyGateTuning() }
                     Toggle("Neural voice detection", isOn: $neuralVADEnabled)
                         .onChange(of: neuralVADEnabled) { model.applyGateTuning() }
-                    VStack(alignment: .leading) {
-                        Text(String(format: "Minimum voice threshold: %.3f", vadThreshold))
-                            .font(.callout)
-                        Slider(value: $vadThreshold, in: 0.002...0.05)
-                            .onChange(of: vadThreshold) { model.applyGateTuning() }
-                    }
-                    Picker("Server noise reduction", selection: $noiseReduction) {
-                        Text("Near field (lav mics)").tag("near_field")
-                        Text("Far field (room mics)").tag("far_field")
-                        Text("Off").tag("off")
-                    }
+                    // Rebuilt (fresh @AppStorage keys) when the profile
+                    // changes so the controls edit the active profile.
+                    ProfileSignalControls(profile: micProfile)
+                        .id(micProfileRaw)
                 } header: {
                     Text("Signal quality")
                 } footer: {
-                    Text("Neural voice detection (Silero VAD, on-device) opens the gate on speech and ignores rustle, bumps, and room noise; turn it off to fall back to a level-based gate that learns each channel's noise floor. The slider sets the quietest level the gate will ever open at in either mode. When several mics pick up the same voice, only the loudest copy is sent — people genuinely talking at the same time all pass. Also enable each transmitter's onboard noise cancelling (Basic/Strong) from the DJI receiver. Server noise reduction is applied by OpenAI before translating: near field suits the clipped-on DJI lavs, far field suits a distant mic; it applies when a lane's next session opens.")
+                    Text("Mic placement picks the tuning profile: \"Worn on speakers\" is the original setup (a lav on each speaker's chest — faint far-away speech is treated as bleed and suppressed); \"Ambient (carried)\" is for walking around with a mic on your own chest or in hand, listening to conversations near you — quiet far-field speech is the signal, so the gate opens far lower and OpenAI's far-field noise reduction is used. Each profile remembers its own tuning; switching back restores the other exactly. Neural voice detection (Silero VAD, on-device) opens the gate on speech and ignores rustle, bumps, and room noise; turn it off to fall back to a level-based gate that learns each channel's noise floor. The slider sets the quietest level the gate will ever open at in either mode. When several mics pick up the same voice, only the loudest copy is sent — with a chest + hand pair this is what deduplicates them. Server noise reduction is applied by OpenAI before translating and applies when a lane's next session opens.")
                 }
 
                 Section {
@@ -198,6 +200,48 @@ struct SettingsView: View {
                 .opacity(enabled.wrappedValue ? 1 : 0.4)
             Toggle(placeholder, isOn: enabled)
                 .labelsHidden()
+        }
+    }
+}
+
+/// The per-profile signal settings, bound to the given profile's storage
+/// keys. Instantiate with `.id(profile)` so a profile switch rebuilds the
+/// @AppStorage bindings against the new keys.
+private struct ProfileSignalControls: View {
+    @EnvironmentObject private var model: AppModel
+
+    let profile: AppSettings.MicProfile
+    @AppStorage private var vadThreshold: Double
+    @AppStorage private var noiseReduction: String
+
+    init(profile: AppSettings.MicProfile) {
+        self.profile = profile
+        let defaults = AppSettings.gateDefaults(for: profile)
+        _vadThreshold = AppStorage(
+            wrappedValue: defaults.vadThreshold,
+            AppSettings.profileKey(AppSettings.vadThresholdKey, profile)
+        )
+        _noiseReduction = AppStorage(
+            wrappedValue: defaults.noiseReduction,
+            AppSettings.profileKey(AppSettings.noiseReductionKey, profile)
+        )
+    }
+
+    var body: some View {
+        Group {
+            VStack(alignment: .leading) {
+                // Far-field speech sits well below the worn range, so the
+                // ambient slider covers a lower decade at finer print.
+                Text(String(format: profile == .worn ? "Minimum voice threshold: %.3f" : "Minimum voice threshold: %.4f", vadThreshold))
+                    .font(.callout)
+                Slider(value: $vadThreshold, in: profile == .worn ? 0.002...0.05 : 0.0005...0.01)
+                    .onChange(of: vadThreshold) { model.applyGateTuning() }
+            }
+            Picker("Server noise reduction", selection: $noiseReduction) {
+                Text("Near field (lav mics)").tag("near_field")
+                Text("Far field (room mics)").tag("far_field")
+                Text("Off").tag("off")
+            }
         }
     }
 }

@@ -96,6 +96,55 @@ runs while the tab is visible.
 Note: the bench test now runs the gate with your real settings (it used to run
 ungated), so bench meters reflect actual gate behavior too.
 
+## Ambient mode — walking around, listening to dialogue near you
+
+The default tuning assumes each mic is clipped to the person speaking, so it
+deliberately *suppresses* faint far-away speech as bleed. To instead carry a
+mic yourself (on your chest, or a second one in your hand) and translate
+conversations happening around you, switch **Settings → Signal quality →
+Mic placement** to **Ambient (carried)**. This swaps in a second tuning
+profile without touching the worn-mic one — each profile remembers its own
+settings, so flipping back restores your current setup exactly. What the
+ambient profile changes:
+
+| Tunable | Worn | Ambient | Why |
+| --- | --- | --- | --- |
+| Minimum voice threshold | 0.004 | 0.001 | Speech from 1–4 m away is ~15–25 dB quieter than mouth-distance speech; the worn floor would gate all of it. |
+| VAD open probability | 0.50 | 0.35 | Silero scores far-field speech less confidently. |
+| Hangover | 1.5 s | 2.0 s | Low-SNR speech reads as choppier; longer hold avoids chopped sentence endings. |
+| SNR factor (fallback mode) | 3.0× | 2.0× | Distant speech rises less above the room floor. |
+| Steady-noise timeout | 6 s | 12 s | Multi-person chatter around you legitimately stays voiced longer than one wearer ever does. |
+| Server noise reduction | near field | far field | OpenAI's far-field mode suits a distant/roaming mic. |
+
+Practical notes for ambient use:
+
+- **Chest + hand pair**: both mics hear the same conversation, so they
+  correlate strongly and bleed rejection keeps only the louder copy — that's
+  what prevents duplicate translations, no extra setup needed. The hand mic,
+  pointed at whoever's talking, usually wins; name the channels "Chest" and
+  "Hand" in Settings so the transcript shows which one did. Switch off the
+  TX channels you aren't carrying.
+- **Transmitter settings matter more than app tuning**: raise the TX gain
+  (far-field speech needs it), and keep onboard noise cancelling at **Basic**
+  or off — **Strong** is tuned to isolate a close wearer and will eat exactly
+  the distant speech you're trying to catch.
+- **Attribution changes meaning**: a lane's transcript label is the *mic*,
+  not the speaker — everyone the mic hears lands on that one lane.
+- **Expect more gate-open time and higher cost**: the gate now opens for any
+  nearby speech (including strangers'), and busy environments will trigger
+  it often. Watch the running cost estimate, and use the **Signal** tab in a
+  free bench test to sanity-check levels first: distant speech should ride
+  visibly above the threshold line on the gate timeline; if it doesn't,
+  raise TX gain before touching the sliders.
+- **Your own voice** still lands on your chest mic loudest of all — it will
+  be transcribed/translated like anyone else's. That's usually fine
+  (it keeps both sides of your conversations in the transcript).
+
+The Signal tab's gate-tuning panel has the same profile switch, so you can
+A/B the two profiles live against real audio and fine-tune the ambient one
+(its sliders cover a lower threshold range) without disturbing the worn
+profile.
+
 ## Troubleshooting
 
 - **No USB input listed** — unplug/replug the RX, then Diagnostics → *Select USB input*.

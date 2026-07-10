@@ -457,6 +457,7 @@ struct PairEvent {
 /// The gate tunables currently in effect (persisted settings are the source
 /// of truth; AppModel applies the same values to the live gate).
 struct GateSettingsSnapshot: Codable {
+    var profile: String
     var enabled: Bool
     var neuralVAD: Bool
     var minimumVoiceThreshold: Float
@@ -464,16 +465,25 @@ struct GateSettingsSnapshot: Codable {
     var bleedCorrelation: Float
     var takeoverMargin: Float
     var hangover: Double
+    var vadOnProbability: Float
+    var vadOffProbability: Float
+    var sustainedVoiceTimeout: Double
 
+    /// The active mic profile's tunables, resolved through AppSettings so
+    /// the gate, the Signal tab, and the export all agree.
     static func current() -> GateSettingsSnapshot {
         GateSettingsSnapshot(
+            profile: AppSettings.micProfile.rawValue,
             enabled: AppSettings.noiseGateEnabled,
             neuralVAD: AppSettings.neuralVADEnabled,
             minimumVoiceThreshold: AppSettings.vadThreshold,
             snrFactor: AppSettings.snrFactor,
             bleedCorrelation: AppSettings.bleedCorrelation,
             takeoverMargin: AppSettings.takeoverMargin,
-            hangover: AppSettings.gateHangover
+            hangover: AppSettings.gateHangover,
+            vadOnProbability: AppSettings.vadOnProbability,
+            vadOffProbability: AppSettings.vadOffProbability,
+            sustainedVoiceTimeout: AppSettings.sustainedVoiceTimeout
         )
     }
 }

@@ -289,9 +289,22 @@ struct SignalView: View {
 
     // MARK: - Tuning
 
+    @AppStorage(AppSettings.micProfileKey) private var micProfileRaw = AppSettings.MicProfile.worn.rawValue
+
     private var tuningCard: some View {
         card("Gate tuning") {
-            GateTuningPanel()
+            Picker("Mic placement", selection: $micProfileRaw) {
+                ForEach(AppSettings.MicProfile.allCases) { profile in
+                    Text(profile.displayName).tag(profile.rawValue)
+                }
+            }
+            .pickerStyle(.segmented)
+            .onChange(of: micProfileRaw) { model.applyGateTuning() }
+            Text("Each profile keeps its own tuning — switching applies the other profile's values to the running gate within 200 ms, so you can A/B them live.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            GateTuningPanel(profile: AppSettings.MicProfile(rawValue: micProfileRaw) ?? .worn)
+                .id(micProfileRaw)
         }
     }
 
@@ -385,18 +398,36 @@ private struct MiniTranscriptRow: View {
 
 // MARK: - Tuning panel
 
-/// Live gate tunables. Sliders persist via @AppStorage and re-apply to the
-/// running gate on every change (effective within one 200 ms buffer).
+/// Live gate tunables for one mic profile. Sliders persist via @AppStorage
+/// under the profile's keys and re-apply to the running gate on every change
+/// (effective within one 200 ms buffer). Instantiate with `.id(profile)` so
+/// a profile switch rebuilds the bindings against the new keys.
 private struct GateTuningPanel: View {
     @EnvironmentObject private var model: AppModel
 
+    let profile: AppSettings.MicProfile
     @AppStorage(AppSettings.noiseGateEnabledKey) private var gateEnabled = true
     @AppStorage(AppSettings.neuralVADEnabledKey) private var neuralVAD = true
-    @AppStorage(AppSettings.vadThresholdKey) private var vadThreshold = AppSettings.GateDefaults.vadThreshold
-    @AppStorage(AppSettings.snrFactorKey) private var snrFactor = AppSettings.GateDefaults.snrFactor
-    @AppStorage(AppSettings.bleedCorrelationKey) private var bleedCorrelation = AppSettings.GateDefaults.bleedCorrelation
-    @AppStorage(AppSettings.takeoverMarginKey) private var takeoverMargin = AppSettings.GateDefaults.takeoverMargin
-    @AppStorage(AppSettings.gateHangoverKey) private var hangover = AppSettings.GateDefaults.hangover
+    @AppStorage private var vadThreshold: Double
+    @AppStorage private var vadOnProbability: Double
+    @AppStorage private var snrFactor: Double
+    @AppStorage private var bleedCorrelation: Double
+    @AppStorage private var takeoverMargin: Double
+    @AppStorage private var hangover: Double
+
+    init(profile: AppSettings.MicProfile) {
+        self.profile = profile
+        let defaults = AppSettings.gateDefaults(for: profile)
+        func storage(_ base: String, _ value: Double) -> AppStorage<Double> {
+            AppStorage(wrappedValue: value, AppSettings.profileKey(base, profile))
+        }
+        _vadThreshold = storage(AppSettings.vadThresholdKey, defaults.vadThreshold)
+        _vadOnProbability = storage(AppSettings.vadOnProbabilityKey, defaults.vadOnProbability)
+        _snrFactor = storage(AppSettings.snrFactorKey, defaults.snrFactor)
+        _bleedCorrelation = storage(AppSettings.bleedCorrelationKey, defaults.bleedCorrelation)
+        _takeoverMargin = storage(AppSettings.takeoverMarginKey, defaults.takeoverMargin)
+        _hangover = storage(AppSettings.gateHangoverKey, defaults.hangover)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -408,9 +439,16 @@ private struct GateTuningPanel: View {
             slider(
                 "Minimum voice threshold",
                 value: $vadThreshold,
-                range: 0.002...0.05,
-                format: "%.3f",
-                help: "RMS below which the gate never opens, however quiet the room."
+                range: profile == .worn ? 0.002...0.05 : 0.0005...0.01,
+                format: profile == .worn ? "%.3f" : "%.4f",
+                help: "RMS below which the gate never opens, however quiet the room. The ambient profile's range sits an order of magnitude lower — far-field speech is that much quieter."
+            )
+            slider(
+                "VAD open probability",
+                value: $vadOnProbability,
+                range: 0.20...0.70,
+                format: "%.2f",
+                help: "Silero confidence needed to open the gate (it closes 0.15 below). Lower opens on fainter/distant speech at the cost of more false opens."
             )
             slider(
                 "SNR factor",
@@ -440,8 +478,8 @@ private struct GateTuningPanel: View {
                 format: "%.1f s",
                 help: "How long the gate stays open after speech, so quiet sentence endings aren't chopped."
             )
-            Button("Reset to defaults") {
-                AppSettings.resetGateTuning()
+            Button("Reset \(profile == .worn ? "worn" : "ambient") profile to defaults") {
+                AppSettings.resetGateTuning(profile: profile)
                 model.applyGateTuning()
             }
             .font(.callout)
@@ -449,6 +487,7 @@ private struct GateTuningPanel: View {
         .onChange(of: gateEnabled) { model.applyGateTuning() }
         .onChange(of: neuralVAD) { model.applyGateTuning() }
         .onChange(of: vadThreshold) { model.applyGateTuning() }
+        .onChange(of: vadOnProbability) { model.applyGateTuning() }
         .onChange(of: snrFactor) { model.applyGateTuning() }
         .onChange(of: bleedCorrelation) { model.applyGateTuning() }
         .onChange(of: takeoverMargin) { model.applyGateTuning() }

@@ -587,6 +587,9 @@ final class AppModel: ObservableObject {
         gate.bleedCorrelation = tuning.bleedCorrelation
         gate.takeoverMargin = tuning.takeoverMargin
         gate.hangover = tuning.hangover
+        gate.vadOnProbability = tuning.vadOnProbability
+        gate.vadOffProbability = tuning.vadOffProbability
+        gate.sustainedVoiceTimeout = tuning.sustainedVoiceTimeout
     }
 
     // MARK: - Diagnostics support

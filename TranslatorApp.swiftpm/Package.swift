@@ -36,7 +36,12 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "AppModule",
-            path: "."
+            path: ".",
+            resources: [
+                // Silero VAD v5 weights (MIT, © Silero Team), consumed by
+                // Audio/SileroVAD.swift. Regenerate with tools/silero/.
+                .copy("Resources/silero_vad_16k.svad")
+            ]
         )
     ]
 )

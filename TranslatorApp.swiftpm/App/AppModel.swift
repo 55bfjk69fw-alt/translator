@@ -130,6 +130,7 @@ final class AppModel: ObservableObject {
 
         audioQueue.sync {
             gate.enabled = AppSettings.noiseGateEnabled
+            gate.neuralVADEnabled = AppSettings.neuralVADEnabled
             gate.minimumVoiceThreshold = AppSettings.vadThreshold
             gate.reset()
             pipelineActive = true

@@ -7,6 +7,7 @@ enum AppSettings {
     static let modelNameKey = "modelName"
     static let autoPlayChineseKey = "autoPlayChinese"
     static let noiseGateEnabledKey = "noiseGateEnabled"
+    static let neuralVADEnabledKey = "neuralVADEnabled"
     static let vadThresholdKey = "vadThreshold"
     static let userNameKey = "userName"
     static let idleCloseSecondsKey = "idleCloseSeconds"
@@ -32,6 +33,14 @@ enum AppSettings {
         UserDefaults.standard.object(forKey: noiseGateEnabledKey) == nil
             ? true
             : UserDefaults.standard.bool(forKey: noiseGateEnabledKey)
+    }
+
+    /// Voicing via the on-device Silero VAD model instead of the adaptive
+    /// RMS threshold (the gate falls back to RMS when this is off).
+    static var neuralVADEnabled: Bool {
+        UserDefaults.standard.object(forKey: neuralVADEnabledKey) == nil
+            ? true
+            : UserDefaults.standard.bool(forKey: neuralVADEnabledKey)
     }
 
     /// Minimum RMS for the gate to ever open. The gate's adaptive noise

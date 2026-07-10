@@ -7,11 +7,16 @@ import Foundation
 /// beamforming across unsynchronized wireless mics isn't possible, so the
 /// gate combines two ideas:
 ///
-///  - **Adaptive voicing.** Each channel tracks its own noise floor
-///    (fast-falling, slow-rising, frozen while voiced) and is "voiced" when
-///    its RMS climbs `snrFactor` above that floor. Thresholds self-tune to
-///    the room instead of relying on one hand-set constant; the old constant
-///    survives only as an absolute minimum.
+///  - **Voicing.** Silero VAD (see SileroVAD.swift) scores each channel's
+///    speech probability per 32 ms; unlike an energy threshold it ignores
+///    non-speech transients (clothing rustle, dishes) and still detects
+///    quiet speakers in loud rooms, where a level-based gate must choose
+///    between the two failure modes. An adaptive-RMS detector — noise floor
+///    fast-falling, slow-rising, frozen while voiced; voiced when RMS climbs
+///    `snrFactor` above it — remains as the fallback when the model can't
+///    run (weights missing, non-multiple-of-16 kHz input) or is disabled in
+///    Settings. VAD can't replace the bleed logic below: bleed IS speech,
+///    so a speech detector fires on every channel that hears it.
 ///  - **Bleed rejection by cross-correlation.** Bleed is the *same* waveform
 ///    on two mics — delayed by acoustics/radio and attenuated — so when two
 ///    channels are voiced in the same buffer, a high peak cross-correlation
@@ -31,10 +36,21 @@ final class ChannelGate {
     // MARK: - Tunables
 
     /// Absolute RMS below which a channel is never voiced, however low its
-    /// tracked noise floor falls. User-adjustable in Settings.
+    /// tracked noise floor falls. User-adjustable in Settings. Applies in
+    /// both voicing modes: with the VAD it suppresses far-field speech that
+    /// is genuinely someone else's (too faint to be the wearer).
     var minimumVoiceThreshold: Float = 0.004
     /// Voiced when RMS exceeds the tracked noise floor by this factor (~10 dB).
+    /// Fallback mode only.
     var snrFactor: Float = 3.0
+    /// Silero probability that opens voicing, and the lower level it must
+    /// drop below to close it — hysteresis so probabilities hovering around
+    /// the threshold don't chatter mid-utterance. Same split as the official
+    /// silero-vad iterator (threshold / threshold − 0.15).
+    var vadOnProbability: Float = 0.5
+    var vadOffProbability: Float = 0.35
+    /// Settings toggle: use the neural VAD when its weights are available.
+    var neuralVADEnabled = true
     /// Peak normalized cross-correlation at or above which two voiced
     /// channels count as one acoustic source. In simulation, bleed-only
     /// channels score ≥0.9 even with heavy coloration and noise, while
@@ -61,6 +77,18 @@ final class ChannelGate {
 
     // MARK: - State
 
+    /// Loaded once for the process; each channel gets its own model state.
+    private static let vadWeights: SileroVAD.Weights? = {
+        let url = Bundle.main.url(forResource: "silero_vad_16k", withExtension: "svad")
+            ?? Bundle.module.url(forResource: "silero_vad_16k", withExtension: "svad")
+        guard let url, let data = try? Data(contentsOf: url),
+              let weights = SileroVAD.Weights(data: data) else { return nil }
+        return weights
+    }()
+
+    private var vads: [StreamingVAD] = []
+    /// Per-channel hysteresis: currently above the on threshold.
+    private var vadHold: [Bool] = []
     private var noiseFloor: [Float] = []
     private var lastGenuine: [Int: Date] = [:]
     /// pairKey(i,j) -> channel currently winning that correlated pair.
@@ -88,13 +116,20 @@ final class ChannelGate {
 
         let rms = channels.map { Self.rms(samples: $0, count: frames) }
 
-        // 1. Adaptive voicing. The floor falls quickly toward quiet frames
-        // and creeps up only during frames that aren't voiced, so it never
-        // climbs into ongoing speech.
+        // 1. Voicing: Silero probability with hysteresis when the model is
+        // available, adaptive-RMS otherwise. The noise floor keeps updating
+        // in both modes (fast-falling, creeping up only while unvoiced, so
+        // it never climbs into ongoing speech) — it stays warm in case a
+        // buffer arrives at a rate the VAD can't consume.
+        let useVAD = neuralVADEnabled && !vads.isEmpty
         var voicedNow = [Bool](repeating: false, count: count)
         for i in 0..<count {
-            let threshold = max(minimumVoiceThreshold, noiseFloor[i] * snrFactor)
-            voicedNow[i] = rms[i] >= threshold
+            if useVAD, let probability = vads[i].feed(channels[i], count: frames, sampleRate: sampleRate) {
+                vadHold[i] = probability >= (vadHold[i] ? vadOffProbability : vadOnProbability)
+                voicedNow[i] = vadHold[i] && rms[i] >= minimumVoiceThreshold
+            } else {
+                voicedNow[i] = rms[i] >= max(minimumVoiceThreshold, noiseFloor[i] * snrFactor)
+            }
             if rms[i] < noiseFloor[i] {
                 noiseFloor[i] += (rms[i] - noiseFloor[i]) * 0.5
             } else if !voicedNow[i] {
@@ -160,6 +195,8 @@ final class ChannelGate {
         pairWinner.removeAll()
         wasBleed.removeAll()
         scratch.removeAll()
+        vads.removeAll()
+        vadHold.removeAll()
     }
 
     // MARK: - Internals
@@ -171,6 +208,14 @@ final class ChannelGate {
         lastGenuine.removeAll()
         pairWinner.removeAll()
         wasBleed.removeAll()
+        vadHold = Array(repeating: false, count: channelCount)
+        if let weights = Self.vadWeights {
+            vads = (0..<channelCount).map { _ in StreamingVAD(weights: weights) }
+            Log.info("Gate: Silero VAD voicing active (\(channelCount) channels)")
+        } else {
+            vads = []
+            Log.warn("Gate: VAD weights unavailable; using adaptive-RMS voicing")
+        }
     }
 
     private func pairKey(_ i: Int, _ j: Int) -> Int {

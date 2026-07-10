@@ -8,6 +8,7 @@ struct SettingsView: View {
 
     @AppStorage(AppSettings.autoPlayChineseKey) private var autoPlayChinese = false
     @AppStorage(AppSettings.noiseGateEnabledKey) private var noiseGateEnabled = true
+    @AppStorage(AppSettings.neuralVADEnabledKey) private var neuralVADEnabled = true
     @AppStorage(AppSettings.vadThresholdKey) private var vadThreshold = 0.004
     @AppStorage(AppSettings.userNameKey) private var userName = ""
     @AppStorage("speakerName0") private var speakerName0 = ""
@@ -60,6 +61,7 @@ struct SettingsView: View {
 
                 Section {
                     Toggle("Cross-channel noise gate", isOn: $noiseGateEnabled)
+                    Toggle("Neural voice detection", isOn: $neuralVADEnabled)
                     VStack(alignment: .leading) {
                         Text(String(format: "Minimum voice threshold: %.3f", vadThreshold))
                             .font(.callout)
@@ -68,7 +70,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Signal quality")
                 } footer: {
-                    Text("The gate learns each channel's noise floor automatically and opens when speech rises above it; the slider sets the quietest level it will ever open at. When several mics pick up the same voice, only the loudest copy is sent — people genuinely talking at the same time all pass. Also enable each transmitter's onboard noise cancelling (Basic/Strong) from the DJI receiver.")
+                    Text("Neural voice detection (Silero VAD, on-device) opens the gate on speech and ignores rustle, bumps, and room noise; turn it off to fall back to a level-based gate that learns each channel's noise floor. The slider sets the quietest level the gate will ever open at in either mode. When several mics pick up the same voice, only the loudest copy is sent — people genuinely talking at the same time all pass. Also enable each transmitter's onboard noise cancelling (Basic/Strong) from the DJI receiver.")
                 }
 
                 Section {

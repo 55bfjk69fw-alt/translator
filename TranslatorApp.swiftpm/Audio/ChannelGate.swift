@@ -79,6 +79,40 @@ final class ChannelGate {
         var bleed: Bool
     }
 
+    // MARK: - Telemetry
+    //
+    // Everything the gate knew when it made its last decisions, for the
+    // Signal tab. audioQueue-confined like the rest of the gate's state:
+    // read it synchronously right after evaluate() and pass a value copy on.
+
+    struct ChannelTelemetry {
+        var rms: Float
+        var noiseFloor: Float
+        /// The threshold the voicing decision was made against, before this
+        /// buffer's noise-floor update.
+        var effectiveThreshold: Float
+        var voiced: Bool
+        var pass: Bool
+        var bleed: Bool
+    }
+
+    struct PairTelemetry {
+        var a: Int
+        var b: Int
+        var correlation: Float
+        /// Set only when the pair correlated at or above `bleedCorrelation`.
+        var winner: Int?
+    }
+
+    struct Telemetry {
+        var channels: [ChannelTelemetry] = []
+        /// One entry per correlation actually computed this buffer, i.e.
+        /// pairs that were both voiced. Everything else was never measured.
+        var pairs: [PairTelemetry] = []
+    }
+
+    private(set) var lastTelemetry = Telemetry()
+
     /// Evaluate all channels for one buffer interval. The pointers must stay
     /// valid for the duration of the call.
     func evaluate(channels: [UnsafePointer<Float>], frames: Int, sampleRate: Double) -> [Decision] {
@@ -92,8 +126,10 @@ final class ChannelGate {
         // and creeps up only during frames that aren't voiced, so it never
         // climbs into ongoing speech.
         var voicedNow = [Bool](repeating: false, count: count)
+        var thresholds = [Float](repeating: 0, count: count)
         for i in 0..<count {
             let threshold = max(minimumVoiceThreshold, noiseFloor[i] * snrFactor)
+            thresholds[i] = threshold
             voicedNow[i] = rms[i] >= threshold
             if rms[i] < noiseFloor[i] {
                 noiseFloor[i] += (rms[i] - noiseFloor[i]) * 0.5
@@ -104,6 +140,7 @@ final class ChannelGate {
 
         // 2. Bleed rejection among concurrently voiced channels.
         var bleed = [Bool](repeating: false, count: count)
+        var pairTelemetry: [PairTelemetry] = []
         let active = (0..<count).filter { voicedNow[$0] }
         var winners: [Int: Int] = [:]
         if enabled && active.count >= 2 {
@@ -115,7 +152,10 @@ final class ChannelGate {
             for (offset, i) in active.enumerated() {
                 for j in active.dropFirst(offset + 1) {
                     let corr = Self.peakCorrelation(scratch[i], scratch[j], maxLag: maxLag)
-                    guard corr >= bleedCorrelation else { continue }
+                    guard corr >= bleedCorrelation else {
+                        pairTelemetry.append(PairTelemetry(a: i, b: j, correlation: corr, winner: nil))
+                        continue
+                    }
                     let key = pairKey(i, j)
                     let winner: Int
                     if let incumbent = pairWinner[key] {
@@ -126,6 +166,7 @@ final class ChannelGate {
                     }
                     winners[key] = winner
                     bleed[winner == i ? j : i] = true
+                    pairTelemetry.append(PairTelemetry(a: i, b: j, correlation: corr, winner: winner))
                 }
             }
         }
@@ -136,6 +177,8 @@ final class ChannelGate {
         // speaker's words into this channel's session.
         var decisions: [Decision] = []
         decisions.reserveCapacity(count)
+        var channelTelemetry: [ChannelTelemetry] = []
+        channelTelemetry.reserveCapacity(count)
         for i in 0..<count {
             let genuine = voicedNow[i] && !bleed[i]
             if genuine { lastGenuine[i] = now }
@@ -143,6 +186,14 @@ final class ChannelGate {
             let voiced = voicedNow[i] || inHangover
             let pass = !enabled || (!bleed[i] && (genuine || inHangover))
             decisions.append(Decision(rms: rms[i], voiced: voiced, pass: pass, bleed: bleed[i]))
+            channelTelemetry.append(ChannelTelemetry(
+                rms: rms[i],
+                noiseFloor: noiseFloor[i],
+                effectiveThreshold: thresholds[i],
+                voiced: voiced,
+                pass: pass,
+                bleed: bleed[i]
+            ))
 
             if bleed[i] && !wasBleed.contains(i) {
                 Log.info("Gate: ch\(i) suppressed as bleed of a louder channel")
@@ -151,6 +202,7 @@ final class ChannelGate {
                 wasBleed.remove(i)
             }
         }
+        lastTelemetry = Telemetry(channels: channelTelemetry, pairs: pairTelemetry)
         return decisions
     }
 
@@ -160,6 +212,7 @@ final class ChannelGate {
         pairWinner.removeAll()
         wasBleed.removeAll()
         scratch.removeAll()
+        lastTelemetry = Telemetry()
     }
 
     // MARK: - Internals

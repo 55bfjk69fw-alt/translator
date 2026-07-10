@@ -35,6 +35,11 @@ final class AppModel: ObservableObject {
     let transcript: TranscriptStore
     let log = Log.shared
 
+    /// Signal-tab analysis. Deliberately its own ObservableObject (not
+    /// forwarded through objectWillChange) so its 5-10 Hz snapshot churn
+    /// only re-renders views that observe it directly.
+    let signalAnalyzer = SignalAnalyzer()
+
     // MARK: - Pipeline components
 
     let audioSession = AudioSessionController()
@@ -129,8 +134,7 @@ final class AppModel: ObservableObject {
         gateOpen = Array(repeating: false, count: channelCount)
 
         audioQueue.sync {
-            gate.enabled = AppSettings.noiseGateEnabled
-            gate.minimumVoiceThreshold = AppSettings.vadThreshold
+            applyGateTuningLocked()
             gate.reset()
             pipelineActive = true
             sessionAPIKey = apiKey
@@ -231,6 +235,10 @@ final class AppModel: ObservableObject {
             channels.append(UnsafePointer(data[0]))
         }
         let decisions = gate.evaluate(channels: channels, frames: frames, sampleRate: sampleRate)
+        // Fan out to the Signal tab. When the tab is hidden this is a flag
+        // check and return; otherwise the buffers are retained (no copy)
+        // onto the analyzer's lower-priority queue.
+        signalAnalyzer.ingest(buffers: buffers, frames: frames, sampleRate: sampleRate, telemetry: gate.lastTelemetry)
         for (channel, decision) in decisions.enumerated() {
             // Log utterance-level transitions (the hangover smooths word
             // gaps) so missing translations can be correlated with whether
@@ -526,6 +534,25 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: - Gate tuning
+
+    /// Apply the persisted gate tunables to the live gate. Safe from any
+    /// thread at any time; takes effect on the next 200 ms buffer. Used by
+    /// the Signal tab's tuning sliders.
+    func applyGateTuning() {
+        audioQueue.async { self.applyGateTuningLocked() }
+    }
+
+    /// Must run on audioQueue (UserDefaults reads are thread-safe).
+    private func applyGateTuningLocked() {
+        gate.enabled = AppSettings.noiseGateEnabled
+        gate.minimumVoiceThreshold = AppSettings.vadThreshold
+        gate.snrFactor = AppSettings.snrFactor
+        gate.bleedCorrelation = AppSettings.bleedCorrelation
+        gate.takeoverMargin = AppSettings.takeoverMargin
+        gate.hangover = AppSettings.gateHangover
+    }
+
     // MARK: - Diagnostics support
 
     func refreshRoute() {
@@ -549,7 +576,13 @@ final class AppModel: ObservableObject {
         lanes = (0..<channelCount).map { SpeakerLane.djiLane(channel: $0, name: AppSettings.speakerName($0)) }
         meters = Array(repeating: 0, count: channelCount)
         gateOpen = Array(repeating: false, count: channelCount)
-        audioQueue.sync { gate.enabled = false }
+        // Run the gate with the real settings (it used to be disabled here)
+        // so the Signal tab shows genuine gate behavior without any API
+        // cost. Bench meters/gate dots now reflect gating too.
+        audioQueue.sync {
+            applyGateTuningLocked()
+            gate.reset()
+        }
         installInputHandler()
         // Bench mode has no clients; processConversationBuffers still runs
         // and drives the meters, sends go nowhere.

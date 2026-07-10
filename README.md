@@ -71,6 +71,31 @@ channels to iPadOS (DJI certifies it for GarageBand on iOS; this app is the seco
 Keep the app in the foreground: Swift Playgrounds apps can't run background audio.
 The app disables the screen-idle timer while a conversation is running.
 
+## Signal tab — seeing and tuning the gate
+
+The **Signal** tab is a live workbench for the multi-mic pipeline. It works during
+a conversation *and* during a free bench test (no API cost), and analysis only
+runs while the tab is visible.
+
+- **Gate timeline** (per channel, last 20 s, dB scale): live level vs. the learned
+  noise floor vs. the effective open threshold. Green shading = the gate passed
+  audio to the translator; red triangles = suppressed as bleed. This answers
+  "why didn't my first word get translated" and "why is a silent mic opening
+  sessions" at a glance.
+- **Mini transcript**: the latest utterances inline, so gate behavior can be
+  matched to what actually got transcribed.
+- **Mic-pair correlation matrix**: how alike each voiced pair sounds right now;
+  a red border means the pair counted as one source and the quieter copy was muted.
+- **Per-channel cards**: scrolling spectrogram (60 Hz–12 kHz, log scale),
+  instantaneous spectrum, and a waveform envelope with clip detection.
+- **Gate tuning**: sliders for every gate parameter, applied to the running gate
+  within 200 ms — watch the threshold line move while someone talks.
+- **Freeze / export**: pause all plots and share the window as JSON
+  (gate timeline, stats, waveform envelopes, bleed events) for offline analysis.
+
+Note: the bench test now runs the gate with your real settings (it used to run
+ungated), so bench meters reflect actual gate behavior too.
+
 ## Troubleshooting
 
 - **No USB input listed** — unplug/replug the RX, then Diagnostics → *Select USB input*.

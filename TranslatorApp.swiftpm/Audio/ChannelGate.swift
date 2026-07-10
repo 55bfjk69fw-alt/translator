@@ -68,6 +68,11 @@ final class ChannelGate {
     // model chopped audio and directly degrades translation quality. The
     // cost is a longer bleed-exposure window after each utterance.
     var hangover: TimeInterval = 1.5
+    /// A channel voiced continuously for this long — not one sub-threshold
+    /// 200 ms buffer — is carrying steady noise (mic hiss with onboard NC
+    /// off, ventilation), not speech: speakers always pause to breathe.
+    /// Past the timeout the floor unfreezes so it can climb over the noise.
+    var sustainedVoiceTimeout: TimeInterval = 6
     var enabled = true
 
     /// Correlation runs on decimated copies near this rate: speech keeps
@@ -91,6 +96,9 @@ final class ChannelGate {
     private var vadHold: [Bool] = []
     private var noiseFloor: [Float] = []
     private var lastGenuine: [Int: Date] = [:]
+    /// When each channel's current unbroken run of voiced buffers began.
+    private var voicedSince: [Int: Date] = [:]
+    private var wasSustainedNoise: Set<Int> = []
     /// pairKey(i,j) -> channel currently winning that correlated pair.
     /// Rebuilt every buffer so entries vanish as soon as a pair stops being
     /// co-voiced or stops correlating (i.e. real double-talk resumes).
@@ -108,11 +116,18 @@ final class ChannelGate {
     }
 
     /// Evaluate all channels for one buffer interval. The pointers must stay
-    /// valid for the duration of the call.
-    func evaluate(channels: [UnsafePointer<Float>], frames: Int, sampleRate: Double) -> [Decision] {
+    /// valid for the duration of the call. `channelEnabled` hard-mutes
+    /// channels the user turned off in Settings: they are never voiced,
+    /// never pass, and never participate in bleed pairing (a muted channel
+    /// must not steal a correlated pair from a live one).
+    func evaluate(channels: [UnsafePointer<Float>], frames: Int, sampleRate: Double, channelEnabled: [Bool]? = nil) -> [Decision] {
         let now = Date()
         let count = channels.count
         ensureState(channelCount: count)
+        func isEnabled(_ i: Int) -> Bool {
+            guard let channelEnabled, i < channelEnabled.count else { return true }
+            return channelEnabled[i]
+        }
 
         let rms = channels.map { Self.rms(samples: $0, count: frames) }
 
@@ -124,15 +139,42 @@ final class ChannelGate {
         let useVAD = neuralVADEnabled && !vads.isEmpty
         var voicedNow = [Bool](repeating: false, count: count)
         for i in 0..<count {
-            if useVAD, let probability = vads[i].feed(channels[i], count: frames, sampleRate: sampleRate) {
+            if isEnabled(i), useVAD,
+               let probability = vads[i].feed(channels[i], count: frames, sampleRate: sampleRate) {
                 vadHold[i] = probability >= (vadHold[i] ? vadOffProbability : vadOnProbability)
                 voicedNow[i] = vadHold[i] && rms[i] >= minimumVoiceThreshold
             } else {
-                voicedNow[i] = rms[i] >= max(minimumVoiceThreshold, noiseFloor[i] * snrFactor)
+                // Disabled channels skip the VAD entirely (no wasted
+                // inference; the model recovers from the state gap within a
+                // frame or two of re-enabling).
+                if !isEnabled(i) { vadHold[i] = false }
+                voicedNow[i] = isEnabled(i) && rms[i] >= max(minimumVoiceThreshold, noiseFloor[i] * snrFactor)
             }
+
+            // Steady noise above the initial threshold would freeze the
+            // floor and keep the channel voiced forever; only an unbroken
+            // voiced run longer than any human breath group distinguishes
+            // it from speech, and past that the floor unfreezes below.
+            // (Protects the RMS fallback; with the VAD deciding voicing,
+            // steady noise never reads as voiced in the first place.)
+            var sustainedNoise = false
+            if voicedNow[i] {
+                let since = voicedSince[i] ?? now
+                voicedSince[i] = since
+                sustainedNoise = now.timeIntervalSince(since) > sustainedVoiceTimeout
+            } else {
+                voicedSince[i] = nil
+            }
+            if sustainedNoise && !wasSustainedNoise.contains(i) {
+                wasSustainedNoise.insert(i)
+                Log.info("Gate: ch\(i) voiced \(Int(sustainedVoiceTimeout))s without a pause — treating as steady noise, raising its floor")
+            } else if !voicedNow[i] {
+                wasSustainedNoise.remove(i)
+            }
+
             if rms[i] < noiseFloor[i] {
                 noiseFloor[i] += (rms[i] - noiseFloor[i]) * 0.5
-            } else if !voicedNow[i] {
+            } else if !voicedNow[i] || sustainedNoise {
                 noiseFloor[i] = min(rms[i], noiseFloor[i] * 1.05 + 1e-6)
             }
         }
@@ -176,7 +218,8 @@ final class ChannelGate {
             if genuine { lastGenuine[i] = now }
             let inHangover = lastGenuine[i].map { now.timeIntervalSince($0) <= hangover } ?? false
             let voiced = voicedNow[i] || inHangover
-            let pass = !enabled || (!bleed[i] && (genuine || inHangover))
+            // A user-disabled channel never passes, even with the gate off.
+            let pass = isEnabled(i) && (!enabled || (!bleed[i] && (genuine || inHangover)))
             decisions.append(Decision(rms: rms[i], voiced: voiced, pass: pass, bleed: bleed[i]))
 
             if bleed[i] && !wasBleed.contains(i) {
@@ -192,6 +235,8 @@ final class ChannelGate {
     func reset() {
         noiseFloor.removeAll()
         lastGenuine.removeAll()
+        voicedSince.removeAll()
+        wasSustainedNoise.removeAll()
         pairWinner.removeAll()
         wasBleed.removeAll()
         scratch.removeAll()
@@ -206,6 +251,8 @@ final class ChannelGate {
         noiseFloor = Array(repeating: minimumVoiceThreshold, count: channelCount)
         scratch = Array(repeating: [], count: channelCount)
         lastGenuine.removeAll()
+        voicedSince.removeAll()
+        wasSustainedNoise.removeAll()
         pairWinner.removeAll()
         wasBleed.removeAll()
         vadHold = Array(repeating: false, count: channelCount)

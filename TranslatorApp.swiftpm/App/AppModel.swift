@@ -146,6 +146,7 @@ final class AppModel: ObservableObject {
         // a disconnected/powered-off TX never opens a billed session.
         sessionStates = Dictionary(uniqueKeysWithValues: (0..<channelCount).map { ($0, RealtimeTranslationClient.State.idle) })
 
+        signalAnalyzer.startSession()
         installInputHandler()
         startUITimer()
         mode = .conversation
@@ -536,21 +537,33 @@ final class AppModel: ObservableObject {
 
     // MARK: - Gate tuning
 
-    /// Apply the persisted gate tunables to the live gate. Safe from any
-    /// thread at any time; takes effect on the next 200 ms buffer. Used by
-    /// the Signal tab's tuning sliders.
+    private var gateTuningApplyScheduled = false
+
+    /// Apply the persisted gate tunables to the live gate. Coalesced on a
+    /// 100 ms trailing edge: the tuning sliders fire onChange dozens of
+    /// times per second during a drag, and the audio queue must not be
+    /// flooded with redundant re-apply blocks. Main thread.
     func applyGateTuning() {
-        audioQueue.async { self.applyGateTuningLocked() }
+        guard !gateTuningApplyScheduled else { return }
+        gateTuningApplyScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            guard let self else { return }
+            self.gateTuningApplyScheduled = false
+            self.audioQueue.async { self.applyGateTuningLocked() }
+        }
     }
 
-    /// Must run on audioQueue (UserDefaults reads are thread-safe).
+    /// Must run on audioQueue (UserDefaults reads are thread-safe). Reads
+    /// through GateSettingsSnapshot so the gate, the Signal tab display,
+    /// and the export all share one roster of tunables.
     private func applyGateTuningLocked() {
-        gate.enabled = AppSettings.noiseGateEnabled
-        gate.minimumVoiceThreshold = AppSettings.vadThreshold
-        gate.snrFactor = AppSettings.snrFactor
-        gate.bleedCorrelation = AppSettings.bleedCorrelation
-        gate.takeoverMargin = AppSettings.takeoverMargin
-        gate.hangover = AppSettings.gateHangover
+        let tuning = GateSettingsSnapshot.current()
+        gate.enabled = tuning.enabled
+        gate.minimumVoiceThreshold = tuning.minimumVoiceThreshold
+        gate.snrFactor = tuning.snrFactor
+        gate.bleedCorrelation = tuning.bleedCorrelation
+        gate.takeoverMargin = tuning.takeoverMargin
+        gate.hangover = tuning.hangover
     }
 
     // MARK: - Diagnostics support
@@ -583,6 +596,7 @@ final class AppModel: ObservableObject {
             applyGateTuningLocked()
             gate.reset()
         }
+        signalAnalyzer.startSession()
         installInputHandler()
         // Bench mode has no clients; processConversationBuffers still runs
         // and drives the meters, sends go nowhere.

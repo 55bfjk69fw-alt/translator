@@ -61,6 +61,8 @@ final class SignalAnalyzer: ObservableObject {
     /// FFT-bin range feeding each log-spaced display bin (rebuilt on rate change).
     private var binRanges: [Range<Int>] = []
     private var binTableRate: Double = 0
+    /// Squared magnitudes of the useful FFT bins, reused every transform.
+    private var powerScratch = [Float](repeating: 0, count: SignalAnalyzer.fftSize / 2 + 1)
 
     private var channelCount = 0
     private var currentSampleRate: Double = 48_000
@@ -89,15 +91,24 @@ final class SignalAnalyzer: ObservableObject {
 
     // MARK: - API
 
-    /// Toggle from SignalView.onAppear/.onDisappear. Enabling resets history.
+    /// Toggle from SignalView.onAppear/.onDisappear. Purely gates whether
+    /// ingested buffers are analyzed — history, frozen state, and the last
+    /// snapshot all survive tab switches.
     func setEnabled(_ on: Bool) {
         stateLock.lock()
-        let wasEnabled = enabled
         enabled = on
         stateLock.unlock()
-        if on && !wasEnabled {
-            queue.async { self.resetState() }
-        }
+    }
+
+    /// Called from AppModel when a new engine session starts (conversation
+    /// or bench): clears history and any leftover freeze so the tab starts
+    /// live. Main thread.
+    func startSession() {
+        stateLock.lock()
+        frozen = false
+        stateLock.unlock()
+        isFrozen = false
+        queue.async { self.resetState() }
     }
 
     /// Freeze keeps the last snapshot on screen and drops incoming data.
@@ -240,9 +251,11 @@ final class SignalAnalyzer: ObservableObject {
         while offset + Self.fftSize <= frames {
             spectroHead = (spectroHead + 1) % Self.spectrogramColumns
             for channel in 0..<count {
-                guard let data = buffers[channel].floatChannelData else { continue }
-                let samples = UnsafePointer(data[0])
-                computeSpectrum(samples: samples + offset, fft: fft, into: &lastSpectrum[channel])
+                if let data = buffers[channel].floatChannelData {
+                    computeSpectrum(samples: UnsafePointer(data[0]) + offset, fft: fft, into: &lastSpectrum[channel])
+                }
+                // Written even when a channel had no samples, so every
+                // channel's ring advances in lockstep with the shared head.
                 writeSpectrogramColumn(channel: channel, column: spectroHead, spectrum: lastSpectrum[channel])
             }
             offset += Self.fftHop
@@ -252,22 +265,21 @@ final class SignalAnalyzer: ObservableObject {
     /// One Hann-windowed FFT of `fftSize` samples reduced to log-spaced dB
     /// bins. 0 dB ~= a full-scale sine; clamped to the display floor.
     private func computeSpectrum(samples: UnsafePointer<Float>, fft: vDSP.FFT<DSPSplitComplex>, into spectrum: inout [Float]) {
-        hannWindow.withUnsafeBufferPointer { window in
-            for k in 0..<Self.fftSize {
-                fftRealIn[k] = samples[k] * window[k]
-                fftImagIn[k] = 0
-            }
-        }
+        var realIn = UnsafeMutableBufferPointer(start: fftRealIn, count: Self.fftSize)
+        var imagIn = UnsafeMutableBufferPointer(start: fftImagIn, count: Self.fftSize)
+        vDSP.multiply(UnsafeBufferPointer(start: samples, count: Self.fftSize), hannWindow, result: &realIn)
+        vDSP.clear(&imagIn)
         let input = DSPSplitComplex(realp: fftRealIn, imagp: fftImagIn)
         var output = DSPSplitComplex(realp: fftRealOut, imagp: fftImagOut)
         fft.forward(input: input, output: &output)
+        vDSP.squareMagnitudes(output, result: &powerScratch)
 
         // Full-scale Hann-windowed sine peaks at |X| ~= N/4 per side.
         let fullScalePower = Float(Self.fftSize * Self.fftSize) / 16
         for (bin, range) in binRanges.enumerated() {
             var power: Float = 0
             for k in range {
-                power += fftRealOut[k] * fftRealOut[k] + fftImagOut[k] * fftImagOut[k]
+                power += powerScratch[k]
             }
             power /= Float(range.count)
             let db = 10 * log10(max(power / fullScalePower, 1e-12))
@@ -348,20 +360,24 @@ final class SignalAnalyzer: ObservableObject {
         let bins = Self.spectrogramBins
         let rowBytes = cols * 4
         guard spectroHead >= 0 else { return nil }
-        // Unroll the column ring so x=0 is the oldest column.
-        var unrolled = [UInt8](repeating: 0, count: spectroPixels[channel].count)
+        // Unroll the column ring so x=0 is the oldest column: two block
+        // copies per row, into a buffer handed to CGImage without recopying.
+        let byteCount = spectroPixels[channel].count
+        let unrolled = UnsafeMutableRawPointer.allocate(byteCount: byteCount, alignment: 4)
         let splitCol = (spectroHead + 1) % cols
         let tailBytes = (cols - splitCol) * 4
-        spectroPixels[channel].withUnsafeBufferPointer { src in
-            unrolled.withUnsafeMutableBufferPointer { dst in
-                for row in 0..<bins {
-                    let base = row * rowBytes
-                    for i in 0..<tailBytes { dst[base + i] = src[base + splitCol * 4 + i] }
-                    for i in 0..<(splitCol * 4) { dst[base + tailBytes + i] = src[base + i] }
+        spectroPixels[channel].withUnsafeBytes { src in
+            let base = src.baseAddress!
+            for row in 0..<bins {
+                let rowStart = row * rowBytes
+                memcpy(unrolled + rowStart, base + rowStart + splitCol * 4, tailBytes)
+                if splitCol > 0 {
+                    memcpy(unrolled + rowStart + tailBytes, base + rowStart, splitCol * 4)
                 }
             }
         }
-        guard let provider = CGDataProvider(data: Data(unrolled) as CFData) else { return nil }
+        let data = Data(bytesNoCopy: unrolled, count: byteCount, deallocator: .custom { pointer, _ in pointer.deallocate() })
+        guard let provider = CGDataProvider(data: data as CFData) else { return nil }
         return CGImage(
             width: cols,
             height: bins,

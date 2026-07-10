@@ -16,7 +16,9 @@ struct SignalView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    if model.mode == .idle {
+                    // A frozen window stays inspectable/exportable even
+                    // after the session that produced it has stopped.
+                    if model.mode == .idle && !(analyzer.isFrozen && analyzer.snapshot.channelCount > 0) {
                         idleCard
                     } else if analyzer.snapshot.channelCount == 0 {
                         waitingCard
@@ -385,11 +387,11 @@ private struct GateTuningPanel: View {
     @EnvironmentObject private var model: AppModel
 
     @AppStorage(AppSettings.noiseGateEnabledKey) private var gateEnabled = true
-    @AppStorage(AppSettings.vadThresholdKey) private var vadThreshold = 0.004
-    @AppStorage(AppSettings.snrFactorKey) private var snrFactor = 3.0
-    @AppStorage(AppSettings.bleedCorrelationKey) private var bleedCorrelation = 0.55
-    @AppStorage(AppSettings.takeoverMarginKey) private var takeoverMargin = 1.25
-    @AppStorage(AppSettings.gateHangoverKey) private var hangover = 1.5
+    @AppStorage(AppSettings.vadThresholdKey) private var vadThreshold = AppSettings.GateDefaults.vadThreshold
+    @AppStorage(AppSettings.snrFactorKey) private var snrFactor = AppSettings.GateDefaults.snrFactor
+    @AppStorage(AppSettings.bleedCorrelationKey) private var bleedCorrelation = AppSettings.GateDefaults.bleedCorrelation
+    @AppStorage(AppSettings.takeoverMarginKey) private var takeoverMargin = AppSettings.GateDefaults.takeoverMargin
+    @AppStorage(AppSettings.gateHangoverKey) private var hangover = AppSettings.GateDefaults.hangover
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {

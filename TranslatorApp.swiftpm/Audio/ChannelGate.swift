@@ -87,9 +87,10 @@ final class ChannelGate {
 
     struct ChannelTelemetry {
         var rms: Float
+        /// Floor and threshold as they stood when the voicing decision was
+        /// made (before this buffer's noise-floor update), so the pair is
+        /// always consistent: threshold == max(min, floor * snr).
         var noiseFloor: Float
-        /// The threshold the voicing decision was made against, before this
-        /// buffer's noise-floor update.
         var effectiveThreshold: Float
         var voiced: Bool
         var pass: Bool
@@ -127,9 +128,13 @@ final class ChannelGate {
         // climbs into ongoing speech.
         var voicedNow = [Bool](repeating: false, count: count)
         var thresholds = [Float](repeating: 0, count: count)
+        // Floors captured pre-update so telemetry shows the floor/threshold
+        // pair the decision was actually made against.
+        var floors = [Float](repeating: 0, count: count)
         for i in 0..<count {
             let threshold = max(minimumVoiceThreshold, noiseFloor[i] * snrFactor)
             thresholds[i] = threshold
+            floors[i] = noiseFloor[i]
             voicedNow[i] = rms[i] >= threshold
             if rms[i] < noiseFloor[i] {
                 noiseFloor[i] += (rms[i] - noiseFloor[i]) * 0.5
@@ -188,7 +193,7 @@ final class ChannelGate {
             decisions.append(Decision(rms: rms[i], voiced: voiced, pass: pass, bleed: bleed[i]))
             channelTelemetry.append(ChannelTelemetry(
                 rms: rms[i],
-                noiseFloor: noiseFloor[i],
+                noiseFloor: floors[i],
                 effectiveThreshold: thresholds[i],
                 voiced: voiced,
                 pass: pass,

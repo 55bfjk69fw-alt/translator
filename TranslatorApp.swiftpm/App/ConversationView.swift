@@ -91,7 +91,7 @@ struct ConversationView: View {
                 }
                 .padding()
             }
-            .onChange(of: model.transcript.utterances.count) { _ in
+            .onChange(of: model.transcript.utterances.count) {
                 if let last = model.transcript.utterances.last {
                     withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
                 }

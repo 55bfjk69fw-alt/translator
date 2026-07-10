@@ -175,8 +175,12 @@ final class RealtimeTranslationClient: NSObject {
         stopPing()
         if state == .open {
             sendJSON(["type": "session.close"])
+            // Identity-guarded so the timeout can only tear down the
+            // connection it was armed for, never a later one.
+            let draining = task
             queue.asyncAfter(deadline: .now() + 3) { [weak self] in
-                self?.forceClose()
+                guard let self, draining === self.task else { return }
+                self.forceClose()
             }
         } else {
             forceClose()
@@ -186,6 +190,7 @@ final class RealtimeTranslationClient: NSObject {
     /// Queue-confined. Reachable from the session.closed ack, the
     /// drain-timeout, and closeOnQueue; idempotent.
     private func forceClose() {
+        stopPing()
         task?.cancel(with: .normalClosure, reason: nil)
         task = nil
         urlSession?.invalidateAndCancel()

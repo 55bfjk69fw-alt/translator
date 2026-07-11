@@ -30,6 +30,15 @@ enum AssistPrompt {
         never played by a machine. Suggestions must therefore be natural spoken \
         \(language), sayable in one breath.
         """)
+        lines.append("""
+        The conversation lines are real-time speech-to-text from a noisy, \
+        multi-microphone table and WILL contain errors: wrong homophones or \
+        characters, merged or split utterances, missing words, mislabeled \
+        speakers, and occasional gibberish. Read through the noise for intent \
+        using the surrounding context. Never build a suggestion that hinges on \
+        a detail that could be a mis-transcription, and never quote garbled \
+        text back.
+        """)
         if !bio.isEmpty { lines.append("About \(name): \(bio)") }
         if !scene.isEmpty { lines.append("Scene right now: \(scene)") }
         lines.append("Language level (HARD CAP, never exceed it): \(level.promptRule).")
@@ -58,9 +67,10 @@ enum AssistPrompt {
         guard !window.isEmpty else { return "The conversation has not started yet." }
         let lines = window.map { line in
             let speaker = line.isUser ? "\(line.speaker) (the user, said aloud)" : line.speaker
+            let progress = line.isFinal ? "" : " [mid-speech, transcript still arriving]"
             let source = line.source.isEmpty ? "(no transcript)" : line.source
             let translation = line.translation.isEmpty ? "" : " — \(line.translation)"
-            return "[\(speaker)] \(source)\(translation)"
+            return "[\(speaker)]\(progress) \(source)\(translation)"
         }
         return "Recent conversation, oldest first:\n" + lines.joined(separator: "\n")
     }

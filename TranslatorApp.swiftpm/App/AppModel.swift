@@ -114,16 +114,31 @@ final class AppModel: ObservableObject {
         // Prompter wiring: the engine reads the transcript through these
         // closures and writes "I said this" turns back through them — it
         // never touches the audio pipeline (docs/REPLY-FLOW.md §3).
+        // Open (still-streaming) utterances with any text are included and
+        // marked in-progress — the sentence-boundary trigger fires while
+        // someone is mid-utterance, and the fresh sentence must be in the
+        // window for the early request to be worth anything.
         assist.transcriptWindow = { [weak self] in
             guard let self else { return [] }
-            return self.transcript.utterances.suffix(60).filter(\.isFinal).suffix(25).map { utterance in
-                AssistEngine.TranscriptLine(
-                    speaker: self.laneName(utterance.laneID),
-                    source: utterance.sourceText,
-                    translation: utterance.translatedText,
-                    isUser: utterance.laneID == SpeakerLane.userLaneID
-                )
-            }
+            return self.transcript.utterances.suffix(60)
+                .filter { $0.isFinal || !$0.sourceText.isEmpty || !$0.translatedText.isEmpty }
+                .suffix(25)
+                .map { utterance in
+                    AssistEngine.TranscriptLine(
+                        speaker: self.laneName(utterance.laneID),
+                        source: utterance.sourceText,
+                        translation: utterance.translatedText,
+                        isUser: utterance.laneID == SpeakerLane.userLaneID,
+                        isFinal: utterance.isFinal
+                    )
+                }
+        }
+        // Low-latency trigger: fire the moment a sentence lands in a
+        // streaming delta instead of waiting for finalization + the next
+        // 1 Hz tick. The engine's rate limit still bounds request volume.
+        transcript.onSentenceBoundary = { [weak self] in
+            guard let self, self.mode == .conversation else { return }
+            self.assist.transcriptTick(contentEvents: self.transcript.finalizedTotal + self.transcript.sentenceEventTotal)
         }
         assist.onUserSaid = { [weak self] suggestion in
             // The literal meaning, not the intent gloss — the transcript
@@ -185,7 +200,7 @@ final class AppModel: ObservableObject {
         installInputHandler()
         startUITimer()
         mode = .conversation
-        assist.conversationStarted(finalizedCount: transcript.finalizedTotal)
+        assist.conversationStarted(contentEvents: transcript.finalizedTotal + transcript.sentenceEventTotal)
         UIApplication.shared.isIdleTimerDisabled = true
         Log.info("Conversation started: \(channelCount) channel(s); sessions open on first speech")
     }
@@ -547,13 +562,14 @@ final class AppModel: ObservableObject {
             guard let self else { return }
             self.refreshCost()
             self.transcript.finalizeStale(timeout: 2.5)
-            // The prompter's ambient trigger keys off finalizations — tick
-            // it right after finalizeStale so a fresh utterance can fire a
-            // suggestion request the same second (docs/REPLY-FLOW.md §3).
-            // finalizedTotal is monotonic, so the trigger survives the
+            // The prompter's ambient trigger keys off finalizations (plus
+            // the immediate sentence-boundary callback) — tick right after
+            // finalizeStale so a fresh utterance can fire a suggestion
+            // request the same second (docs/REPLY-FLOW.md §3). Both
+            // counters are monotonic, so the trigger survives the
             // transcript's 400-utterance trim cap.
             if self.mode == .conversation {
-                self.assist.transcriptTick(finalizedCount: self.transcript.finalizedTotal)
+                self.assist.transcriptTick(contentEvents: self.transcript.finalizedTotal + self.transcript.sentenceEventTotal)
             }
             self.closeIdleSessions()
             self.watchdogEngineCheck()

@@ -142,10 +142,14 @@ Designed for the worst case the app exists for: several conversations
 running simultaneously across four lanes, where a global lull may never
 arrive.
 
-- **Ambient trigger — rate-limited immediate fire.** A finalization fires a
-  request *immediately* unless a request was made in the last 5 s; in that
-  case one fire is scheduled for the boundary (further finalizations fold
-  into it). Turn-taking conversation → chips land ~3–4 s after someone stops
+- **Ambient trigger — rate-limited immediate fire.** A finalization OR a
+  sentence boundary streaming in mid-utterance (。？！.?! landing in a
+  source/translation delta) fires a request *immediately* unless a request
+  was made in the last 5 s; in that case one fire is scheduled for the
+  boundary (further triggers fold into it). Sentence-boundary firing means
+  chips can land while the speaker is still mid-utterance — the window
+  includes open utterances marked "[mid-speech]", and the system prompt
+  warns the model that all lines are error-prone speech-to-text. Turn-taking conversation → chips land ~3–4 s after someone stops
   talking (the ~2.5 s the transcript itself needs to finalize, plus the model
   call — no artificial wait). Continuous multi-thread chatter → a steady
   ~5 s cadence by construction, no starvation possible. Quiet table → no

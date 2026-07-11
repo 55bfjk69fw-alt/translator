@@ -52,6 +52,23 @@ final class TranscriptStore: ObservableObject {
     /// the trigger for the rest of a long conversation.
     private(set) var finalizedTotal = 0
 
+    /// Monotonic count of sentence boundaries seen in STREAMING deltas —
+    /// the prompter's low-latency trigger: a completed sentence is worth
+    /// suggesting on ~3 s before its utterance finalizes.
+    private(set) var sentenceEventTotal = 0
+
+    /// Fired (main thread) the moment a sentence boundary lands, so the
+    /// prompter can react immediately instead of at the next 1 Hz tick.
+    var onSentenceBoundary: (() -> Void)?
+
+    private static let sentenceEnders: Set<Character> = ["。", "！", "？", "…", ".", "!", "?"]
+
+    private func noteSentenceBoundary(in text: String) {
+        guard text.contains(where: { Self.sentenceEnders.contains($0) }) else { return }
+        sentenceEventTotal += 1
+        onSentenceBoundary?()
+    }
+
     private let maxUtterances = 400
 
     /// Index of the open (partial) utterance per lane.
@@ -67,6 +84,7 @@ final class TranscriptStore: ObservableObject {
             $0.sourceText += text
             $0.lastSourceActivity = Date()
         }
+        noteSentenceBoundary(in: text)
     }
 
     func appendTranslationDelta(lane: Int, text: String) {
@@ -75,6 +93,7 @@ final class TranscriptStore: ObservableObject {
             $0.translatedText += text
             $0.lastTranslationActivity = Date()
         }
+        noteSentenceBoundary(in: text)
     }
 
     /// Record something the user actually said aloud (a cue card confirmed

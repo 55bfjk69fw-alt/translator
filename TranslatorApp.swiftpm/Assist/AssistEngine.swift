@@ -22,6 +22,9 @@ final class AssistEngine: ObservableObject {
         let source: String
         let translation: String
         let isUser: Bool
+        /// false = still streaming (included so sentence-boundary-triggered
+        /// requests can see the sentence that triggered them).
+        let isFinal: Bool
     }
 
     struct Suggestion: Identifiable, Equatable {
@@ -75,7 +78,9 @@ final class AssistEngine: ObservableObject {
     // MARK: - Loop state (main thread)
 
     private var conversationActive = false
-    private var lastFinalizedCount = 0
+    /// High-water mark over the transcript's monotonic content counters
+    /// (finalizations + streamed sentence boundaries).
+    private var lastContentEvents = 0
     private var lastRequestAt = Date.distantPast
     private var pendingAmbient = false
     /// Bumped by manual/scoped requests and conversation end — an ambient
@@ -104,9 +109,9 @@ final class AssistEngine: ObservableObject {
 
     // MARK: - Lifecycle (called by AppModel)
 
-    func conversationStarted(finalizedCount: Int) {
+    func conversationStarted(contentEvents: Int) {
         conversationActive = true
-        lastFinalizedCount = finalizedCount
+        lastContentEvents = contentEvents
         lastEngagedThread = nil
         suggestions = []
         pendingAmbient = false
@@ -126,15 +131,17 @@ final class AssistEngine: ObservableObject {
         status = .idle
     }
 
-    /// Called at 1 Hz right after finalizeStale. Fires the ambient loop
-    /// when new utterances have finalized.
-    func transcriptTick(finalizedCount: Int) {
+    /// Called at 1 Hz right after finalizeStale AND immediately on each
+    /// streamed sentence boundary. Fires the ambient loop when there is
+    /// new content since the last request; the rate limit inside
+    /// scheduleAmbient bounds how aggressive this can get.
+    func transcriptTick(contentEvents: Int) {
         guard conversationActive, AppSettings.prompterEnabled, AppSettings.autoSuggest else {
-            lastFinalizedCount = finalizedCount
+            lastContentEvents = contentEvents
             return
         }
-        guard finalizedCount > lastFinalizedCount else { return }
-        lastFinalizedCount = finalizedCount
+        guard contentEvents > lastContentEvents else { return }
+        lastContentEvents = contentEvents
         scheduleAmbient()
     }
 

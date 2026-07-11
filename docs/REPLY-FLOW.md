@@ -101,6 +101,7 @@ New **"About you (reply prompter)"** section:
 | Tone | picker | auto | casual / polite / auto (model reads the room) |
 | Suggestions in tray | picker | 10 | Caps UNPINNED chips only — pins never count. Each batch requests up to `min(limit, 8)` suggestions, so the ask scales with the limit |
 | Refresh rate limit | picker | 3 s | Minimum gap between ambient requests (0–8 s; 0 = one-in-flight is the only throttle). Applies live mid-conversation |
+| Priority processing | toggle | off | `service_tier: "priority"` — faster/more consistent TTFT at ~2× token price |
 | Auto-suggest | toggle | on | Off = tray fills only via "suggest now" / scoped requests |
 | Model | picker | `gpt-5-mini` | Populated from the account's `/v1/models` (chat-capable ids only), static fallback list offline; `reasoning_effort: low` is pinned for reasoning models |
 
@@ -238,6 +239,19 @@ Compose variant: same contract, input is the user's draft, output is exactly
 one suggestion. Explain variant: input is one utterance, output is
 `{explanation, key_phrases: [{hanzi, pinyin, meaning}]}` — rendered, never
 stored.
+
+### Latency levers (2026-07 research)
+
+Applied, in order of impact: reasoning effort pinned to the per-family
+FLOOR (`none` on gpt-5.1+, where the model behaves as non-reasoning;
+`minimal` on the gpt-5 family; `low` on o-series — `gpt-5-chat-*` reject
+the parameter); `verbosity: low` on the gpt-5 family to trim output
+tokens; optional `service_tier: "priority"` toggle. Free structural win
+already in place: the static system prompt (persona/rules/bio/scene)
+leads every request, so OpenAI's automatic prompt caching hits it —
+cached-prefix requests are faster and input-discounted. Next lever if
+ever needed: streaming with incremental JSON parsing so chips render as
+they generate.
 
 ### Cost & model
 

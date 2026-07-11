@@ -68,11 +68,23 @@ struct ChatCompletionClient {
             ]
         ]
         // Reasoning models default to slow multi-second thinking — this is
-        // a latency-sensitive JSON task, so pin low effort. The gpt-5-chat-*
-        // variants are non-reasoning and reject the parameter.
-        if (model.hasPrefix("gpt-5") && !model.contains("chat"))
-            || model.hasPrefix("o1") || model.hasPrefix("o3") || model.hasPrefix("o4") {
+        // a latency-sensitive JSON task, so pin the FLOOR effort per family:
+        // gpt-5.1+ accept "none" (behaves like a non-reasoning model), the
+        // original gpt-5 family accepts "minimal", o-series bottoms out at
+        // "low". The gpt-5-chat-* variants are non-reasoning and reject the
+        // parameter entirely. "verbosity: low" additionally trims output
+        // tokens on the gpt-5 family (codex/chat variants reject it, but
+        // those are filtered out of the model picker).
+        if model.hasPrefix("gpt-5"), !model.contains("chat") {
+            payload["reasoning_effort"] = model.hasPrefix("gpt-5.") ? "none" : "minimal"
+            payload["verbosity"] = "low"
+        } else if model.hasPrefix("o1") || model.hasPrefix("o3") || model.hasPrefix("o4") {
             payload["reasoning_effort"] = "low"
+        }
+        // Paid fast lane: ~2x token price for faster, more consistent
+        // time-to-first-token (docs/REPLY-FLOW.md cost note).
+        if AppSettings.priorityProcessing {
+            payload["service_tier"] = "priority"
         }
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
 

@@ -34,6 +34,7 @@ enum AppSettings {
     static let suggestionToneKey = "suggestionTone"
     static let suggestionLimitKey = "suggestionLimit"
     static let assistRateLimitKey = "assistRateLimit"
+    static let priorityProcessingKey = "assistPriorityProcessing"
     static let assistModelKey = "assistModel"
     static let assistEndpointKey = "assistEndpoint"
     static let sceneContextKey = "sceneContext"
@@ -354,6 +355,12 @@ enum AppSettings {
     static var assistMinRequestInterval: Double {
         if UserDefaults.standard.object(forKey: assistRateLimitKey) == nil { return 3 }
         return max(0, UserDefaults.standard.double(forKey: assistRateLimitKey))
+    }
+
+    /// OpenAI priority processing (service_tier "priority"): faster, more
+    /// consistent time-to-first-token at roughly double the token price.
+    static var priorityProcessing: Bool {
+        UserDefaults.standard.bool(forKey: priorityProcessingKey)
     }
 
     static let defaultAssistModel = "gpt-5-mini"

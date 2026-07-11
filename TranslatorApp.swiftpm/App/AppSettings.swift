@@ -33,6 +33,7 @@ enum AppSettings {
     static let mandarinLevelKey = "mandarinLevel"
     static let suggestionToneKey = "suggestionTone"
     static let suggestionLimitKey = "suggestionLimit"
+    static let assistRateLimitKey = "assistRateLimit"
     static let assistModelKey = "assistModel"
     static let assistEndpointKey = "assistEndpoint"
     static let sceneContextKey = "sceneContext"
@@ -344,6 +345,15 @@ enum AppSettings {
     /// utterance, not the whole table.
     static var scopedBatchSize: Int {
         max(3, min(suggestionLimit / 2, 5))
+    }
+
+    /// Minimum seconds between ambient suggestion requests. 0 is valid and
+    /// means fire on every trigger — volume is then bounded only by the
+    /// one-request-in-flight rule (a new request starts as soon as the
+    /// previous one returns).
+    static var assistMinRequestInterval: Double {
+        if UserDefaults.standard.object(forKey: assistRateLimitKey) == nil { return 3 }
+        return max(0, UserDefaults.standard.double(forKey: assistRateLimitKey))
     }
 
     static let defaultAssistModel = "gpt-5-mini"

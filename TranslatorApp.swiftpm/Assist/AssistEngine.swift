@@ -105,7 +105,9 @@ final class AssistEngine: ObservableObject {
     private var consumedChipIDs: Set<String> = []
     private var lastEngagedThread: String?
     private var chipCounter = 0
-    private let minRequestInterval: TimeInterval = 5
+    /// Read live so the Settings picker applies mid-conversation. 0 means
+    /// no pacing at all — one-in-flight is then the only throttle.
+    private var minRequestInterval: TimeInterval { AppSettings.assistMinRequestInterval }
 
     // MARK: - Lifecycle (called by AppModel)
 

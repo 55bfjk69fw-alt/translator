@@ -43,6 +43,7 @@ struct SettingsView: View {
     @AppStorage(AppSettings.mandarinLevelKey) private var mandarinLevelRaw = AppSettings.MandarinLevel.elementary.rawValue
     @AppStorage(AppSettings.suggestionToneKey) private var suggestionTone = "auto"
     @AppStorage(AppSettings.suggestionLimitKey) private var suggestionLimit = 10
+    @AppStorage(AppSettings.assistRateLimitKey) private var assistRateLimit = 3.0
     @AppStorage(AppSettings.assistModelKey) private var assistModel = ""
     @AppStorage(AppSettings.assistEndpointKey) private var assistEndpoint = ""
 
@@ -158,6 +159,14 @@ struct SettingsView: View {
                         Text("15").tag(15)
                         Text("20").tag(20)
                     }
+                    Picker("Refresh rate limit", selection: $assistRateLimit) {
+                        Text("Off (as fast as possible)").tag(0.0)
+                        Text("1 second").tag(1.0)
+                        Text("2 seconds").tag(2.0)
+                        Text("3 seconds").tag(3.0)
+                        Text("5 seconds").tag(5.0)
+                        Text("8 seconds").tag(8.0)
+                    }
                     TextField(
                         "About you — who you are, how you know the group, safe topics…",
                         text: $userBio,
@@ -177,7 +186,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Reply prompter")
                 } footer: {
-                    Text("The prompter watches the conversation and keeps things you could say ready as cue cards — Chinese plus pinyin you read aloud yourself; nothing is ever played by the iPad. Your level hard-caps suggestion length and vocabulary so every card is actually sayable. \"Suggestions in tray\" caps how many unpinned chips are kept (each refresh asks for more when the limit is higher); pinned chips never count against it. The bio and the transcript are sent to OpenAI with your existing key — include nothing you wouldn't say at the table. Set the per-meal scene from the chip on the Conversation tab.")
+                    Text("The prompter watches the conversation and keeps things you could say ready as cue cards — Chinese plus pinyin you read aloud yourself; nothing is ever played by the iPad. Your level hard-caps suggestion length and vocabulary so every card is actually sayable. \"Suggestions in tray\" caps how many unpinned chips are kept (each refresh asks for more when the limit is higher); pinned chips never count against it. \"Refresh rate limit\" is the minimum gap between suggestion requests — lower is fresher but costs more; Off fires a new request the moment the previous one returns. The bio and the transcript are sent to OpenAI with your existing key — include nothing you wouldn't say at the table. Set the per-meal scene from the chip on the Conversation tab.")
                 }
 
                 Section {

@@ -100,6 +100,7 @@ New **"About you (reply prompter)"** section:
 | Mandarin level | picker | elementary | beginner / elementary / intermediate / advanced — caps sentence length & vocabulary in the prompt |
 | Tone | picker | auto | casual / polite / auto (model reads the room) |
 | Suggestions in tray | picker | 10 | Caps UNPINNED chips only — pins never count. Each batch requests up to `min(limit, 8)` suggestions, so the ask scales with the limit |
+| Refresh rate limit | picker | 3 s | Minimum gap between ambient requests (0–8 s; 0 = one-in-flight is the only throttle). Applies live mid-conversation |
 | Auto-suggest | toggle | on | Off = tray fills only via "suggest now" / scoped requests |
 | Model | picker | `gpt-5-mini` | Populated from the account's `/v1/models` (chat-capable ids only), static fallback list offline; `reasoning_effort: low` is pinned for reasoning models |
 
@@ -145,8 +146,9 @@ arrive.
 - **Ambient trigger — rate-limited immediate fire.** A finalization OR a
   sentence boundary streaming in mid-utterance (。？！.?! landing in a
   source/translation delta) fires a request *immediately* unless a request
-  was made in the last 5 s; in that case one fire is scheduled for the
-  boundary (further triggers fold into it). Sentence-boundary firing means
+  was made within the rate limit (Settings, default 3 s, 0 = fire the
+  moment the previous request returns); otherwise one fire is scheduled
+  for the boundary (further triggers fold into it). Sentence-boundary firing means
   chips can land while the speaker is still mid-utterance — the window
   includes open utterances marked "[mid-speech]", and the system prompt
   warns the model that all lines are error-prone speech-to-text. Turn-taking conversation → chips land ~3–4 s after someone stops
@@ -239,10 +241,11 @@ stored.
 
 ### Cost & model
 
-~1.8k tokens in / ~300 out per call. Worst case (continuous multi-thread
-chatter pinning the loop to the 5 s rate limit) is ~720 calls/hour — under
-$1/hour at `gpt-5-mini` pricing, noise against the ~$10/hour realtime
-sessions; typical turn-taking conversation costs a fraction of that. Token usage per call is logged
+~1.5k tokens in / ~600 out per call. Worst case scales with the rate-limit
+setting: at the 3 s default, continuous chatter is ~1,200 calls/hour —
+roughly $2–3/hour at `gpt-5-mini` pricing; at 0 the request round-trip
+itself (~2–3 s) is the pace. Still small against the ~$10/hour realtime
+sessions, and typical turn-taking conversation costs a fraction of it. Token usage per call is logged
 to Diagnostics (no UI meter for now). The model field is a Settings
 escape-hatch, same philosophy as the realtime model/endpoint fields.
 

@@ -56,10 +56,10 @@ The PTT bar at the bottom is replaced by an **assist bar**:
 └────────────────────────────────────────────────────┘
 ```
 
-- **Suggestion tray**: horizontally scrolling chips, each a short English
-  gloss with a colored dot when it targets a specific thread ("→ Auntie").
-  Tray refreshes quietly as conversation moves; chips never reorder under a
-  finger (new batches replace the tray only when it isn't being touched).
+- **Suggestion tray**: chips in a wrapping flow (no horizontal scrolling —
+  every chip visible at a glance), each a short English gloss labeled with
+  the thread it targets ("→ Auntie"). Tray refreshes quietly as conversation
+  moves; carry-over keeps still-relevant chips in place across batches.
 - **Tap a chip → cue card** (sheet on iPhone, popover/inline expansion on
   iPad):
 

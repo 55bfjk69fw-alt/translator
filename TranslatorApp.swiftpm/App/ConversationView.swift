@@ -225,18 +225,19 @@ private struct AssistBarView: View {
                 }
             }
             if !assist.suggestions.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(assist.suggestions) { suggestion in
-                            SuggestionChip(
-                                suggestion: suggestion,
-                                onTap: { onOpenCard(suggestion) },
-                                onTogglePin: { assist.togglePin(suggestion.id) }
-                            )
-                        }
+                // Wrapping flow, not a horizontal scroller: every chip is
+                // visible at a glance — scanning beats scrolling at a
+                // chaotic table.
+                FlowLayout(spacing: 8) {
+                    ForEach(assist.suggestions) { suggestion in
+                        SuggestionChip(
+                            suggestion: suggestion,
+                            onTap: { onOpenCard(suggestion) },
+                            onTogglePin: { assist.togglePin(suggestion.id) }
+                        )
                     }
-                    .padding(.horizontal, 2)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
             HStack(spacing: 8) {
                 // Single-line on purpose: with axis .vertical the Return
@@ -321,6 +322,9 @@ private struct SuggestionChip: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
+            // Bound the chip so one long gloss can't blow past the row
+            // width in the flow layout; the full text lives on the card.
+            .frame(maxWidth: 280, alignment: .leading)
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
             .background(
@@ -334,6 +338,61 @@ private struct SuggestionChip: View {
                 Label(suggestion.pinned ? "Unpin" : "Pin", systemImage: suggestion.pinned ? "pin.slash" : "pin")
             }
         }
+    }
+}
+
+/// Minimal left-aligned wrapping layout (iOS 16 Layout protocol): chips
+/// flow onto new rows instead of scrolling off-screen.
+private struct FlowLayout: Layout {
+    var spacing: CGFloat = 8
+
+    private struct Row {
+        var indices: [Int] = []
+        var width: CGFloat = 0
+        var height: CGFloat = 0
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let rows = computeRows(maxWidth: proposal.width ?? .infinity, subviews: subviews)
+        let width = proposal.width ?? rows.map(\.width).max() ?? 0
+        let height = rows.reduce(0) { $0 + $1.height } + spacing * CGFloat(max(0, rows.count - 1))
+        return CGSize(width: width, height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let rows = computeRows(maxWidth: bounds.width, subviews: subviews)
+        var y = bounds.minY
+        for row in rows {
+            var x = bounds.minX
+            for index in row.indices {
+                let size = subviews[index].sizeThatFits(.unspecified)
+                subviews[index].place(at: CGPoint(x: x, y: y), proposal: .unspecified)
+                x += size.width + spacing
+            }
+            y += row.height + spacing
+        }
+    }
+
+    private func computeRows(maxWidth: CGFloat, subviews: Subviews) -> [Row] {
+        var rows: [Row] = []
+        var current = Row()
+        for (index, subview) in subviews.enumerated() {
+            let size = subview.sizeThatFits(.unspecified)
+            let widthIfAdded = current.indices.isEmpty ? size.width : current.width + spacing + size.width
+            if widthIfAdded > maxWidth, !current.indices.isEmpty {
+                rows.append(current)
+                current = Row()
+                current.width = size.width
+            } else {
+                current.width = widthIfAdded
+            }
+            current.indices.append(index)
+            current.height = max(current.height, size.height)
+        }
+        if !current.indices.isEmpty {
+            rows.append(current)
+        }
+        return rows
     }
 }
 

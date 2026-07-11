@@ -260,11 +260,16 @@ user turns come from — this phase bolts on without touching P1–P3 code.
 
 If the probe fails, P4 is simply dropped; nothing else changes.
 
-## 9. Open questions (owner input wanted)
+## 9. Resolved design decisions (owner, 2026-07-11)
 
-1. Should "I said this" also be offered directly on a chip (skip the cue
-   card) once a suggestion has been used a few times? Default: no — the card
-   is the pronunciation aid, skipping it invites misreads.
-2. Tray refresh cadence: replace-on-new-batch (default) vs. append-and-age.
-3. Does *Explain this* deserve a hanzi-by-hanzi gloss mode for vocabulary
-   mining, or is that scope creep for a dinner-table tool?
+1. **Chips never skip the cue card.** The card is the pronunciation aid;
+   recording "I said this" always goes through it, no shortcut even for
+   repeated phrases.
+2. **Tray refresh: replace-on-new-batch, with pinning.** Each new batch
+   replaces the tray (never while it's being touched); long-press a chip to
+   pin it — pinned chips survive batch replacement, sit leftmost, and are
+   unpinned by another long-press or by being said. Pins are the "save this
+   for the right lull in the conversation" mechanism.
+3. **Explain this = nuance + key phrases.** A short meaning/idiom
+   explanation plus 2–3 key phrases (hanzi, pinyin, meaning). No word-by-word
+   breakdown — this is a dinner-table tool, not a flashcard generator.

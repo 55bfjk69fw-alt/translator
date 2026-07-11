@@ -3,10 +3,11 @@ import AVFoundation
 
 /// Owns AVAudioSession configuration and routing.
 ///
-/// Core constraint (see docs/RESEARCH.md): iPadOS supports exactly ONE active
-/// audio input route. Conversation mode = USB (DJI RX) input + AirPods A2DP
-/// output; push-to-talk mode = AirPods mic input (which drops output quality
-/// to the HFP link unless iOS 26 high-quality recording engages).
+/// Core constraint (see docs/RESEARCH.md): iPadOS publicly supports exactly
+/// ONE active input route. The app only ever uses USB (DJI RX) input +
+/// AirPods A2DP output — the user's replies are spoken aloud from cue cards
+/// (docs/REPLY-FLOW.md), never captured. The AirPods mic is touched only by
+/// the Diagnostics dual-input probe.
 final class AudioSessionController {
 
     let session = AVAudioSession.sharedInstance()
@@ -30,23 +31,6 @@ final class AudioSessionController {
         maximizeInputChannels()
     }
 
-    /// AirPods (or headset) mic in. On iPadOS 26 with H2 AirPods the
-    /// high-quality recording link avoids the HFP quality collapse; HFP is
-    /// the automatic fallback.
-    func configureForPushToTalk() throws {
-        var options: AVAudioSession.CategoryOptions = [.allowBluetoothHFP, .allowBluetoothA2DP]
-        if #available(iOS 26.0, *) {
-            options.insert(.bluetoothHighQualityRecording)
-        }
-        try session.setCategory(.playAndRecord, mode: .default, options: options)
-        try session.setActive(true)
-        if let bt = bluetoothMicInput() {
-            try session.setPreferredInput(bt)
-        } else {
-            Log.warn("No Bluetooth mic found for push-to-talk; using \(session.currentRoute.inputs.first?.portName ?? "default input")")
-        }
-    }
-
     @discardableResult
     func selectUSBInput() -> Bool {
         guard let usb = session.availableInputs?.first(where: { $0.portType == .usbAudio }) else {
@@ -63,12 +47,6 @@ final class AudioSessionController {
         }
     }
 
-    private func bluetoothMicInput() -> AVAudioSessionPortDescription? {
-        let inputs = session.availableInputs ?? []
-        return inputs.first(where: { $0.portType == .bluetoothHFP })
-            ?? inputs.first(where: { $0.portName.localizedCaseInsensitiveContains("airpods") })
-    }
-
     /// Ask for up to 4 input channels (DJI Quadraphonic). The request is not
     /// a guarantee — read back `inputNumberOfChannels` to see what stuck.
     func maximizeInputChannels() {
@@ -80,14 +58,6 @@ final class AudioSessionController {
             Log.warn("setPreferredInputNumberOfChannels(\(wanted)) failed: \(error.localizedDescription)")
         }
         Log.info("Input channels: max=\(maxChannels) requested=\(wanted) actual=\(session.inputNumberOfChannels)")
-    }
-
-    func overrideToSpeaker(_ enabled: Bool) {
-        do {
-            try session.overrideOutputAudioPort(enabled ? .speaker : .none)
-        } catch {
-            Log.error("Speaker override failed: \(error.localizedDescription)")
-        }
     }
 
     func snapshot() -> RouteSnapshot {

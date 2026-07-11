@@ -5,7 +5,6 @@ import Foundation
 enum AppSettings {
     static let endpointTemplateKey = "endpointTemplate"
     static let modelNameKey = "modelName"
-    static let autoPlayChineseKey = "autoPlayChinese"
     static let noiseGateEnabledKey = "noiseGateEnabled"
     static let neuralVADEnabledKey = "neuralVADEnabled"
     static let micProfileKey = "micProfile"
@@ -20,8 +19,20 @@ enum AppSettings {
     static let showPinyinKey = "showPinyin"
     static let outputGainKey = "outputGain"
     static let outputLanguageKey = "outputLanguage"
-    static let pttOutputLanguageKey = "pttOutputLanguage"
+    static let replyLanguageKey = "replyLanguage"
+    /// Pre-reply-flow key for what is now `replyLanguage`; read as a
+    /// migration fallback only.
+    static let legacyPTTOutputLanguageKey = "pttOutputLanguage"
     static let noiseReductionKey = "noiseReduction"
+
+    // Reply co-pilot (docs/REPLY-FLOW.md)
+    static let copilotEnabledKey = "copilotEnabled"
+    static let autoSuggestKey = "copilotAutoSuggest"
+    static let userBioKey = "userBio"
+    static let mandarinLevelKey = "mandarinLevel"
+    static let suggestionToneKey = "suggestionTone"
+    static let assistModelKey = "assistModel"
+    static let sceneContextKey = "sceneContext"
 
     static func speakerNameKey(_ channel: Int) -> String { "speakerName\(channel)" }
     static func speakerEnabledKey(_ channel: Int) -> String { "speakerEnabled\(channel)" }
@@ -34,10 +45,6 @@ enum AppSettings {
     static var modelName: String {
         let value = UserDefaults.standard.string(forKey: modelNameKey) ?? ""
         return value.isEmpty ? "gpt-realtime-translate" : value
-    }
-
-    static var autoPlayChinese: Bool {
-        UserDefaults.standard.bool(forKey: autoPlayChineseKey)
     }
 
     static var noiseGateEnabled: Bool {
@@ -236,11 +243,75 @@ enum AppSettings {
         return value.isEmpty ? "en" : value
     }
 
-    /// Target language for the push-to-talk return channel (what the user's
-    /// speech is translated into).
-    static var pttOutputLanguage: String {
-        let value = UserDefaults.standard.string(forKey: pttOutputLanguageKey) ?? ""
-        return value.isEmpty ? "zh" : value
+    /// Target language for the user's replies (what cue cards are written
+    /// in). Falls back to the pre-reply-flow push-to-talk key so an existing
+    /// install keeps its choice.
+    static var replyLanguage: String {
+        let value = UserDefaults.standard.string(forKey: replyLanguageKey) ?? ""
+        if !value.isEmpty { return value }
+        let legacy = UserDefaults.standard.string(forKey: legacyPTTOutputLanguageKey) ?? ""
+        return legacy.isEmpty ? "zh" : legacy
+    }
+
+    // MARK: - Reply co-pilot
+
+    /// The user's self-assessed level, which HARD-CAPS suggestion length and
+    /// vocabulary in the prompt — a suggestion the user can't pronounce
+    /// under table pressure is worse than none (docs/REPLY-FLOW.md §3).
+    enum MandarinLevel: String, CaseIterable, Identifiable {
+        case beginner, elementary, intermediate, advanced
+        var id: String { rawValue }
+        var displayName: String { rawValue.capitalized }
+        /// Prompt fragment describing the cap for this level.
+        var promptRule: String {
+            switch self {
+            case .beginner:
+                return "at most 8 characters per suggestion, only very common (HSK 1-2) vocabulary"
+            case .elementary:
+                return "at most 14 characters per suggestion, common everyday (HSK 1-3) vocabulary"
+            case .intermediate:
+                return "at most 20 characters per suggestion, everyday vocabulary (HSK 1-4)"
+            case .advanced:
+                return "natural sentences of any length"
+            }
+        }
+    }
+
+    static var copilotEnabled: Bool {
+        UserDefaults.standard.object(forKey: copilotEnabledKey) == nil
+            ? true
+            : UserDefaults.standard.bool(forKey: copilotEnabledKey)
+    }
+
+    static var autoSuggest: Bool {
+        UserDefaults.standard.object(forKey: autoSuggestKey) == nil
+            ? true
+            : UserDefaults.standard.bool(forKey: autoSuggestKey)
+    }
+
+    static var userBio: String {
+        UserDefaults.standard.string(forKey: userBioKey) ?? ""
+    }
+
+    static var mandarinLevel: MandarinLevel {
+        MandarinLevel(rawValue: UserDefaults.standard.string(forKey: mandarinLevelKey) ?? "") ?? .elementary
+    }
+
+    /// "auto" lets the model read the room; "casual"/"polite" force it.
+    static var suggestionTone: String {
+        let value = UserDefaults.standard.string(forKey: suggestionToneKey) ?? ""
+        return value.isEmpty ? "auto" : value
+    }
+
+    static var assistModel: String {
+        let value = UserDefaults.standard.string(forKey: assistModelKey) ?? ""
+        return value.isEmpty ? "gpt-4o-mini" : value
+    }
+
+    /// Per-meal context line, edited from the Conversation tab scene chip.
+    static var sceneContext: String {
+        get { UserDefaults.standard.string(forKey: sceneContextKey) ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: sceneContextKey) }
     }
 
     /// Server-side noise reduction type ("near_field"/"far_field"/"off") as

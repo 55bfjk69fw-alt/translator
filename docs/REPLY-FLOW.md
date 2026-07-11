@@ -1,5 +1,9 @@
 # Reply flow — push-to-talk teardown + reply co-pilot
 
+> **Status (2026-07-11):** P1–P3 implemented (`Assist/`, ConversationView
+> assist bar, Settings § Reply co-pilot, PTT removed). P4 awaits the
+> dual-input probe verdict.
+
 Design for replacing the push-to-talk return channel with a silent,
 suggestion-driven reply flow. The user hears the table in English through
 AirPods (unchanged), and **speaks all replies aloud in Mandarin themselves**,

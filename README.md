@@ -4,9 +4,11 @@ An iPad app that live-translates a multi-person Mandarin conversation to English
 Up to four speakers each wear a DJI Mic 3 transmitter; the DJI receiver plugs into
 the iPad over USB-C; each speaker's channel is streamed to its own OpenAI
 `gpt-realtime-translate` session; translated English audio plays into your AirPods,
-and a per-speaker Chinese + English transcript scrolls on screen. Hold the
-push-to-talk button to answer in English through your AirPods mic — your words are
-translated to Chinese, shown on screen, and playable over the iPad speaker.
+and a per-speaker Chinese + English transcript scrolls on screen. To reply, the
+**reply co-pilot** watches the conversation and keeps 2–3 things you could say
+ready as cue cards — Chinese with tone-marked pinyin that *you read aloud
+yourself* (nothing is ever played by the iPad) — and a composer turns anything
+you type into the same kind of card. See `docs/REPLY-FLOW.md` for the design.
 
 Developed and run entirely on the iPad with **Swift Playgrounds 4.7+** — no Mac needed.
 See `docs/RESEARCH.md` for the feasibility research behind every design decision.
@@ -21,8 +23,8 @@ See `docs/RESEARCH.md` for the feasibility research behind every design decision
    venues) from the RX touchscreen or the DJI Mimo app.
 3. Plug the RX into the iPad's USB-C port (use the DJI phone adapter or a USB-C cable).
 4. Connect your **AirPods** (Pro 2 / Pro 3 / 4 recommended). They are the *output*;
-   the DJI RX is the *input*. iPadOS only allows one active input, which is why the
-   AirPods mic is push-to-talk only.
+   the DJI RX is the *input*. iPadOS publicly allows one active input, so the
+   AirPods mic is never used (except by the Diagnostics dual-input probe).
 
 ## Getting the app onto your iPad
 
@@ -92,11 +94,18 @@ translating the table.
 3. Mandarin speech on any TX appears as a Chinese transcript with its English
    translation underneath, and the interpreted English audio plays in your AirPods
    (~0.5–1.5 s behind the speaker).
-4. **Hold the purple button** to speak English: input switches to your AirPods mic,
-   your words appear translated to Chinese, with a play button to speak them over
-   the iPad speaker (or enable auto-play in Settings).
+4. **Replying**: the suggestion tray above the composer fills with 2–3 things you
+   could say (each labeled with who it responds to). Tap a chip for its **cue
+   card** — big hanzi + pinyin + what it means — read it aloud, then tap
+   **"I said this"** to record it into the transcript. Type anything into the
+   composer for a custom card. Long-press any bubble to get replies scoped to
+   that exchange (**Reply to this**) or a nuance breakdown (**Explain this**).
+   Long-press a chip to **pin** it for the right lull. Set the per-meal scene
+   line (who/where/what) from the chip above the tray, and your bio + Mandarin
+   level in Settings → Reply co-pilot — both feed the suggestions.
 5. The status bar shows per-speaker levels, gate state, session health, and a
-   running cost estimate (5 sessions ≈ $10/hour ceiling at $0.034/session-minute).
+   running cost estimate (4 sessions ≈ $8/hour ceiling at $0.034/session-minute;
+   the co-pilot's text calls add pennies).
 
 Keep the app in the foreground: Swift Playgrounds apps can't run background audio.
 The app disables the screen-idle timer while a conversation is running.
@@ -184,7 +193,7 @@ profile.
   If it persists, the stereo fallback is the design (see research doc).
 - **Robotic/low-quality AirPods audio** — something switched the connection to the
   HFP profile. Stop, disconnect/reconnect AirPods, Start again. The app never
-  requests the AirPods mic outside push-to-talk precisely to avoid this.
+  requests the AirPods mic (outside the Diagnostics probe) precisely to avoid this.
 - **Sessions won't open** — check the API key, then the Diagnostics event log.
   If the server rejects `session.update` or event names changed, the payload lives in
   `Realtime/SessionConfig.swift` and the event aliases in
@@ -230,5 +239,7 @@ profile.
 - [ ] M6: TestFlight self-install (Apple Developer Program, upload from Playgrounds)
   for a home-screen app; CI (GitHub Actions + fastlane) only if background audio is
   ever required.
-- [ ] Evaluate iOS 26 `bluetoothHighQualityRecording` quality during push-to-talk.
+- [ ] AirPods personal capture lane (transcribe the user's own speech hands-free)
+  if the dual-input probe proves AirPods mic + USB can run together
+  (docs/REPLY-FLOW.md §8).
 - [ ] Head-to-head: Gemini Live translate / Azure Live Interpreter fallbacks.

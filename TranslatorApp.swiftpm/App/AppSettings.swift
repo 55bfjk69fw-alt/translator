@@ -22,6 +22,7 @@ enum AppSettings {
     static let outputLanguageKey = "outputLanguage"
     static let pttOutputLanguageKey = "pttOutputLanguage"
     static let noiseReductionKey = "noiseReduction"
+    static let keepScreenAwakeKey = "keepScreenAwake"
 
     static func speakerNameKey(_ channel: Int) -> String { "speakerName\(channel)" }
     static func speakerEnabledKey(_ channel: Int) -> String { "speakerEnabled\(channel)" }
@@ -218,6 +219,15 @@ enum AppSettings {
     static var idleCloseSeconds: Double {
         if UserDefaults.standard.object(forKey: idleCloseSecondsKey) == nil { return 120 }
         return UserDefaults.standard.double(forKey: idleCloseSecondsKey)
+    }
+
+    /// Keep the iPad screen awake while the app is open (default on): a
+    /// live conversation goes untouched for minutes at a time, and iPadOS
+    /// sleeping the screen would suspend the app and drop every session.
+    static var keepScreenAwake: Bool {
+        UserDefaults.standard.object(forKey: keepScreenAwakeKey) == nil
+            ? true
+            : UserDefaults.standard.bool(forKey: keepScreenAwakeKey)
     }
 
     /// Whether a DJI channel participates at all (default on). Disabled

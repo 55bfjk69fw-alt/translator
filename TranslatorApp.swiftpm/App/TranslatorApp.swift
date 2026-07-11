@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 @main
 struct TranslatorApp: App {
@@ -9,6 +10,9 @@ struct TranslatorApp: App {
             ContentView()
                 .environmentObject(model)
                 .environmentObject(model.signalAnalyzer)
+                .onAppear {
+                    UIApplication.shared.isIdleTimerDisabled = AppSettings.keepScreenAwake
+                }
         }
     }
 }

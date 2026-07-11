@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
@@ -26,6 +27,7 @@ struct SettingsView: View {
     @AppStorage(AppSettings.outputGainKey) private var outputGain = 1.0
     @AppStorage(AppSettings.outputLanguageKey) private var outputLanguage = "en"
     @AppStorage(AppSettings.pttOutputLanguageKey) private var pttOutputLanguage = "zh"
+    @AppStorage(AppSettings.keepScreenAwakeKey) private var keepScreenAwake = true
 
     private var micProfile: AppSettings.MicProfile {
         AppSettings.MicProfile(rawValue: micProfileRaw) ?? .worn
@@ -123,6 +125,17 @@ struct SettingsView: View {
                     Text("Push to talk")
                 } footer: {
                     Text("Off: your translated speech appears as text with a play button. On: it plays over the iPad speaker as soon as it arrives.")
+                }
+
+                Section {
+                    Toggle("Keep screen awake", isOn: $keepScreenAwake)
+                        .onChange(of: keepScreenAwake) { _, newValue in
+                            UIApplication.shared.isIdleTimerDisabled = newValue
+                        }
+                } header: {
+                    Text("Display")
+                } footer: {
+                    Text("Prevents the iPad from auto-locking while the app is open, so a running conversation is never cut off by the screen going to sleep. Turn off to let the normal auto-lock timer apply (saves battery when you're not translating).")
                 }
 
                 Section {

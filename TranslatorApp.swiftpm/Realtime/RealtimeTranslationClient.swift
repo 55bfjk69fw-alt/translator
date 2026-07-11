@@ -123,6 +123,24 @@ final class RealtimeTranslationClient: NSObject {
     /// so progress is reported as monotonic increments.
     private var reportedBilledSeconds: Double = 0
 
+    /// First-response clock (queue-confined): armed by the first chunk the
+    /// gate marked as speech that arrives while the server is quiet, cleared
+    /// by the first content event back. The interval is the listener's
+    /// time-to-first-response — for a lazily-opened session it includes the
+    /// connect and the pre-open queue flush, which is exactly the delay the
+    /// user feels.
+    private var awaitingResponseSince: Date?
+    /// When the server last produced content on any stream (heartbeats
+    /// excluded) — a speech chunk only arms a fresh measurement once the
+    /// server has been quiet, so mid-stream chunks don't count as "waits".
+    private var lastContentEventAt: Date?
+    /// Regenerated on every connect. Snapshot consumers diff the cumulative
+    /// traffic counters between samples; comparing this identity is how they
+    /// detect a counter reset — a value dip can't be trusted for that, since
+    /// a reconnect's pre-open queue flush can outrun the old total within
+    /// one sampling tick.
+    private var connectionID = UUID()
+
     // Audio arriving while the socket is still connecting is queued and
     // flushed on open, so lazily-opened sessions don't drop the words that
     // triggered them. Bounded to ~30 s of 24 kHz PCM16.
@@ -155,6 +173,11 @@ final class RealtimeTranslationClient: NSObject {
     /// max(server elapsed_ms, input audio appended), so it keeps counting
     /// through the post-close drain and the pre-open queue flush.
     var onBilledSeconds: ((Double) -> Void)?
+    /// WebSocket connect duration (connect() → 101 upgrade), once per open.
+    var onConnectSeconds: ((Double) -> Void)?
+    /// Speech-to-first-response latency, once per utterance burst (see
+    /// awaitingResponseSince).
+    var onFirstResponseSeconds: ((Double) -> Void)?
 
     // MARK: - Live snapshot (any thread)
 
@@ -162,6 +185,10 @@ final class RealtimeTranslationClient: NSObject {
     /// gate → session → transcript chain is breaking for this lane.
     struct Snapshot {
         var state: State
+        /// Changes on every reconnect; counters below restart at zero with
+        /// it. Consumers diffing counters across snapshots must treat a new
+        /// ID as a fresh baseline.
+        var connectionID: UUID
         /// Seconds since the socket reached .open (nil while not open).
         var openForSeconds: TimeInterval?
         /// Total audio streamed vs. the part that carried actual signal.
@@ -190,6 +217,7 @@ final class RealtimeTranslationClient: NSObject {
             let now = Date()
             return Snapshot(
                 state: state,
+                connectionID: connectionID,
                 openForSeconds: state == .open ? openedAt.map { now.timeIntervalSince($0) } : nil,
                 audioSecondsSent: Double(stats.audioBytesSent) / Self.billedBytesPerSecond,
                 speechSecondsSent: Double(stats.speechBytesSent) / Self.billedBytesPerSecond,
@@ -242,8 +270,14 @@ final class RealtimeTranslationClient: NSObject {
     /// Translation sessions accept exactly: session.update,
     /// session.input_audio_buffer.append, session.close — note the
     /// "session." prefix on all client events.
-    func sendAudio(_ pcm16: Data) {
-        queue.async { self.sendAudioOnQueue(pcm16) }
+    ///
+    /// `containsSpeech` is the gate's voicing verdict for this chunk; it
+    /// drives the first-response clock. Keyed on the gate (not a silence
+    /// scan here) so that with the gate disabled — where every noisy room
+    /// buffer flows through — ambient noise can't arm bogus latency
+    /// measurements.
+    func sendAudio(_ pcm16: Data, containsSpeech: Bool = false) {
+        queue.async { self.sendAudioOnQueue(pcm16, containsSpeech: containsSpeech) }
     }
 
     // MARK: - Lifecycle (queue-confined)
@@ -257,6 +291,7 @@ final class RealtimeTranslationClient: NSObject {
         intentionallyClosed = false
         seenEventTypes.removeAll()
         stats = Stats()
+        connectionID = UUID()
         // Each connection is a fresh billed session server-side: elapsed_ms
         // restarts at zero, so the billed-progress baseline must too.
         maxElapsedMs = 0
@@ -269,6 +304,13 @@ final class RealtimeTranslationClient: NSObject {
         lastSourceDeltaAt = nil
         lastTranslationDeltaAt = nil
         lastAudioFrameAt = nil
+        // pendingAudio survives a reconnect and flushes on open, so a wait
+        // armed by still-queued speech keeps its clock (the reconnect delay
+        // IS part of what the listener waits through). A wait with nothing
+        // queued was armed by audio that died with the old socket — clearing
+        // it stops the measurement from including a whole outage.
+        if pendingAudio.isEmpty { awaitingResponseSince = nil }
+        lastContentEventAt = nil
         warnedNothingReturned = false
         warnedNoSourceText = false
         warnedNoTranslatedAudio = false
@@ -331,9 +373,12 @@ final class RealtimeTranslationClient: NSObject {
 
     // MARK: - Sending (queue-confined)
 
-    private func sendAudioOnQueue(_ pcm16: Data) {
+    private func sendAudioOnQueue(_ pcm16: Data, containsSpeech: Bool) {
         // Appending after session.close is a protocol violation.
         guard !intentionallyClosed else { return }
+        // Armed here (not in sendAppendEvent) so audio queued while the
+        // socket connects starts the clock at speech time, not flush time.
+        if containsSpeech { armResponseClock() }
         if state == .open {
             sendAppendEvent(pcm16)
         } else {
@@ -374,6 +419,34 @@ final class RealtimeTranslationClient: NSObject {
         let delta = billed - reportedBilledSeconds
         reportedBilledSeconds = billed
         onBilledSeconds?(delta)
+    }
+
+    /// Queue-confined. Start the first-response clock if this speech chunk
+    /// begins a fresh request cycle (server quiet, no wait already pending).
+    private func armResponseClock() {
+        let now = Date()
+        if let armed = awaitingResponseSince {
+            // A burst the server never answered: re-arm rather than letting
+            // one lost response poison every later measurement.
+            if now.timeIntervalSince(armed) > 30 { awaitingResponseSince = now }
+            return
+        }
+        // While the server is actively streaming a response, further speech
+        // chunks are continuation, not a new wait.
+        if let last = lastContentEventAt, now.timeIntervalSince(last) < 1.5 { return }
+        awaitingResponseSince = now
+    }
+
+    /// Queue-confined. Called for every content event (heartbeats excluded):
+    /// resolves a pending first-response measurement and marks the server as
+    /// actively streaming.
+    private func noteContentEvent() {
+        let now = Date()
+        if let armed = awaitingResponseSince {
+            awaitingResponseSince = nil
+            onFirstResponseSeconds?(now.timeIntervalSince(armed))
+        }
+        lastContentEventAt = now
     }
 
     static func isPureSilence(_ pcm16: Data) -> Bool {
@@ -490,6 +563,7 @@ final class RealtimeTranslationClient: NSObject {
                     stats.audioFrames += 1
                     stats.audioBytes += audio.count
                     lastAudioFrameAt = Date()
+                    noteContentEvent()
                     onTranslatedAudio?(audio)
                 }
             }
@@ -498,6 +572,7 @@ final class RealtimeTranslationClient: NSObject {
                 stats.sourceDeltas += 1
                 stats.sourceChars += delta.count
                 lastSourceDeltaAt = Date()
+                noteContentEvent()
                 onSourceTranscriptDelta?(delta)
             }
         case "session.output_transcript.delta":
@@ -505,6 +580,7 @@ final class RealtimeTranslationClient: NSObject {
                 stats.translationDeltas += 1
                 stats.translationChars += delta.count
                 lastTranslationDeltaAt = Date()
+                noteContentEvent()
                 onTranslatedTranscriptDelta?(delta)
             }
         case "session.created", "session.updated":
@@ -653,7 +729,9 @@ extension RealtimeTranslationClient: URLSessionWebSocketDelegate {
                     webSocketTask: URLSessionWebSocketTask,
                     didOpenWithProtocol protocol: String?) {
         guard webSocketTask === task else { return }
-        let latency = connectStartedAt.map { String(format: " (%.1fs)", Date().timeIntervalSince($0)) } ?? ""
+        let connectSeconds = connectStartedAt.map { Date().timeIntervalSince($0) }
+        if let connectSeconds { onConnectSeconds?(connectSeconds) }
+        let latency = connectSeconds.map { String(format: " (%.1fs)", $0) } ?? ""
         Log.info("[\(label)] WS open\(latency)")
         lastServerEventAt = Date()
         openedAt = Date()

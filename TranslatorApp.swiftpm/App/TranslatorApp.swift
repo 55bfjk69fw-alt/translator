@@ -10,6 +10,7 @@ struct TranslatorApp: App {
             ContentView()
                 .environmentObject(model)
                 .environmentObject(model.signalAnalyzer)
+                .environmentObject(model.metrics)
                 .onAppear {
                     UIApplication.shared.isIdleTimerDisabled = AppSettings.keepScreenAwake
                 }

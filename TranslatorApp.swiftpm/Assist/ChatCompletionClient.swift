@@ -10,6 +10,11 @@ struct ChatCompletionClient {
     struct Usage {
         let promptTokens: Int
         let completionTokens: Int
+        /// Hidden reasoning ("thinking") tokens — a subset of
+        /// completionTokens, billed at the output rate but never visible in
+        /// the reply. 0 for non-reasoning models or API shapes without the
+        /// completion_tokens_details block.
+        let reasoningTokens: Int
     }
 
     struct Response {
@@ -99,9 +104,11 @@ struct ChatCompletionClient {
         }
         var usage: Usage?
         if let raw = root["usage"] as? [String: Any] {
+            let details = raw["completion_tokens_details"] as? [String: Any]
             usage = Usage(
                 promptTokens: raw["prompt_tokens"] as? Int ?? 0,
-                completionTokens: raw["completion_tokens"] as? Int ?? 0
+                completionTokens: raw["completion_tokens"] as? Int ?? 0,
+                reasoningTokens: details?["reasoning_tokens"] as? Int ?? 0
             )
         }
         return Response(content: object, usage: usage)

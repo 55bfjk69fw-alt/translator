@@ -425,7 +425,8 @@ final class AssistEngine: ObservableObject {
 
     private func logUsage(_ usage: ChatCompletionClient.Usage?) {
         guard let usage else { return }
-        Log.info("[assist] \(AppSettings.assistModel): \(usage.promptTokens) prompt + \(usage.completionTokens) completion tokens")
+        let reasoning = usage.reasoningTokens > 0 ? " (\(usage.reasoningTokens) reasoning)" : ""
+        Log.info("[assist] \(AppSettings.assistModel): \(usage.promptTokens) prompt + \(usage.completionTokens) completion tokens\(reasoning)")
     }
 
     /// ChatCompletionClient.complete with Metrics-tab timing wrapped around
@@ -467,6 +468,7 @@ final class AssistEngine: ObservableObject {
             seconds: Date().timeIntervalSince(startedAt),
             promptTokens: usage?.promptTokens ?? 0,
             completionTokens: usage?.completionTokens ?? 0,
+            reasoningTokens: usage?.reasoningTokens ?? 0,
             model: model,
             estimatedCost: usage.flatMap {
                 AssistPricing.estimatedDollars(model: model, promptTokens: $0.promptTokens, completionTokens: $0.completionTokens)

@@ -61,6 +61,11 @@ struct AssistRequestSample: Identifiable {
     /// prompter.
     let promptTokens: Int
     let completionTokens: Int
+    /// Hidden thinking tokens (subset of completionTokens) — how much the
+    /// model reasoned before writing. The closest observable proxy for
+    /// reasoning time without a streaming client; 0 for non-reasoning
+    /// models.
+    let reasoningTokens: Int
     let model: String
     /// nil when the model has no AssistPricing entry (or the request failed
     /// before usage was reported).

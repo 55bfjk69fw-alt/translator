@@ -372,7 +372,7 @@ struct MetricsView: View {
 
     private func prompterCard(_ assistRequests: [AssistRequestSample]) -> some View {
         card("Prompter") {
-            Text("Tokens per request — the prompt segment is the request's whole context (system + transcript window), so its trend is the context size.")
+            Text("Tokens per request — the prompt segment is the request's whole context (system + transcript window), so its trend is the context size. The gray segment is hidden reasoning: thinking tokens billed as output but never shown, the best proxy for reasoning effort per request.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
             chartOrPlaceholder(assistRequests, "No prompter requests yet — they fire as the conversation produces utterances (or from the compose bar).") {
@@ -385,12 +385,22 @@ struct MetricsView: View {
                     .foregroundStyle(by: .value("Part", "Context (prompt)"))
                     BarMark(
                         x: .value("Time", request.date),
-                        y: .value("Tokens", request.completionTokens),
+                        y: .value("Tokens", request.reasoningTokens),
                         width: .fixed(7)
                     )
-                    .foregroundStyle(by: .value("Part", "Completion"))
+                    .foregroundStyle(by: .value("Part", "Reasoning (hidden)"))
+                    BarMark(
+                        x: .value("Time", request.date),
+                        y: .value("Tokens", max(0, request.completionTokens - request.reasoningTokens)),
+                        width: .fixed(7)
+                    )
+                    .foregroundStyle(by: .value("Part", "Reply output"))
                 }
-                .chartForegroundStyleScale(["Context (prompt)": Color.teal, "Completion": Color.indigo])
+                .chartForegroundStyleScale([
+                    "Context (prompt)": Color.teal,
+                    "Reasoning (hidden)": Color.gray,
+                    "Reply output": Color.indigo
+                ])
                 .frame(height: 150)
             }
             if !assistRequests.isEmpty {

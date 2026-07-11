@@ -7,7 +7,6 @@ struct SettingsView: View {
     @State private var apiKey: String = KeychainStore.loadAPIKey() ?? ""
     @State private var keySaved = false
 
-    @AppStorage(AppSettings.autoPlayChineseKey) private var autoPlayChinese = false
     @AppStorage(AppSettings.noiseGateEnabledKey) private var noiseGateEnabled = true
     @AppStorage(AppSettings.neuralVADEnabledKey) private var neuralVADEnabled = true
     @AppStorage(AppSettings.micProfileKey) private var micProfileRaw = AppSettings.MicProfile.worn.rawValue
@@ -26,8 +25,15 @@ struct SettingsView: View {
     @AppStorage(AppSettings.showPinyinKey) private var showPinyin = true
     @AppStorage(AppSettings.outputGainKey) private var outputGain = 1.0
     @AppStorage(AppSettings.outputLanguageKey) private var outputLanguage = "en"
-    @AppStorage(AppSettings.pttOutputLanguageKey) private var pttOutputLanguage = "zh"
     @AppStorage(AppSettings.keepScreenAwakeKey) private var keepScreenAwake = true
+    @AppStorage(AppSettings.replyLanguageKey) private var replyLanguage = "zh"
+    @AppStorage(AppSettings.copilotEnabledKey) private var copilotEnabled = true
+    @AppStorage(AppSettings.autoSuggestKey) private var autoSuggest = true
+    @AppStorage(AppSettings.userBioKey) private var userBio = ""
+    @AppStorage(AppSettings.mandarinLevelKey) private var mandarinLevelRaw = AppSettings.MandarinLevel.elementary.rawValue
+    @AppStorage(AppSettings.suggestionToneKey) private var suggestionTone = "auto"
+    @AppStorage(AppSettings.assistModelKey) private var assistModel = ""
+    @AppStorage(AppSettings.assistEndpointKey) private var assistEndpoint = ""
 
     private var micProfile: AppSettings.MicProfile {
         AppSettings.MicProfile(rawValue: micProfileRaw) ?? .worn
@@ -108,23 +114,44 @@ struct SettingsView: View {
                             Text(option.name).tag(option.code)
                         }
                     }
-                    Picker("My speech translates to", selection: $pttOutputLanguage) {
+                } header: {
+                    Text("Languages")
+                } footer: {
+                    Text("What anyone says is auto-detected (70+ languages) — this chooses the translated output for the table mics. Changes apply when a lane's next session opens (after an idle close, or on the next Start).")
+                }
+
+                Section {
+                    Toggle("Enable co-pilot", isOn: $copilotEnabled)
+                    Toggle("Auto-suggest during conversation", isOn: $autoSuggest)
+                        .disabled(!copilotEnabled)
+                    Picker("Reply language", selection: $replyLanguage) {
                         ForEach(Self.outputLanguages) { option in
                             Text(option.name).tag(option.code)
                         }
                     }
+                    Picker("My Mandarin level", selection: $mandarinLevelRaw) {
+                        ForEach(AppSettings.MandarinLevel.allCases) { level in
+                            Text(level.displayName).tag(level.rawValue)
+                        }
+                    }
+                    Picker("Suggestion tone", selection: $suggestionTone) {
+                        Text("Match the room").tag("auto")
+                        Text("Casual").tag("casual")
+                        Text("Polite").tag("polite")
+                    }
+                    TextField(
+                        "About you — who you are, how you know the group, safe topics…",
+                        text: $userBio,
+                        axis: .vertical
+                    )
+                    .lineLimit(3...8)
+                    TextField("Assist model", text: $assistModel, prompt: Text("gpt-4o-mini"))
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
                 } header: {
-                    Text("Languages")
+                    Text("Reply co-pilot")
                 } footer: {
-                    Text("What anyone says is auto-detected (70+ languages) — these choose the translated output: the first for the table mics, the second for push-to-talk. Changes apply when a lane's next session opens (after an idle close, or on the next Start).")
-                }
-
-                Section {
-                    Toggle("Auto-play my translation over speaker", isOn: $autoPlayChinese)
-                } header: {
-                    Text("Push to talk")
-                } footer: {
-                    Text("Off: your translated speech appears as text with a play button. On: it plays over the iPad speaker as soon as it arrives.")
+                    Text("The co-pilot watches the conversation and keeps 2–3 things you could say ready as cue cards — Chinese plus pinyin you read aloud yourself; nothing is ever played by the iPad. Your level hard-caps suggestion length and vocabulary so every card is actually sayable. The bio and the transcript are sent to OpenAI with your existing key — include nothing you wouldn't say at the table. Set the per-meal scene from the chip on the Conversation tab.")
                 }
 
                 Section {
@@ -191,10 +218,14 @@ struct SettingsView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .font(.footnote)
+                    TextField("Co-pilot endpoint", text: $assistEndpoint, prompt: Text(AppSettings.defaultAssistEndpoint))
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .font(.footnote)
                 } header: {
                     Text("Advanced")
                 } footer: {
-                    Text("Only change these if OpenAI renames the model or moves the realtime translation endpoint. %@ in the template is replaced by the model name. Applies on the next Start.")
+                    Text("Only change these if OpenAI renames the model or moves an endpoint, or you route through a relay/proxy — the endpoint template covers the realtime translation sessions, the co-pilot endpoint covers the suggestion/compose calls (both must point at your relay for everything to work through it). %@ in the template is replaced by the model name. Applies on the next Start / next co-pilot request.")
                 }
 
                 Section {

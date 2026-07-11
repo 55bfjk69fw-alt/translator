@@ -3,6 +3,17 @@ import SwiftUI
 struct ConversationView: View {
     @EnvironmentObject private var model: AppModel
 
+    @State private var composerText = ""
+    @State private var composing = false
+    @State private var cueCard: AssistEngine.Suggestion?
+    @State private var explanation: AssistEngine.Explanation?
+
+    /// The privacy switch: with the co-pilot off, NO assist affordance may
+    /// exist — the composer, tray, and long-press actions all send the
+    /// transcript window + bio to OpenAI (the engine also guards, but the
+    /// UI must not offer what the setting promises is off).
+    @AppStorage(AppSettings.copilotEnabledKey) private var copilotEnabled = true
+
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
@@ -16,7 +27,16 @@ struct ConversationView: View {
                         .background(.red)
                 }
                 transcriptList
-                pttBar
+                if copilotEnabled {
+                    AssistBarView(
+                        assist: model.assist,
+                        composerText: $composerText,
+                        composing: composing,
+                        conversationActive: model.mode == .conversation,
+                        onOpenCard: { cueCard = $0 },
+                        onCompose: composeDraft
+                    )
+                }
             }
             .navigationTitle("Translator")
             .navigationBarTitleDisplayMode(.inline)
@@ -24,6 +44,22 @@ struct ConversationView: View {
                 ToolbarItem(placement: .primaryAction) {
                     startStopButton
                 }
+            }
+            .sheet(item: $cueCard) { suggestion in
+                CueCardView(
+                    suggestion: suggestion,
+                    onSaid: {
+                        model.assist.markSaid(suggestion)
+                        cueCard = nil
+                    },
+                    onRefine: {
+                        composerText = suggestion.gloss
+                        cueCard = nil
+                    }
+                )
+            }
+            .sheet(item: $explanation) { explanation in
+                ExplainCardView(explanation: explanation)
             }
         }
     }
@@ -79,11 +115,15 @@ struct ConversationView: View {
                         emptyHint
                     }
                     ForEach(model.transcript.utterances) { utterance in
+                        let isUser = utterance.laneID == SpeakerLane.userLaneID
                         UtteranceBubble(
                             utterance: utterance,
                             lane: model.lane(for: utterance.laneID),
-                            playAction: utterance.translatedAudio != nil && model.mode != .idle
-                                ? { model.playUtteranceAudio(utterance) }
+                            onReplyTo: copilotEnabled && !isUser && utterance.isFinal
+                                ? { requestScopedReply(to: utterance) }
+                                : nil,
+                            onExplain: copilotEnabled && !isUser && !utterance.sourceText.isEmpty
+                                ? { explain(utterance) }
                                 : nil
                         )
                         .id(utterance.id)
@@ -113,31 +153,288 @@ struct ConversationView: View {
         .padding(.top, 80)
     }
 
-    // MARK: - Push to talk
+    // MARK: - Co-pilot actions
 
-    private var pttBar: some View {
-        VStack(spacing: 4) {
-            if model.speakerOverrideActive {
-                Label("Playing translation over speaker", systemImage: "speaker.wave.2.fill")
-                    .font(.footnote)
+    private func composeDraft() {
+        let draft = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !draft.isEmpty, !composing else { return }
+        composing = true
+        Task { @MainActor in
+            let suggestion = await model.assist.compose(draft: draft)
+            composing = false
+            if let suggestion {
+                composerText = ""
+                cueCard = suggestion
+            }
+        }
+    }
+
+    private func requestScopedReply(to utterance: TranscriptStore.Utterance) {
+        model.assist.requestScoped(
+            speaker: model.laneName(utterance.laneID),
+            source: utterance.sourceText,
+            translation: utterance.translatedText
+        )
+    }
+
+    private func explain(_ utterance: TranscriptStore.Utterance) {
+        let speaker = model.laneName(utterance.laneID)
+        Task { @MainActor in
+            if let result = await model.assist.explain(
+                speaker: speaker,
+                source: utterance.sourceText,
+                translation: utterance.translatedText
+            ) {
+                explanation = result
+            }
+        }
+    }
+}
+
+// MARK: - Assist bar
+
+/// Scene chip + suggestion tray + composer: the reply flow's home
+/// (docs/REPLY-FLOW.md §2). Observes the AssistEngine directly so
+/// suggestion churn doesn't re-render the transcript above it.
+private struct AssistBarView: View {
+    @ObservedObject var assist: AssistEngine
+    @Binding var composerText: String
+    let composing: Bool
+    let conversationActive: Bool
+    let onOpenCard: (AssistEngine.Suggestion) -> Void
+    let onCompose: () -> Void
+
+    @AppStorage(AppSettings.sceneContextKey) private var scene = ""
+    @State private var editingScene = false
+    @State private var sceneDraft = ""
+
+    var body: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 10) {
+                sceneChip
+                Spacer()
+                statusIndicator
+                if conversationActive {
+                    Button {
+                        assist.requestNow()
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+            if !assist.suggestions.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(assist.suggestions) { suggestion in
+                            SuggestionChip(
+                                suggestion: suggestion,
+                                onTap: { onOpenCard(suggestion) },
+                                onTogglePin: { assist.togglePin(suggestion.id) }
+                            )
+                        }
+                    }
+                    .padding(.horizontal, 2)
+                }
+            }
+            HStack(spacing: 8) {
+                // Single-line on purpose: with axis .vertical the Return
+                // key inserts a newline and .onSubmit never fires.
+                TextField("Compose a reply to say aloud…", text: $composerText)
+                    .textFieldStyle(.roundedBorder)
+                    .submitLabel(.send)
+                    .onSubmit(onCompose)
+                if composing {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Button(action: onCompose) {
+                        Image(systemName: "arrow.up.circle.fill")
+                            .font(.title2)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 10)
+        .background(.thinMaterial)
+        .alert("Set the scene", isPresented: $editingScene) {
+            TextField("Dinner with the in-laws in Chengdu…", text: $sceneDraft)
+            Button("Save") { scene = sceneDraft }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("One line of context that makes suggestions land — where you are, who's at the table, what's going on.")
+        }
+    }
+
+    private var sceneChip: some View {
+        Button {
+            sceneDraft = scene
+            editingScene = true
+        } label: {
+            Label(scene.isEmpty ? "Set the scene…" : scene, systemImage: "theatermasks")
+                .font(.caption)
+                .lineLimit(1)
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+    }
+
+    @ViewBuilder
+    private var statusIndicator: some View {
+        switch assist.status {
+        case .idle:
+            EmptyView()
+        case .loading:
+            ProgressView()
+                .controlSize(.small)
+        case .offline:
+            Label("co-pilot offline", systemImage: "exclamationmark.triangle.fill")
+                .font(.caption2)
+                .foregroundStyle(.orange)
+        }
+    }
+}
+
+private struct SuggestionChip: View {
+    let suggestion: AssistEngine.Suggestion
+    let onTap: () -> Void
+    let onTogglePin: () -> Void
+
+    var body: some View {
+        Button(action: onTap) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 4) {
+                    if suggestion.pinned {
+                        Image(systemName: "pin.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.indigo)
+                    }
+                    Text(suggestion.gloss)
+                        .font(.callout.weight(.medium))
+                        .lineLimit(1)
+                }
+                Text(suggestion.replyTo.map { "→ \($0)" } ?? "→ table")
+                    .font(.caption2)
                     .foregroundStyle(.secondary)
             }
-            if model.mode == .pushToTalk {
-                ProgressView(value: Double(model.pttLevel))
-                    .progressViewStyle(.linear)
-                    .tint(.red)
-                    .frame(maxWidth: 220)
-            }
-            PushToTalkButton(
-                enabled: model.mode == .conversation || model.mode == .pushToTalk,
-                isTalking: model.mode == .pushToTalk,
-                onPress: { model.pttPressed() },
-                onRelease: { model.pttReleased() }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(Color.indigo.opacity(suggestion.pinned ? 0.22 : 0.12))
             )
         }
-        .padding(.vertical, 10)
-        .frame(maxWidth: .infinity)
-        .background(.thinMaterial)
+        .buttonStyle(.plain)
+        .contextMenu {
+            Button(action: onTogglePin) {
+                Label(suggestion.pinned ? "Unpin" : "Pin", systemImage: suggestion.pinned ? "pin.slash" : "pin")
+            }
+        }
+    }
+}
+
+// MARK: - Cue card
+
+/// The thing the user reads aloud. Hanzi big enough to read at arm's
+/// length, pinyin as the pronunciation aid, gloss so they know exactly
+/// what they're committing to. Never enters the transcript unless
+/// confirmed via "I said this".
+private struct CueCardView: View {
+    let suggestion: AssistEngine.Suggestion
+    let onSaid: () -> Void
+    let onRefine: () -> Void
+
+    var body: some View {
+        VStack(spacing: 18) {
+            Spacer(minLength: 8)
+            Text(suggestion.hanzi)
+                .font(.system(size: 40, weight: .semibold))
+                .multilineTextAlignment(.center)
+                .textSelection(.enabled)
+            if !suggestion.pinyin.isEmpty {
+                Text(suggestion.pinyin)
+                    .font(.title2)
+                    .foregroundStyle(.teal)
+                    .multilineTextAlignment(.center)
+                    .textSelection(.enabled)
+            }
+            Text("“\(suggestion.gloss)”")
+                .font(.body)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            HStack(spacing: 8) {
+                tag(suggestion.register)
+                if let replyTo = suggestion.replyTo {
+                    tag("→ \(replyTo)")
+                }
+            }
+            Spacer(minLength: 8)
+            HStack(spacing: 12) {
+                Button(action: onSaid) {
+                    Label("I said this", systemImage: "checkmark.bubble.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .tint(.indigo)
+                Button(action: onRefine) {
+                    Label("Refine…", systemImage: "pencil")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+            }
+        }
+        .padding(24)
+        .presentationDetents([.medium])
+    }
+
+    private func tag(_ text: String) -> some View {
+        Text(text)
+            .font(.caption)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(Capsule().fill(Color.secondary.opacity(0.15)))
+    }
+}
+
+// MARK: - Explain card
+
+private struct ExplainCardView: View {
+    let explanation: AssistEngine.Explanation
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                Text(explanation.about)
+                    .font(.title3.weight(.semibold))
+                    .textSelection(.enabled)
+                Text(explanation.explanation)
+                    .font(.body)
+                ForEach(explanation.phrases) { phrase in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(phrase.hanzi)
+                            .font(.headline)
+                            .textSelection(.enabled)
+                        Text(phrase.pinyin)
+                            .font(.subheadline.italic())
+                            .foregroundStyle(.teal)
+                        Text(phrase.meaning)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(RoundedRectangle(cornerRadius: 10).fill(Color.secondary.opacity(0.08)))
+                }
+            }
+            .padding(24)
+        }
+        .presentationDetents([.medium, .large])
     }
 }
 
@@ -198,7 +495,8 @@ private struct LaneStatusDot: View {
 private struct UtteranceBubble: View {
     let utterance: TranscriptStore.Utterance
     let lane: SpeakerLane
-    let playAction: (() -> Void)?
+    let onReplyTo: (() -> Void)?
+    let onExplain: (() -> Void)?
 
     @AppStorage(AppSettings.showPinyinKey) private var showPinyin = true
 
@@ -218,13 +516,6 @@ private struct UtteranceBubble: View {
                     if !utterance.isFinal {
                         ProgressView()
                             .controlSize(.mini)
-                    }
-                    if let playAction {
-                        Button(action: playAction) {
-                            Image(systemName: "speaker.wave.2.circle.fill")
-                                .font(.title3)
-                        }
-                        .buttonStyle(.plain)
                     }
                 }
                 if !utterance.sourceText.isEmpty {
@@ -254,45 +545,19 @@ private struct UtteranceBubble: View {
                 RoundedRectangle(cornerRadius: 12)
                     .fill(lane.color.opacity(0.12))
             )
+            .contextMenu {
+                if let onReplyTo {
+                    Button(action: onReplyTo) {
+                        Label("Reply to this", systemImage: "arrowshape.turn.up.left")
+                    }
+                }
+                if let onExplain {
+                    Button(action: onExplain) {
+                        Label("Explain this", systemImage: "questionmark.bubble")
+                    }
+                }
+            }
             if !isUser { Spacer(minLength: 60) }
         }
-    }
-}
-
-private struct PushToTalkButton: View {
-    let enabled: Bool
-    let isTalking: Bool
-    let onPress: () -> Void
-    let onRelease: () -> Void
-
-    @State private var pressing = false
-
-    var body: some View {
-        Label(
-            isTalking ? "Speaking… (release to translate)" : "Hold to speak",
-            systemImage: "mic.fill"
-        )
-        .font(.headline)
-        .foregroundStyle(.white)
-        .padding(.horizontal, 28)
-        .padding(.vertical, 14)
-        .background(
-            Capsule().fill(isTalking ? Color.red : (enabled ? Color.indigo : Color.gray))
-        )
-        .scaleEffect(isTalking ? 1.06 : 1.0)
-        .animation(.easeInOut(duration: 0.15), value: isTalking)
-        .gesture(
-            DragGesture(minimumDistance: 0)
-                .onChanged { _ in
-                    guard enabled, !pressing else { return }
-                    pressing = true
-                    onPress()
-                }
-                .onEnded { _ in
-                    guard pressing else { return }
-                    pressing = false
-                    onRelease()
-                }
-        )
     }
 }

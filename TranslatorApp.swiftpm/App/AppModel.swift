@@ -5,8 +5,8 @@ import SwiftUI
 import UIKit
 
 /// Central coordinator: audio session/engine, per-channel gating and
-/// resampling, one translation session per speaker, push-to-talk return
-/// channel, playback ducking, and transcript/cost bookkeeping.
+/// resampling, one translation session per speaker, the reply co-pilot,
+/// and transcript/cost bookkeeping.
 ///
 /// Threading: @Published state is only touched on the main thread. The audio
 /// tap hands buffers to `audioQueue` for gating/resampling/sending.
@@ -16,7 +16,6 @@ final class AppModel: ObservableObject {
         case idle
         case bench          // meters only, no translation sessions
         case conversation
-        case pushToTalk
     }
 
     // MARK: - Published UI state (main thread only)
@@ -29,18 +28,15 @@ final class AppModel: ObservableObject {
     @Published private(set) var route: AudioSessionController.RouteSnapshot?
     @Published private(set) var estimatedCost: Double = 0
     @Published var errorBanner: String?
-    @Published private(set) var speakerOverrideActive = false
-    @Published private(set) var pttLevel: Float = 0
 
     /// One row of the Diagnostics "Translation pipeline" panel: everything
     /// between the gate and the transcript for one lane, sampled at 1 Hz by
     /// the UI timer. This is the tool for "the gate is open but nothing is
     /// showing up" — it localizes the break to gate/session/server stream.
     struct LanePipelineStatus: Identifiable {
-        let id: Int            // lane ID; SpeakerLane.userLaneID for PTT
+        let id: Int            // lane ID (DJI channel)
         var name: String
-        /// Gate currently passing this channel (mirror of the status dot);
-        /// for the PTT lane, whether the talk button is held.
+        /// Gate currently passing this channel (mirror of the status dot).
         var gateOpen: Bool
         var secondsSinceSpeech: TimeInterval?
         /// nil = no session right now (they open lazily on first speech).
@@ -50,6 +46,11 @@ final class AppModel: ObservableObject {
     @Published private(set) var pipelineStatuses: [LanePipelineStatus] = []
 
     let transcript: TranscriptStore
+
+    /// Reply co-pilot (docs/REPLY-FLOW.md). Its own ObservableObject so the
+    /// assist bar re-renders on suggestion churn without re-rendering the
+    /// transcript, mirroring the SignalAnalyzer pattern.
+    let assist = AssistEngine()
 
     /// Signal-tab analysis. Deliberately its own ObservableObject (not
     /// forwarded through objectWillChange) so its 5-10 Hz snapshot churn
@@ -64,8 +65,7 @@ final class AppModel: ObservableObject {
     private let costMeter = CostMeter()
     private let audioQueue = DispatchQueue(label: "translator.audio.pipeline", qos: .userInitiated)
 
-    /// laneID -> client. DJI lanes are 0..<channelCount; the user's
-    /// push-to-talk lane is SpeakerLane.userLaneID.
+    /// laneID -> client, one per DJI channel (0..<channelCount).
     /// `clients`, `resamplers`, and `gate` internals are confined to
     /// audioQueue (mutations from the main thread hop via audioQueue.sync)
     /// because the tap pipeline reads them concurrently.
@@ -94,25 +94,16 @@ final class AppModel: ObservableObject {
     private var lastWatchdogRestart = Date.distantPast
     private var lastEngineDownWarn = Date.distantPast
 
-    /// Playback lanes on the engine: 0..3 = translated English per speaker,
-    /// 4 = the user's translated Chinese.
-    private let zhPlaybackLane = 4
+    /// Playback lanes on the engine: 0..3 = translated English per speaker.
+    private let playbackLaneCount = 4
     private var pendingPlaybackBuffers: [Int: Int] = [:]
-    private var zhSpeakerPlaybackOutstanding = 0
 
     private var uiTimer: Timer?
     private var stopping = false
     private var cancellables: Set<AnyCancellable> = []
 
-    // Read on the tap thread, written on main — lock-protected.
-    private let pttFlagLock = NSLock()
-    private var _pttEngaged = false
-    private var pttEngaged: Bool {
-        get { pttFlagLock.lock(); defer { pttFlagLock.unlock() }; return _pttEngaged }
-        set { pttFlagLock.lock(); _pttEngaged = newValue; pttFlagLock.unlock() }
-    }
-
     init() {
+        AppSettings.migrateLegacyKeys()
         transcript = TranscriptStore()
         engineGraph.outputGain = AppSettings.outputGain
         // Nested ObservableObject: forward its changes so views observing
@@ -120,6 +111,23 @@ final class AppModel: ObservableObject {
         transcript.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
+        // Co-pilot wiring: the engine reads the transcript through these
+        // closures and writes "I said this" turns back through them — it
+        // never touches the audio pipeline (docs/REPLY-FLOW.md §3).
+        assist.transcriptWindow = { [weak self] in
+            guard let self else { return [] }
+            return self.transcript.utterances.suffix(60).filter(\.isFinal).suffix(25).map { utterance in
+                AssistEngine.TranscriptLine(
+                    speaker: self.laneName(utterance.laneID),
+                    source: utterance.sourceText,
+                    translation: utterance.translatedText,
+                    isUser: utterance.laneID == SpeakerLane.userLaneID
+                )
+            }
+        }
+        assist.onUserSaid = { [weak self] suggestion in
+            self?.transcript.addUserUtterance(source: suggestion.hanzi, gloss: suggestion.gloss)
+        }
         observeNotifications()
     }
 
@@ -147,7 +155,7 @@ final class AppModel: ObservableObject {
         refreshRoute()
 
         do {
-            try engineGraph.start(playerCount: zhPlaybackLane + 1)
+            try engineGraph.start(playerCount: playbackLaneCount)
         } catch {
             errorBanner = "Audio engine failed to start: \(error.localizedDescription)"
             return
@@ -175,6 +183,7 @@ final class AppModel: ObservableObject {
         installInputHandler()
         startUITimer()
         mode = .conversation
+        assist.conversationStarted(finalizedCount: transcript.finalizedTotal)
         UIApplication.shared.isIdleTimerDisabled = true
         Log.info("Conversation started: \(channelCount) channel(s); sessions open on first speech")
     }
@@ -183,7 +192,7 @@ final class AppModel: ObservableObject {
         guard mode != .idle else { return }
         stopping = true
         mode = .idle
-        pttEngaged = false
+        assist.conversationEnded()
         uiTimer?.invalidate()
         uiTimer = nil
         engineGraph.onInputChannels = nil
@@ -201,7 +210,10 @@ final class AppModel: ObservableObject {
         sessionOpenedAt.removeAll()
         pipelineStatuses = []
         resetPlaybackState()
-        UIApplication.shared.isIdleTimerDisabled = false
+        // Restore the user's Display preference rather than forcing the
+        // idle timer back on — "Keep screen awake" applies app-wide, not
+        // just during a conversation.
+        UIApplication.shared.isIdleTimerDisabled = AppSettings.keepScreenAwake
         refreshCost()
         Log.info("Conversation stopped")
     }
@@ -219,14 +231,9 @@ final class AppModel: ObservableObject {
 
     /// Player nodes are torn down on every engine rebuild and their pending
     /// completion handlers may never fire — reset the counters that ducking
-    /// and the speaker override key off, or they wedge.
+    /// keys off, or they wedge.
     private func resetPlaybackState() {
         pendingPlaybackBuffers.removeAll()
-        zhSpeakerPlaybackOutstanding = 0
-        if speakerOverrideActive {
-            audioSession.overrideToSpeaker(false)
-            speakerOverrideActive = false
-        }
     }
 
     // MARK: - Input pipeline
@@ -236,20 +243,13 @@ final class AppModel: ObservableObject {
             guard let self else { return }
             // Copy on the tap thread — the pointers die when the callback
             // returns — then process off-thread.
-            if self.pttEngaged {
-                guard let first = channelPointers.first,
-                      let buffer = EngineGraph.monoBuffer(from: first, frames: frames, sampleRate: sampleRate) else { return }
-                let rms = ChannelGate.rms(samples: first, count: frames)
-                self.audioQueue.async { self.processPTTBuffer(buffer, rms: rms) }
-            } else {
-                let laneCount = min(4, channelPointers.count)
-                var buffers: [AVAudioPCMBuffer] = []
-                for index in 0..<laneCount {
-                    guard let buffer = EngineGraph.monoBuffer(from: channelPointers[index], frames: frames, sampleRate: sampleRate) else { return }
-                    buffers.append(buffer)
-                }
-                self.audioQueue.async { self.processConversationBuffers(buffers, frames: frames, sampleRate: sampleRate) }
+            let laneCount = min(4, channelPointers.count)
+            var buffers: [AVAudioPCMBuffer] = []
+            for index in 0..<laneCount {
+                guard let buffer = EngineGraph.monoBuffer(from: channelPointers[index], frames: frames, sampleRate: sampleRate) else { return }
+                buffers.append(buffer)
             }
+            self.audioQueue.async { self.processConversationBuffers(buffers, frames: frames, sampleRate: sampleRate) }
         }
     }
 
@@ -327,17 +327,6 @@ final class AppModel: ObservableObject {
         return client
     }
 
-    /// Runs on audioQueue.
-    private func processPTTBuffer(_ buffer: AVAudioPCMBuffer, rms: Float) {
-        let level = min(1, rms * 12)
-        DispatchQueue.main.async { self.pttLevel = level }
-        lastVoiceAt[SpeakerLane.userLaneID] = Date()
-        guard let resampler = resamplers[SpeakerLane.userLaneID],
-              let client = clients[SpeakerLane.userLaneID],
-              let data = resampler.convert(buffer) else { return }
-        client.sendAudio(data)
-    }
-
     private var lastMeterPush = Date.distantPast
 
     private func pushMeters(_ decisions: [ChannelGate.Decision]) {
@@ -362,9 +351,8 @@ final class AppModel: ObservableObject {
         var config = SessionConfig(outputLanguage: outputLanguage)
         config.model = AppSettings.modelName
         config.noiseReduction = AppSettings.noiseReduction
-        let label = lane == SpeakerLane.userLaneID ? "me→\(outputLanguage)" : "ch\(lane)→\(outputLanguage)"
         let client = RealtimeTranslationClient(
-            label: label,
+            label: "ch\(lane)→\(outputLanguage)",
             config: config,
             apiKey: apiKey,
             endpointTemplate: AppSettings.endpointTemplate
@@ -373,16 +361,7 @@ final class AppModel: ObservableObject {
         return client
     }
 
-    /// Main-thread path (push-to-talk lane): register + connect.
-    private func openClient(lane: Int, outputLanguage: String, apiKey: String) {
-        let client = makeClient(lane: lane, outputLanguage: outputLanguage, apiKey: apiKey)
-        audioQueue.sync { clients[lane] = client }
-        client.connect()
-    }
-
     private func wireClient(_ client: RealtimeTranslationClient, lane: Int) {
-        let isUserLane = lane == SpeakerLane.userLaneID
-
         client.onStateChange = { [weak self, weak client] state in
             DispatchQueue.main.async {
                 guard let self, let client else { return }
@@ -422,14 +401,7 @@ final class AppModel: ObservableObject {
             self?.costMeter.addBilledSeconds(seconds)
         }
         client.onTranslatedAudio = { [weak self] audio in
-            guard let self else { return }
-            DispatchQueue.main.async {
-                if isUserLane {
-                    self.handleChineseAudio(audio)
-                } else {
-                    self.playEnglishAudio(audio, lane: lane)
-                }
-            }
+            DispatchQueue.main.async { self?.playEnglishAudio(audio, lane: lane) }
         }
     }
 
@@ -474,7 +446,7 @@ final class AppModel: ObservableObject {
             lastEngineDownWarn = Date()
             Log.warn("Translated audio arriving for lane \(lane) but the audio engine is not running — playback stalled (watchdog will restart it)")
         }
-        let othersActive = pendingPlaybackBuffers.contains { $0.key != lane && $0.key != zhPlaybackLane && $0.value > 0 }
+        let othersActive = pendingPlaybackBuffers.contains { $0.key != lane && $0.value > 0 }
         engineGraph.setLaneVolume(othersActive ? 0.35 : 1.0, lane: lane)
         pendingPlaybackBuffers[lane, default: 0] += 1
         engineGraph.schedule(pcm16: audio, lane: lane) { [weak self] in
@@ -483,103 +455,6 @@ final class AppModel: ObservableObject {
                 self.pendingPlaybackBuffers[lane] = max(0, (self.pendingPlaybackBuffers[lane] ?? 1) - 1)
                 if self.pendingPlaybackBuffers[lane] == 0 {
                     self.engineGraph.setLaneVolume(1.0, lane: lane)
-                }
-            }
-        }
-    }
-
-    // MARK: - Push-to-talk (main thread)
-
-    func pttPressed() {
-        guard mode == .conversation else { return }
-        guard let apiKey = KeychainStore.loadAPIKey(), !apiKey.isEmpty else { return }
-        mode = .pushToTalk
-        pttEngaged = true
-        Log.info("PTT engaged — switching input to AirPods mic")
-
-        engineGraph.stop()
-        resetPlaybackState()
-        do {
-            try audioSession.configureForPushToTalk()
-        } catch {
-            Log.error("PTT session config failed: \(error.localizedDescription)")
-        }
-        // The route change settles asynchronously; give it a beat before the
-        // engine rebuilds against the new input format.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            guard let self, self.pttEngaged, self.mode == .pushToTalk else { return }
-            do {
-                try self.engineGraph.start(playerCount: self.zhPlaybackLane + 1)
-            } catch {
-                Log.error("PTT engine start failed: \(error.localizedDescription)")
-            }
-            let rate = self.engineGraph.inputSampleRate
-            self.audioQueue.sync {
-                self.resamplers[SpeakerLane.userLaneID] = StreamResampler(inputSampleRate: rate)
-            }
-            if self.audioQueue.sync(execute: { self.clients[SpeakerLane.userLaneID] }) == nil {
-                self.openClient(lane: SpeakerLane.userLaneID, outputLanguage: AppSettings.pttOutputLanguage, apiKey: apiKey)
-            }
-            self.refreshRoute()
-        }
-    }
-
-    func pttReleased() {
-        guard mode == .pushToTalk else { return }
-        pttEngaged = false
-        Log.info("PTT released — restoring USB input")
-
-        engineGraph.stop()
-        resetPlaybackState()
-        do {
-            try audioSession.configureForConversation()
-        } catch {
-            Log.error("Restoring conversation session failed: \(error.localizedDescription)")
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            guard let self, !self.pttEngaged, self.mode == .pushToTalk else { return }
-            do {
-                try self.engineGraph.start(playerCount: self.zhPlaybackLane + 1)
-                self.buildResamplers(channelCount: self.lanes.count)
-                self.audioQueue.sync { self.gate.reset() }
-            } catch {
-                Log.error("Engine restart failed: \(error.localizedDescription)")
-            }
-            self.refreshRoute()
-            self.pttLevel = 0
-            self.mode = .conversation
-        }
-    }
-
-    // MARK: - Chinese (user lane) playback (main thread)
-
-    private func handleChineseAudio(_ audio: Data) {
-        transcript.appendTranslatedAudio(lane: SpeakerLane.userLaneID, audio: audio)
-        if AppSettings.autoPlayChinese {
-            playChineseOverSpeaker(audio)
-        }
-    }
-
-    /// Replay a finished utterance's Chinese audio over the iPad speaker.
-    func playUtteranceAudio(_ utterance: TranscriptStore.Utterance) {
-        // Player nodes only exist while the engine runs.
-        guard mode != .idle, let audio = utterance.translatedAudio else { return }
-        playChineseOverSpeaker(audio)
-    }
-
-    private func playChineseOverSpeaker(_ audio: Data) {
-        if zhSpeakerPlaybackOutstanding == 0 {
-            audioSession.overrideToSpeaker(true)
-            speakerOverrideActive = true
-        }
-        zhSpeakerPlaybackOutstanding += 1
-        engineGraph.schedule(pcm16: audio, lane: zhPlaybackLane) { [weak self] in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.zhSpeakerPlaybackOutstanding = max(0, self.zhSpeakerPlaybackOutstanding - 1)
-                if self.zhSpeakerPlaybackOutstanding == 0 {
-                    self.audioSession.overrideToSpeaker(false)
-                    self.speakerOverrideActive = false
                 }
             }
         }
@@ -670,6 +545,14 @@ final class AppModel: ObservableObject {
             guard let self else { return }
             self.refreshCost()
             self.transcript.finalizeStale(timeout: 2.5)
+            // The co-pilot's ambient trigger keys off finalizations — tick
+            // it right after finalizeStale so a fresh utterance can fire a
+            // suggestion request the same second (docs/REPLY-FLOW.md §3).
+            // finalizedTotal is monotonic, so the trigger survives the
+            // transcript's 400-utterance trim cap.
+            if self.mode == .conversation {
+                self.assist.transcriptTick(finalizedCount: self.transcript.finalizedTotal)
+            }
             self.closeIdleSessions()
             self.watchdogEngineCheck()
             self.refreshPipelineStatuses()
@@ -680,13 +563,13 @@ final class AppModel: ObservableObject {
     /// Main thread (UI timer); each snapshot() is a brief sync hop onto that
     /// client's queue, and the clients dictionary is copied under audioQueue.
     private func refreshPipelineStatuses() {
-        guard mode == .conversation || mode == .pushToTalk else {
+        guard mode == .conversation else {
             if !pipelineStatuses.isEmpty { pipelineStatuses = [] }
             return
         }
         let (clientsCopy, voiceTimes) = audioQueue.sync { (clients, lastVoiceAt) }
         let now = Date()
-        var statuses: [LanePipelineStatus] = lanes.map { lane in
+        pipelineStatuses = lanes.map { lane in
             LanePipelineStatus(
                 id: lane.id,
                 name: lane.name,
@@ -695,16 +578,6 @@ final class AppModel: ObservableObject {
                 session: clientsCopy[lane.id]?.snapshot()
             )
         }
-        if let userClient = clientsCopy[SpeakerLane.userLaneID] {
-            statuses.append(LanePipelineStatus(
-                id: SpeakerLane.userLaneID,
-                name: laneName(SpeakerLane.userLaneID),
-                gateOpen: pttEngaged,
-                secondsSinceSpeech: voiceTimes[SpeakerLane.userLaneID].map { now.timeIntervalSince($0) },
-                session: userClient.snapshot()
-            ))
-        }
-        pipelineStatuses = statuses
     }
 
     /// AVAudioEngine auto-stops on configuration changes (Bluetooth codec
@@ -713,7 +586,7 @@ final class AppModel: ObservableObject {
     /// continues after a pause" failure. Restart it whenever it's found dead
     /// outside an active interruption.
     private func watchdogEngineCheck() {
-        guard mode == .conversation || mode == .bench, !pttEngaged, !engineGraph.engine.isRunning else { return }
+        guard mode == .conversation || mode == .bench, !engineGraph.engine.isRunning else { return }
         // During an interruption the session can't be reactivated; wait for
         // the .ended notification, but only up to 60 s — it famously doesn't
         // always arrive.
@@ -726,8 +599,8 @@ final class AppModel: ObservableObject {
 
     /// Close sessions whose channel has been silent past the idle timeout —
     /// they reopen automatically on the next detected speech. Stops billing
-    /// for quiet channels and for the PTT lane between uses. Sessions on
-    /// mics disabled in Settings close immediately, timeout or not.
+    /// for quiet channels. Sessions on mics disabled in Settings close
+    /// immediately, timeout or not.
     private func closeIdleSessions() {
         guard mode != .idle else { return }
         let timeout = AppSettings.idleCloseSeconds
@@ -736,8 +609,7 @@ final class AppModel: ObservableObject {
         var disabledLanes: Set<Int> = []
         audioQueue.sync {
             for (lane, client) in clients {
-                if lane == SpeakerLane.userLaneID && pttEngaged { continue }
-                if lane >= 0 && !AppSettings.speakerEnabled(lane) {
+                if !AppSettings.speakerEnabled(lane) {
                     disabledLanes.insert(lane)
                 } else {
                     guard timeout > 0, let last = lastVoiceAt[lane],
@@ -810,7 +682,7 @@ final class AppModel: ObservableObject {
 
     private func handleRouteChange(_ notification: Notification) {
         refreshRoute()
-        guard mode == .conversation || mode == .bench, !pttEngaged else { return }
+        guard mode == .conversation || mode == .bench else { return }
         guard let raw = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
               let reason = AVAudioSession.RouteChangeReason(rawValue: raw) else { return }
         switch reason {
@@ -847,7 +719,7 @@ final class AppModel: ObservableObject {
             try audioSession.configureForConversation()
             // Mirror what each mode's start built: bench runs one throwaway
             // player and no resamplers (nothing is sent anywhere).
-            try engineGraph.start(playerCount: mode == .bench ? 1 : zhPlaybackLane + 1)
+            try engineGraph.start(playerCount: mode == .bench ? 1 : playbackLaneCount)
             if mode == .conversation {
                 buildResamplers(channelCount: lanes.count)
             }

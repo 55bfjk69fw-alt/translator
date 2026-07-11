@@ -24,7 +24,7 @@ struct SignalView: View {
                         waitingCard
                     } else {
                         gateTimelineCard
-                        if model.mode == .conversation || model.mode == .pushToTalk {
+                        if model.mode == .conversation {
                             miniTranscriptCard
                         }
                         correlationCard

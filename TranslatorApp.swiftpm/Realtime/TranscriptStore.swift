@@ -3,7 +3,7 @@ import SwiftUI
 
 /// One speaker lane = one audio channel = one translation session.
 struct SpeakerLane: Identifiable {
-    let id: Int            // channel index; -1 is the push-to-talk user lane
+    let id: Int            // channel index; -1 is the user's own lane
     var name: String
     var color: Color
 
@@ -37,9 +37,6 @@ final class TranscriptStore: ObservableObject {
         var sourceText: String
         var translatedText: String
         var isFinal: Bool
-        /// 24 kHz PCM16 of the translated audio (kept only for the user's
-        /// ZH utterances so they can be replayed over the speaker).
-        var translatedAudio: Data?
         var lastActivity: Date
         // The translation stream trails the source stream by 1-2 s, so the
         // two are tracked independently for segmentation.
@@ -49,14 +46,19 @@ final class TranscriptStore: ObservableObject {
 
     @Published private(set) var utterances: [Utterance] = []
 
+    /// Monotonic count of utterances EVER finalized (never decremented by
+    /// trim/clear). The co-pilot's ambient trigger diffs this — a live
+    /// `filter(\.isFinal).count` plateaus at the trim cap and would silence
+    /// the trigger for the rest of a long conversation.
+    private(set) var finalizedTotal = 0
+
     private let maxUtterances = 400
-    private let maxStoredAudioUtterances = 10
 
     /// Index of the open (partial) utterance per lane.
     private var openUtteranceIndex: [Int: Int] = [:]
 
     private enum Stream: String {
-        case source, translation, audio
+        case source, translation
     }
 
     func appendSourceDelta(lane: Int, text: String) {
@@ -75,14 +77,23 @@ final class TranscriptStore: ObservableObject {
         }
     }
 
-    func appendTranslatedAudio(lane: Int, audio: Data) {
-        reopenRecentIfNeeded(lane: lane, stream: .audio)
-        withOpenUtterance(lane: lane, stream: .audio) {
-            var existing = $0.translatedAudio ?? Data()
-            existing.append(audio)
-            $0.translatedAudio = existing
-            $0.lastTranslationActivity = Date()
-        }
+    /// Record something the user actually said aloud (a cue card confirmed
+    /// via "I said this"). Final immediately — no server stream ever feeds
+    /// the user lane, so there is nothing to wait for.
+    func addUserUtterance(source: String, gloss: String) {
+        let now = Date()
+        utterances.append(Utterance(
+            laneID: SpeakerLane.userLaneID,
+            date: now,
+            sourceText: source,
+            translatedText: gloss,
+            isFinal: true,
+            lastActivity: now,
+            lastSourceActivity: now,
+            lastTranslationActivity: now
+        ))
+        finalizedTotal += 1
+        trim()
     }
 
     /// The two server streams are not in lockstep: translation output trails
@@ -129,11 +140,12 @@ final class TranscriptStore: ObservableObject {
             let utterance = utterances[index]
             let sourceQuiet = now.timeIntervalSince(utterance.lastSourceActivity ?? utterance.date) > timeout
             let translationQuiet = now.timeIntervalSince(utterance.lastTranslationActivity ?? utterance.date) > timeout
-            let translationDrained = !utterance.translatedText.isEmpty || utterance.translatedAudio != nil
+            let translationDrained = !utterance.translatedText.isEmpty
             let hardCap = now.timeIntervalSince(utterance.lastActivity) > timeout * 3
             if (sourceQuiet && translationQuiet && translationDrained) || hardCap {
                 utterances[index].isFinal = true
                 openUtteranceIndex[lane] = nil
+                finalizedTotal += 1
                 finalizedAny = true
                 logFinalize(utterance, lane: lane, reason: sourceQuiet && translationQuiet && translationDrained ? "quiet" : "hard-cap")
             }
@@ -154,7 +166,7 @@ final class TranscriptStore: ObservableObject {
         let translation = utterance.translatedText.count
         if source == 0, translation > 0 {
             Log.warn("[transcript] lane \(lane): finalized (\(reason)) with translation (\(translation)ch) but NO source text — Mandarin characters missing")
-        } else if source > 0, translation == 0, utterance.translatedAudio == nil {
+        } else if source > 0, translation == 0 {
             Log.warn("[transcript] lane \(lane): finalized (\(reason)) with source (\(source)ch) but NO translation output")
         } else {
             Log.info("[transcript] lane \(lane): finalized (\(reason)) source=\(source)ch translation=\(translation)ch")
@@ -173,7 +185,6 @@ final class TranscriptStore: ObservableObject {
                 sourceText: "",
                 translatedText: "",
                 isFinal: false,
-                translatedAudio: nil,
                 lastActivity: Date(),
                 lastSourceActivity: nil,
                 lastTranslationActivity: nil
@@ -186,20 +197,13 @@ final class TranscriptStore: ObservableObject {
     }
 
     private func trim() {
-        // Bound memory: cap utterance count and drop old stored audio.
+        // Bound memory: cap utterance count.
         if utterances.count > maxUtterances {
             let overflow = utterances.count - maxUtterances
             utterances.removeFirst(overflow)
             openUtteranceIndex = openUtteranceIndex.compactMapValues { index in
                 let shifted = index - overflow
                 return shifted >= 0 ? shifted : nil
-            }
-        }
-        var audioSeen = 0
-        for index in utterances.indices.reversed() where utterances[index].translatedAudio != nil {
-            audioSeen += 1
-            if audioSeen > maxStoredAudioUtterances {
-                utterances[index].translatedAudio = nil
             }
         }
     }

@@ -40,6 +40,10 @@ final class AssistEngine: ObservableObject {
         var register: String
         /// Speaker/thread this responds to; nil = general table contribution.
         var replyTo: String?
+        /// 0–100, model-assigned: how natural/well-timed saying this right
+        /// now is relative to the batch. Orders the tray; re-scored on
+        /// every refresh, including for carried-over chips.
+        var fit: Int
         var pinned: Bool = false
     }
 
@@ -355,9 +359,18 @@ final class AssistEngine: ObservableObject {
         // keep pointing at an id we never had counts as new.
         let pinned = suggestions.filter(\.pinned)
         var rest: [Suggestion] = []
-        let keptIDs = Set(incoming.compactMap(\.keep))
-        for chip in suggestions where !chip.pinned && keptIDs.contains(chip.id) {
-            rest.append(chip)
+        // A kept chip keeps its identity but takes the batch's FRESH fit
+        // score — "natural right now" decays as the conversation moves.
+        var keptFit: [String: Int] = [:]
+        for item in incoming {
+            if let keep = item.keep { keptFit[keep] = item.suggestion.fit }
+        }
+        for chip in suggestions where !chip.pinned {
+            if let freshFit = keptFit[chip.id] {
+                var updated = chip
+                updated.fit = freshFit
+                rest.append(updated)
+            }
         }
         for item in incoming {
             if let keep = item.keep {
@@ -370,6 +383,8 @@ final class AssistEngine: ObservableObject {
             }
         }
         consumedChipIDs.removeAll()
+        // Most natural first; the limit then truncates the least natural.
+        rest.sort { $0.fit > $1.fit }
         suggestions = pinned + rest.prefix(AppSettings.suggestionLimit)
         status = .idle
         drainPending()
@@ -383,7 +398,8 @@ final class AssistEngine: ObservableObject {
             return
         }
         let incoming = Self.parseSuggestions(response.content, nextID: { self.nextChipID() })
-        suggestions = suggestions.filter(\.pinned) + incoming.prefix(AppSettings.scopedBatchSize).map(\.suggestion)
+        let ranked = incoming.map(\.suggestion).sorted { $0.fit > $1.fit }
+        suggestions = suggestions.filter(\.pinned) + ranked.prefix(AppSettings.scopedBatchSize)
         consumedChipIDs.removeAll()
         status = .idle
         // Deliberately NOT draining here: queued ambient demand predates the
@@ -470,7 +486,8 @@ final class AssistEngine: ObservableObject {
                 hanzi: hanzi,
                 pinyin: pinyin,
                 register: item["register"] as? String ?? "casual",
-                replyTo: replyTo
+                replyTo: replyTo,
+                fit: min(100, max(0, item["fit"] as? Int ?? 50))
             )
             return IncomingSuggestion(keep: item["keep"] as? String, suggestion: suggestion)
         }

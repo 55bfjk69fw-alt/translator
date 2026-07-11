@@ -58,8 +58,11 @@ The PTT bar at the bottom is replaced by an **assist bar**:
 
 - **Suggestion tray**: chips in a wrapping flow (no horizontal scrolling —
   every chip visible at a glance), each a short English gloss labeled with
-  the thread it targets ("→ Auntie"). Tray refreshes quietly as conversation
-  moves; carry-over keeps still-relevant chips in place across batches.
+  the thread it targets ("→ Auntie"). Unpinned chips are ordered by the
+  model's `fit` score — most natural thing to say right now first — and
+  every refresh re-scores carried-over chips too, so a chip drifts right
+  as the conversation moves past its moment and truncation drops the
+  least natural. Pins stay leftmost regardless.
 - **Tap a chip → cue card** (sheet on iPhone, popover/inline expansion on
   iPad):
 
@@ -211,7 +214,8 @@ One `chat/completions` call, `response_format: json_schema (strict)`:
       "hanzi":    "你们从重庆开了多久的车？",
       "pinyin":   "Nǐmen cóng Chóngqìng kāi le duō jiǔ de chē?",
       "register": "casual",
-      "reply_to": "Uncle Wang"
+      "reply_to": "Uncle Wang",
+      "fit":      85
     }
   ]
 }

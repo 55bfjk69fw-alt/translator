@@ -58,7 +58,12 @@ enum AssistPrompt {
         `pinyin` is the line's pronunciation aid (tone-marked pinyin for \
         Mandarin, romanization otherwise); `register` is "casual" or \
         "polite"; `reply_to` is the name of the person/thread it responds \
-        to, or "table" for a general contribution, or null.
+        to, or "table" for a general contribution, or null; `fit` is 0-100 — \
+        how natural and well-timed saying this line RIGHT NOW would be, \
+        relative to the other suggestions in this batch (it orders the tray, \
+        best first). Score `fit` fresh on every batch, including for kept \
+        suggestions — a line gets less natural as the conversation moves past \
+        its moment.
         """)
         return lines.joined(separator: "\n")
     }
@@ -122,8 +127,9 @@ enum AssistPrompt {
         fewer only if the moment is genuinely thin. Weight them toward the \
         thread the user is engaged with, but include an option or two from other \
         active threads. If a current tray suggestion is still among the best \
-        options, return it UNCHANGED with `keep` set to its id — otherwise \
-        `keep` is null. Never duplicate a pinned tray suggestion as a new entry.
+        options, return it UNCHANGED except for a freshly scored `fit`, with \
+        `keep` set to its id — otherwise `keep` is null. Never duplicate a \
+        pinned tray suggestion as a new entry.
         """)
         return parts.joined(separator: "\n\n")
     }
@@ -191,7 +197,7 @@ enum AssistPrompt {
                     "items": [
                         "type": "object",
                         "additionalProperties": false,
-                        "required": ["keep", "gloss", "meaning", "hanzi", "pinyin", "register", "reply_to"],
+                        "required": ["keep", "gloss", "meaning", "hanzi", "pinyin", "register", "reply_to", "fit"],
                         "properties": [
                             "keep": ["type": ["string", "null"]],
                             "gloss": ["type": "string"],
@@ -199,7 +205,8 @@ enum AssistPrompt {
                             "hanzi": ["type": "string"],
                             "pinyin": ["type": "string"],
                             "register": ["type": "string", "enum": ["casual", "polite"]],
-                            "reply_to": ["type": ["string", "null"]]
+                            "reply_to": ["type": ["string", "null"]],
+                            "fit": ["type": "integer"]
                         ]
                     ]
                 ]

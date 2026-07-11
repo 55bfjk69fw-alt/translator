@@ -8,11 +8,11 @@ struct ConversationView: View {
     @State private var cueCard: AssistEngine.Suggestion?
     @State private var explanation: AssistEngine.Explanation?
 
-    /// The privacy switch: with the co-pilot off, NO assist affordance may
+    /// The privacy switch: with the prompter off, NO assist affordance may
     /// exist — the composer, tray, and long-press actions all send the
     /// transcript window + bio to OpenAI (the engine also guards, but the
     /// UI must not offer what the setting promises is off).
-    @AppStorage(AppSettings.copilotEnabledKey) private var copilotEnabled = true
+    @AppStorage(AppSettings.prompterEnabledKey) private var prompterEnabled = true
 
     var body: some View {
         NavigationStack {
@@ -27,7 +27,7 @@ struct ConversationView: View {
                         .background(.red)
                 }
                 transcriptList
-                if copilotEnabled {
+                if prompterEnabled {
                     AssistBarView(
                         assist: model.assist,
                         composerText: $composerText,
@@ -119,10 +119,10 @@ struct ConversationView: View {
                         UtteranceBubble(
                             utterance: utterance,
                             lane: model.lane(for: utterance.laneID),
-                            onReplyTo: copilotEnabled && !isUser && utterance.isFinal
+                            onReplyTo: prompterEnabled && !isUser && utterance.isFinal
                                 ? { requestScopedReply(to: utterance) }
                                 : nil,
-                            onExplain: copilotEnabled && !isUser && !utterance.sourceText.isEmpty
+                            onExplain: prompterEnabled && !isUser && !utterance.sourceText.isEmpty
                                 ? { explain(utterance) }
                                 : nil
                         )
@@ -153,7 +153,7 @@ struct ConversationView: View {
         .padding(.top, 80)
     }
 
-    // MARK: - Co-pilot actions
+    // MARK: - Prompter actions
 
     private func composeDraft() {
         let draft = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -292,7 +292,7 @@ private struct AssistBarView: View {
             ProgressView()
                 .controlSize(.small)
         case .offline:
-            Label("co-pilot offline", systemImage: "exclamationmark.triangle.fill")
+            Label("prompter offline", systemImage: "exclamationmark.triangle.fill")
                 .font(.caption2)
                 .foregroundStyle(.orange)
         }

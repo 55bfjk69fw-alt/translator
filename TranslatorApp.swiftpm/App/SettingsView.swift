@@ -27,7 +27,7 @@ struct SettingsView: View {
     @AppStorage(AppSettings.outputLanguageKey) private var outputLanguage = "en"
     @AppStorage(AppSettings.keepScreenAwakeKey) private var keepScreenAwake = true
     @AppStorage(AppSettings.replyLanguageKey) private var replyLanguage = "zh"
-    @AppStorage(AppSettings.copilotEnabledKey) private var copilotEnabled = true
+    @AppStorage(AppSettings.prompterEnabledKey) private var prompterEnabled = true
     @AppStorage(AppSettings.autoSuggestKey) private var autoSuggest = true
     @AppStorage(AppSettings.userBioKey) private var userBio = ""
     @AppStorage(AppSettings.mandarinLevelKey) private var mandarinLevelRaw = AppSettings.MandarinLevel.elementary.rawValue
@@ -121,9 +121,9 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    Toggle("Enable co-pilot", isOn: $copilotEnabled)
+                    Toggle("Enable prompter", isOn: $prompterEnabled)
                     Toggle("Auto-suggest during conversation", isOn: $autoSuggest)
-                        .disabled(!copilotEnabled)
+                        .disabled(!prompterEnabled)
                     Picker("Reply language", selection: $replyLanguage) {
                         ForEach(Self.outputLanguages) { option in
                             Text(option.name).tag(option.code)
@@ -149,9 +149,9 @@ struct SettingsView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                 } header: {
-                    Text("Reply co-pilot")
+                    Text("Reply prompter")
                 } footer: {
-                    Text("The co-pilot watches the conversation and keeps 2–3 things you could say ready as cue cards — Chinese plus pinyin you read aloud yourself; nothing is ever played by the iPad. Your level hard-caps suggestion length and vocabulary so every card is actually sayable. The bio and the transcript are sent to OpenAI with your existing key — include nothing you wouldn't say at the table. Set the per-meal scene from the chip on the Conversation tab.")
+                    Text("The prompter watches the conversation and keeps 2–3 things you could say ready as cue cards — Chinese plus pinyin you read aloud yourself; nothing is ever played by the iPad. Your level hard-caps suggestion length and vocabulary so every card is actually sayable. The bio and the transcript are sent to OpenAI with your existing key — include nothing you wouldn't say at the table. Set the per-meal scene from the chip on the Conversation tab.")
                 }
 
                 Section {
@@ -218,14 +218,14 @@ struct SettingsView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .font(.footnote)
-                    TextField("Co-pilot endpoint", text: $assistEndpoint, prompt: Text(AppSettings.defaultAssistEndpoint))
+                    TextField("Prompter endpoint", text: $assistEndpoint, prompt: Text(AppSettings.defaultAssistEndpoint))
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .font(.footnote)
                 } header: {
                     Text("Advanced")
                 } footer: {
-                    Text("Only change these if OpenAI renames the model or moves an endpoint, or you route through a relay/proxy — the endpoint template covers the realtime translation sessions, the co-pilot endpoint covers the suggestion/compose calls (both must point at your relay for everything to work through it). %@ in the template is replaced by the model name. Applies on the next Start / next co-pilot request.")
+                    Text("Only change these if OpenAI renames the model or moves an endpoint, or you route through a relay/proxy — the endpoint template covers the realtime translation sessions, the prompter endpoint covers the suggestion/compose calls (both must point at your relay for everything to work through it). %@ in the template is replaced by the model name. Applies on the next Start / next prompter request.")
                 }
 
                 Section {

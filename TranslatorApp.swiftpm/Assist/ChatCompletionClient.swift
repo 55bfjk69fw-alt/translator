@@ -1,7 +1,7 @@
 import Foundation
 
 /// Minimal client for OpenAI `POST /v1/chat/completions` with structured
-/// output — the reply co-pilot's only network dependency. One request, one
+/// output — the reply prompter's only network dependency. One request, one
 /// strict-JSON-schema response, no streaming. Payloads are dictionaries
 /// (not Codable) for the same reason as SessionConfig: easy to tweak
 /// on-device from logged evidence.

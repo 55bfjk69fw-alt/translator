@@ -5,7 +5,7 @@ import SwiftUI
 import UIKit
 
 /// Central coordinator: audio session/engine, per-channel gating and
-/// resampling, one translation session per speaker, the reply co-pilot,
+/// resampling, one translation session per speaker, the reply prompter,
 /// and transcript/cost bookkeeping.
 ///
 /// Threading: @Published state is only touched on the main thread. The audio
@@ -47,7 +47,7 @@ final class AppModel: ObservableObject {
 
     let transcript: TranscriptStore
 
-    /// Reply co-pilot (docs/REPLY-FLOW.md). Its own ObservableObject so the
+    /// Reply prompter (docs/REPLY-FLOW.md). Its own ObservableObject so the
     /// assist bar re-renders on suggestion churn without re-rendering the
     /// transcript, mirroring the SignalAnalyzer pattern.
     let assist = AssistEngine()
@@ -111,7 +111,7 @@ final class AppModel: ObservableObject {
         transcript.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
-        // Co-pilot wiring: the engine reads the transcript through these
+        // Prompter wiring: the engine reads the transcript through these
         // closures and writes "I said this" turns back through them — it
         // never touches the audio pipeline (docs/REPLY-FLOW.md §3).
         assist.transcriptWindow = { [weak self] in
@@ -545,7 +545,7 @@ final class AppModel: ObservableObject {
             guard let self else { return }
             self.refreshCost()
             self.transcript.finalizeStale(timeout: 2.5)
-            // The co-pilot's ambient trigger keys off finalizations — tick
+            // The prompter's ambient trigger keys off finalizations — tick
             // it right after finalizeStale so a fresh utterance can fire a
             // suggestion request the same second (docs/REPLY-FLOW.md §3).
             // finalizedTotal is monotonic, so the trigger survives the

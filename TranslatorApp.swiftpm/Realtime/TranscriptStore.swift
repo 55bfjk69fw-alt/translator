@@ -47,7 +47,7 @@ final class TranscriptStore: ObservableObject {
     @Published private(set) var utterances: [Utterance] = []
 
     /// Monotonic count of utterances EVER finalized (never decremented by
-    /// trim/clear). The co-pilot's ambient trigger diffs this — a live
+    /// trim/clear). The prompter's ambient trigger diffs this — a live
     /// `filter(\.isFinal).count` plateaus at the trim cap and would silence
     /// the trigger for the rest of a long conversation.
     private(set) var finalizedTotal = 0

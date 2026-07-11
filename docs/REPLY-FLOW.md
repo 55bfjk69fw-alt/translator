@@ -1,7 +1,7 @@
-# Reply flow — push-to-talk teardown + reply co-pilot
+# Reply flow — push-to-talk teardown + reply prompter
 
 > **Status (2026-07-11):** P1–P3 implemented (`Assist/`, ConversationView
-> assist bar, Settings § Reply co-pilot, PTT removed). P4 awaits the
+> assist bar, Settings § Reply prompter, PTT removed). P4 awaits the
 > dual-input probe verdict.
 
 Design for replacing the push-to-talk return channel with a silent,
@@ -23,13 +23,13 @@ Goals
 - Tear out push-to-talk entirely (mode, UI, audio-session dance).
 - A composer: type English → cue card with 汉字 + tone-marked pinyin + literal
   back-translation, sized to read aloud.
-- A co-pilot: an agentic loop that watches the transcript and keeps 2–3
+- A prompter: an agentic loop that watches the transcript and keeps 2–3
   candidate contributions ready, personalized by a user bio and a per-session
   context line, calibrated to the user's Mandarin level.
 - Thread-scoped replies: pick a specific utterance and get suggestions for
   *that* exchange (the chaos-of-multiple-conversations mitigation).
 - "I said this": one tap records a spoken cue card into the transcript as the
-  user's turn — ground truth for the co-pilot without any microphone on the
+  user's turn — ground truth for the prompter without any microphone on the
   user.
 
 Non-goals
@@ -90,11 +90,11 @@ a right-hand column on iPad landscape is a later polish item, not structure.
 
 ### Settings
 
-New **"About you (reply co-pilot)"** section:
+New **"About you (reply prompter)"** section:
 
 | Setting | Type | Default | Notes |
 |---|---|---|---|
-| Enable co-pilot | toggle | on | Off = composer still works (compose calls only) |
+| Enable prompter | toggle | on | Off = composer still works (compose calls only) |
 | Bio | multi-line text | "" | Who you are, relationship to the group, safe topics |
 | Mandarin level | picker | elementary | beginner / elementary / intermediate / advanced — caps sentence length & vocabulary in the prompt |
 | Tone | picker | auto | casual / polite / auto (model reads the room) |
@@ -165,7 +165,7 @@ arrive.
   source text) — noted here, not built until real use demands it.
 - **Scoped/compose/explain requests** fire immediately and pre-empt the
   ambient loop (its next batch just comes later).
-- **Failure**: log to Diagnostics, show a subtle "co-pilot offline" chip in
+- **Failure**: log to Diagnostics, show a subtle "prompter offline" chip in
   the tray, retry the *next* trigger (no retry storms). Errors never block
   the transcript or listening pipeline.
 
@@ -253,7 +253,7 @@ Removed outright:
 - `TranscriptStore`: `translatedAudio`, `appendTranslatedAudio`, the `.audio`
   stream case, `maxStoredAudioUtterances`.
 - `AppSettings`/`SettingsView`: `autoPlayChinese` + its section; the
-  "My speech translates to" picker moves under the co-pilot section as
+  "My speech translates to" picker moves under the prompter section as
   "Reply language" (`pttOutputLanguage` key renamed with migration).
 - README: PTT hardware notes, usage step 4, HFP troubleshooting entry
   (rewritten — HFP can now only be entered by the probe), roadmap item on
@@ -284,7 +284,7 @@ threads active in the last 2 minutes first).
 ## 6. Privacy note
 
 The transcript already transits OpenAI via the realtime sessions; the
-co-pilot sends the same content plus the bio to the same vendor under the
+prompter sends the same content plus the bio to the same vendor under the
 same key. The bio should carry nothing the user wouldn't say at the table —
 the Settings footer says exactly that.
 
@@ -293,7 +293,7 @@ the Settings footer says exactly that.
 - **P1 — teardown + composer**: remove PTT (§4), assist bar with composer
   only, `ChatCompletionClient`, cue cards, "I said this", bio/level/tone
   settings. Independently shippable; already a strictly better reply flow.
-- **P2 — ambient co-pilot**: `AssistEngine` loop, suggestion tray, scene
+- **P2 — ambient prompter**: `AssistEngine` loop, suggestion tray, scene
   chip, "suggest now".
 - **P3 — scoped actions**: long-press *Reply to this* / *Explain this*.
 - **P4 — probe-contingent personal lane** (§8).
@@ -305,7 +305,7 @@ run beside USB, add a **personal lane**: AirPods mic → resampler → one more
 translation session, transcribing the user's spoken Mandarin onto the user
 lane like any speaker. It *supplements* "I said this" (which stays the
 authoritative record of cue-card turns — learner-accented Mandarin
-transcribes unreliably) and gives the co-pilot the user's off-script turns
+transcribes unreliably) and gives the prompter the user's off-script turns
 too. `AssistEngine` reads the transcript only, so it is indifferent to where
 user turns come from — this phase bolts on without touching P1–P3 code.
 

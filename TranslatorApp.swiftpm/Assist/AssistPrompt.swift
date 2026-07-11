@@ -1,7 +1,7 @@
 import Foundation
 
 /// Builds the system/user messages and strict JSON schemas for the four
-/// co-pilot tasks: ambient suggest, scoped reply, compose, explain.
+/// prompter tasks: ambient suggest, scoped reply, compose, explain.
 /// Everything the model needs to know lives in the prompt — there is no
 /// client-side thread tracking (docs/REPLY-FLOW.md §5).
 enum AssistPrompt {
@@ -24,7 +24,7 @@ enum AssistPrompt {
             : "the \(language) text with a Latin-letter pronunciation aid"
         var lines: [String] = []
         lines.append("""
-        You are a real-time conversation co-pilot for \(name), an English speaker \
+        You are a real-time conversation prompter for \(name), an English speaker \
         at a \(language)-speaking table. Everything you suggest will be READ ALOUD \
         BY \(name) THEMSELVES from a cue card — \(pronunciationAid) — \
         never played by a machine. Suggestions must therefore be natural spoken \

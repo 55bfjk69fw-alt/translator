@@ -5,7 +5,7 @@ Up to four speakers each wear a DJI Mic 3 transmitter; the DJI receiver plugs in
 the iPad over USB-C; each speaker's channel is streamed to its own OpenAI
 `gpt-realtime-translate` session; translated English audio plays into your AirPods,
 and a per-speaker Chinese + English transcript scrolls on screen. To reply, the
-**reply co-pilot** watches the conversation and keeps 2–3 things you could say
+**reply prompter** watches the conversation and keeps 2–3 things you could say
 ready as cue cards — Chinese with tone-marked pinyin that *you read aloud
 yourself* (nothing is ever played by the iPad) — and a composer turns anything
 you type into the same kind of card. See `docs/REPLY-FLOW.md` for the design.
@@ -102,10 +102,10 @@ translating the table.
    that exchange (**Reply to this**) or a nuance breakdown (**Explain this**).
    Long-press a chip to **pin** it for the right lull. Set the per-meal scene
    line (who/where/what) from the chip above the tray, and your bio + Mandarin
-   level in Settings → Reply co-pilot — both feed the suggestions.
+   level in Settings → Reply prompter — both feed the suggestions.
 5. The status bar shows per-speaker levels, gate state, session health, and a
    running cost estimate (4 sessions ≈ $8/hour ceiling at $0.034/session-minute;
-   the co-pilot's text calls add pennies).
+   the prompter's text calls add pennies).
 
 Keep the app in the foreground: Swift Playgrounds apps can't run background audio.
 The app disables the screen-idle timer while a conversation is running.

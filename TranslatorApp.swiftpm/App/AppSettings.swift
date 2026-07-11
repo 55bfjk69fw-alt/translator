@@ -26,9 +26,9 @@ enum AppSettings {
     static let noiseReductionKey = "noiseReduction"
     static let keepScreenAwakeKey = "keepScreenAwake"
 
-    // Reply co-pilot (docs/REPLY-FLOW.md)
-    static let copilotEnabledKey = "copilotEnabled"
-    static let autoSuggestKey = "copilotAutoSuggest"
+    // Reply prompter (docs/REPLY-FLOW.md)
+    static let prompterEnabledKey = "prompterEnabled"
+    static let autoSuggestKey = "prompterAutoSuggest"
     static let userBioKey = "userBio"
     static let mandarinLevelKey = "mandarinLevel"
     static let suggestionToneKey = "suggestionTone"
@@ -276,7 +276,7 @@ enum AppSettings {
         return legacy.isEmpty ? "zh" : legacy
     }
 
-    // MARK: - Reply co-pilot
+    // MARK: - Reply prompter
 
     /// The user's self-assessed level, which HARD-CAPS suggestion length and
     /// vocabulary in the prompt — a suggestion the user can't pronounce
@@ -300,10 +300,10 @@ enum AppSettings {
         }
     }
 
-    static var copilotEnabled: Bool {
-        UserDefaults.standard.object(forKey: copilotEnabledKey) == nil
+    static var prompterEnabled: Bool {
+        UserDefaults.standard.object(forKey: prompterEnabledKey) == nil
             ? true
-            : UserDefaults.standard.bool(forKey: copilotEnabledKey)
+            : UserDefaults.standard.bool(forKey: prompterEnabledKey)
     }
 
     static var autoSuggest: Bool {
@@ -333,9 +333,9 @@ enum AppSettings {
 
     static let defaultAssistEndpoint = "https://api.openai.com/v1/chat/completions"
 
-    /// Chat-completions endpoint for the co-pilot — the same escape hatch
+    /// Chat-completions endpoint for the prompter — the same escape hatch
     /// the realtime path gets via `endpointTemplate` (relay/proxy users
-    /// need BOTH paths reroutable or the co-pilot is dead where the
+    /// need BOTH paths reroutable or the prompter is dead where the
     /// translator works).
     static var assistEndpoint: URL {
         let value = UserDefaults.standard.string(forKey: assistEndpointKey) ?? ""

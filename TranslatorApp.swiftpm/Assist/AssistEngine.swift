@@ -1,7 +1,7 @@
 import Foundation
 import Combine
 
-/// The reply co-pilot (docs/REPLY-FLOW.md): watches the transcript and keeps
+/// The reply prompter (docs/REPLY-FLOW.md): watches the transcript and keeps
 /// 2–3 sayable suggestions ready, turns typed drafts into cue cards, answers
 /// scoped "reply to this" and "explain this" requests, and records what the
 /// user actually said aloud. It only ever reads the transcript — it is
@@ -124,7 +124,7 @@ final class AssistEngine: ObservableObject {
     /// Called at 1 Hz right after finalizeStale. Fires the ambient loop
     /// when new utterances have finalized.
     func transcriptTick(finalizedCount: Int) {
-        guard conversationActive, AppSettings.copilotEnabled, AppSettings.autoSuggest else {
+        guard conversationActive, AppSettings.prompterEnabled, AppSettings.autoSuggest else {
             lastFinalizedCount = finalizedCount
             return
         }
@@ -138,14 +138,14 @@ final class AssistEngine: ObservableObject {
     /// The "suggest now" button: bypasses the rate limit and supersedes any
     /// in-flight or scheduled ambient batch.
     func requestNow() {
-        guard AppSettings.copilotEnabled else { return }
+        guard AppSettings.prompterEnabled else { return }
         supersedeAmbient()
         fireAmbient(generation: generation)
     }
 
     /// Long-press "reply to this": suggestions scoped to one utterance.
     func requestScoped(speaker: String, source: String, translation: String) {
-        guard AppSettings.copilotEnabled else { return }
+        guard AppSettings.prompterEnabled else { return }
         guard let apiKey = apiKeyOrOffline() else { return }
         supersedeAmbient()
         let gen = generation
@@ -181,7 +181,7 @@ final class AssistEngine: ObservableObject {
     /// ambient loop — it produces a cue card, never touches the tray.
     func compose(draft: String) async -> Suggestion? {
         let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, AppSettings.copilotEnabled else { return nil }
+        guard !trimmed.isEmpty, AppSettings.prompterEnabled else { return nil }
         guard let apiKey = KeychainStore.loadAPIKey(), !apiKey.isEmpty else {
             await MainActor.run { self.status = .offline("Add your OpenAI API key in Settings") }
             return nil
@@ -206,7 +206,7 @@ final class AssistEngine: ObservableObject {
 
     /// Long-press "explain this": nuance + key phrases, rendered only.
     func explain(speaker: String, source: String, translation: String) async -> Explanation? {
-        guard AppSettings.copilotEnabled else { return nil }
+        guard AppSettings.prompterEnabled else { return nil }
         guard let apiKey = KeychainStore.loadAPIKey(), !apiKey.isEmpty else {
             await MainActor.run { self.status = .offline("Add your OpenAI API key in Settings") }
             return nil
@@ -277,7 +277,7 @@ final class AssistEngine: ObservableObject {
                 self.boundaryFireScheduled = false
                 // Re-check everything that can change during the wait — a
                 // superseded/disabled/stopped trigger must not fire.
-                guard self.conversationActive, AppSettings.copilotEnabled, AppSettings.autoSuggest else { return }
+                guard self.conversationActive, AppSettings.prompterEnabled, AppSettings.autoSuggest else { return }
                 if self.inFlight {
                     self.pendingAmbient = true
                 } else {

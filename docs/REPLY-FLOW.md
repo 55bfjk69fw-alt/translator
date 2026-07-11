@@ -1,0 +1,270 @@
+# Reply flow — push-to-talk teardown + reply co-pilot
+
+Design for replacing the push-to-talk return channel with a silent,
+suggestion-driven reply flow. The user hears the table in English through
+AirPods (unchanged), and **speaks all replies aloud in Mandarin themselves**,
+reading from cue cards the app composes. No audio playback of replies, no TTS,
+no input-route switching — the reply path never touches the audio pipeline.
+
+Field-tested context this design responds to (big-group dinner, 2026-07):
+push-to-talk went unused — holding a button, going deaf on the table for the
+duration, and playing a robot voice were each individually disqualifying. The
+user speaks some Mandarin and reads pinyin comfortably; what was missing was
+*what to say*, fast, in a chaotic multi-thread conversation.
+
+## 1. Goals / non-goals
+
+Goals
+
+- Tear out push-to-talk entirely (mode, UI, audio-session dance).
+- A composer: type English → cue card with 汉字 + tone-marked pinyin + literal
+  back-translation, sized to read aloud.
+- A co-pilot: an agentic loop that watches the transcript and keeps 2–3
+  candidate contributions ready, personalized by a user bio and a per-session
+  context line, calibrated to the user's Mandarin level.
+- Thread-scoped replies: pick a specific utterance and get suggestions for
+  *that* exchange (the chaos-of-multiple-conversations mitigation).
+- "I said this": one tap records a spoken cue card into the transcript as the
+  user's turn — ground truth for the co-pilot without any microphone on the
+  user.
+
+Non-goals
+
+- No audio playback of the user's replies (owner decision: their own voice,
+  always).
+- No AirPods-mic capture in this phase — pending the dual-input probe result;
+  the design works identically with or without it (§8).
+- No changes to the listening pipeline (gate, lanes, sessions).
+
+## 2. UX
+
+### Conversation tab
+
+The PTT bar at the bottom is replaced by an **assist bar**:
+
+```
+┌────────────────────────────────────────────────────┐
+│ transcript (unchanged)                             │
+├────────────────────────────────────────────────────┤
+│ [scene: 晚饭 w/ wife's family ✎]  [suggest now ↻]  │  ← context row
+│ ‹ chip: Ask how long the drive was › ‹ chip: … ›   │  ← suggestion tray
+│ [ compose a reply…                          ] [→]  │  ← composer
+└────────────────────────────────────────────────────┘
+```
+
+- **Suggestion tray**: horizontally scrolling chips, each a short English
+  gloss with a colored dot when it targets a specific thread ("→ Auntie").
+  Tray refreshes quietly as conversation moves; chips never reorder under a
+  finger (new batches replace the tray only when it isn't being touched).
+- **Tap a chip → cue card** (sheet on iPhone, popover/inline expansion on
+  iPad):
+
+  ```
+  你们开了多久的车？             ← .largeTitle, the thing to read
+  Nǐmen kāi le duō jiǔ de chē?   ← .title2, teal, the pronunciation aid
+  "How long did you all drive?"   ← gloss, secondary
+  casual · replies to Uncle Wang  ← register + target
+  [ I said this ]  [ Refine… ]    ← actions
+  ```
+
+  **I said this** appends the utterance to the transcript on the user lane
+  (final immediately) and dismisses. **Refine** drops the gloss into the
+  composer for editing. Dismissing does nothing — unspoken cards never
+  pollute the transcript.
+- **Composer**: free text (English, or mixed — the model handles it) →
+  same cue card. This is the escape hatch when no suggestion fits.
+- **Long-press any transcript bubble** → context menu:
+  - *Reply to this* — scoped suggestion request for that utterance/thread.
+  - *Explain this* — idiom/nuance breakdown of that bubble (same client, a
+    different task prompt; rendered as a card, never enters the transcript).
+- **Scene chip**: the per-session context one-liner ("dinner in Chengdu with
+  the in-laws; we just got back from Jiuzhaigou"), editable in place. This is
+  deliberately in the Conversation tab, not Settings — it changes every meal.
+
+Suggestion tray placement is the same in portrait and landscape for phase 1;
+a right-hand column on iPad landscape is a later polish item, not structure.
+
+### Settings
+
+New **"About you (reply co-pilot)"** section:
+
+| Setting | Type | Default | Notes |
+|---|---|---|---|
+| Enable co-pilot | toggle | on | Off = composer still works (compose calls only) |
+| Bio | multi-line text | "" | Who you are, relationship to the group, safe topics |
+| Mandarin level | picker | elementary | beginner / elementary / intermediate / advanced — caps sentence length & vocabulary in the prompt |
+| Tone | picker | auto | casual / polite / auto (model reads the room) |
+| Auto-suggest | toggle | on | Off = tray fills only via "suggest now" / scoped requests |
+| Assist model | text | `gpt-4o-mini` | Same escape-hatch pattern as the realtime model field |
+
+`userName` already exists and is reused. Reply language stays a setting
+(`pttOutputLanguage` renamed → `replyLanguage`, default `zh`) so the flow
+generalizes beyond Mandarin.
+
+## 3. Architecture
+
+Three new files, no changes to the audio stack:
+
+```
+Assist/AssistEngine.swift        — ObservableObject: triggers, debounce,
+                                   in-flight management, suggestion state
+Assist/ChatCompletionClient.swift — minimal URLSession client for
+                                   POST /v1/chat/completions, structured output
+Assist/AssistPrompt.swift        — prompt + JSON-schema builders for the
+                                   four tasks: suggest / scoped-reply /
+                                   compose / explain
+```
+
+Integration points in existing code:
+
+- `AppModel`'s 1 Hz timer already calls `transcript.finalizeStale` — after it,
+  notify `AssistEngine` of newly-finalized utterances (engine holds a weak
+  transcript reference and a high-water mark; no TranscriptStore changes for
+  reads).
+- `TranscriptStore` gains one small API:
+  `addUserUtterance(source:gloss:)` — appends a final utterance on
+  `SpeakerLane.userLaneID` (hanzi as `sourceText`, gloss as `translatedText`)
+  so user turns render exactly like everyone else's bubbles, pinyin included,
+  via the existing `UtteranceBubble`.
+- `ConversationView` swaps `pttBar` for the assist bar + cue-card
+  presentation.
+- API key comes from the existing `KeychainStore`; no second credential.
+
+### Trigger logic (the "agentic loop")
+
+- **Ambient trigger**: fires 2.5 s after the most recent finalization
+  (coalescing — a new finalization during the window restarts it), only if
+  auto-suggest is on and there is new content since the last batch.
+- **One request in flight, ever.** A newer trigger while in flight marks the
+  response stale; stale responses are dropped (generation counter), then the
+  trigger re-arms. No queues.
+- **Scoped/compose/explain requests** fire immediately and pre-empt the
+  ambient loop (its next batch just comes later).
+- **Failure**: log to Diagnostics, show a subtle "co-pilot offline" chip in
+  the tray, retry the *next* trigger (no retry storms). Errors never block
+  the transcript or listening pipeline.
+
+### Request shape
+
+One `chat/completions` call, `response_format: json_schema (strict)`:
+
+```json
+{
+  "suggestions": [
+    {
+      "gloss":    "Ask how long the drive from Chongqing was",
+      "hanzi":    "你们从重庆开了多久的车？",
+      "pinyin":   "Nǐmen cóng Chóngqìng kāi le duō jiǔ de chē?",
+      "register": "casual",
+      "reply_to": "Uncle Wang"
+    }
+  ]
+}
+```
+
+System prompt contract (assembled by `AssistPrompt`):
+
+- Persona: the user's name, bio, Mandarin level, tone preference, scene line.
+- Level calibration: hard caps per level (beginner ≤ 8 chars & top-1k vocab;
+  elementary ≤ 14 chars; …) — the suggestions must be *sayable*, not elegant.
+- Task: read the recent conversation (last ~20 finalized utterances, speaker
+  names attached, user turns marked as such), identify the active threads,
+  and propose 2–3 contributions the user could *say out loud right now* —
+  a mix of "join the main thread" and "react to what was just said".
+  `reply_to` names the speaker/thread each targets, or `"table"`.
+- Pinyin must be tone-marked. (Fallback: if the model omits it, derive via
+  the existing ICU `String.pinyin` transform.)
+
+Compose variant: same contract, input is the user's draft, output is exactly
+one suggestion. Explain variant: input is one utterance, output is
+`{explanation, key_phrases: [{hanzi, pinyin, meaning}]}` — rendered, never
+stored.
+
+### Cost & model
+
+~1.5k tokens in / ~250 out per call, one call per finalized burst of speech.
+At `gpt-4o-mini` pricing that is under $0.25/hour of continuous conversation —
+noise against the ~$10/hour realtime sessions. Token usage per call is logged
+to Diagnostics (no UI meter for now). The model field is a Settings
+escape-hatch, same philosophy as the realtime model/endpoint fields.
+
+## 4. Push-to-talk teardown
+
+Removed outright:
+
+- `AppModel`: `Mode.pushToTalk`, `pttPressed/pttReleased`, `pttEngaged` +
+  lock, `pttLevel`, the PTT branch in `installInputHandler`,
+  `processPTTBuffer`, the user-lane branch of `closeIdleSessions`,
+  `handleChineseAudio`, `playChineseOverSpeaker`, `playUtteranceAudio`,
+  `speakerOverrideActive`, `zhPlaybackLane` (player count drops to 4).
+- `AudioSessionController.configureForPushToTalk`, `overrideToSpeaker`.
+- `ConversationView`: `pttBar`, `PushToTalkButton`, play buttons on bubbles.
+- `TranscriptStore`: `translatedAudio`, `appendTranslatedAudio`, the `.audio`
+  stream case, `maxStoredAudioUtterances`.
+- `AppSettings`/`SettingsView`: `autoPlayChinese` + its section; the
+  "My speech translates to" picker moves under the co-pilot section as
+  "Reply language" (`pttOutputLanguage` key renamed with migration).
+- README: PTT hardware notes, usage step 4, HFP troubleshooting entry
+  (rewritten — HFP can now only be entered by the probe), roadmap item on
+  PTT recording quality (superseded by the probe).
+
+Kept deliberately:
+
+- `SpeakerLane.userLaneID` and the user lane — now fed by "I said this"
+  (and, probe-permitting, the personal capture lane later).
+- The indigo user-bubble styling and pinyin rendering — cue cards and user
+  turns reuse it.
+
+## 5. Threading & chaos handling
+
+Two mechanisms, both cheap:
+
+1. The ambient prompt asks the model to cluster recent utterances into
+   threads and label every suggestion with `reply_to`. The tray shows the
+   label; the user picks the thread by picking the chip.
+2. Long-press → *Reply to this* pins the next batch to one utterance. This
+   turns table chaos from a problem into a targeting gesture.
+
+No client-side diarization/topic tracking — the transcript window plus the
+model is the thread tracker. If context windows get tight at 400 utterances,
+the serializer truncates by *thread recency*, not raw count (utterances from
+threads active in the last 2 minutes first).
+
+## 6. Privacy note
+
+The transcript already transits OpenAI via the realtime sessions; the
+co-pilot sends the same content plus the bio to the same vendor under the
+same key. The bio should carry nothing the user wouldn't say at the table —
+the Settings footer says exactly that.
+
+## 7. Phasing
+
+- **P1 — teardown + composer**: remove PTT (§4), assist bar with composer
+  only, `ChatCompletionClient`, cue cards, "I said this", bio/level/tone
+  settings. Independently shippable; already a strictly better reply flow.
+- **P2 — ambient co-pilot**: `AssistEngine` loop, suggestion tray, scene
+  chip, "suggest now".
+- **P3 — scoped actions**: long-press *Reply to this* / *Explain this*.
+- **P4 — probe-contingent personal lane** (§8).
+
+## 8. Dual-input probe contingency
+
+If the Diagnostics probe (see RESEARCH.md §2) proves AirPods-mic capture can
+run beside USB, add a **personal lane**: AirPods mic → resampler → one more
+translation session, transcribing the user's spoken Mandarin onto the user
+lane like any speaker. It *supplements* "I said this" (which stays the
+authoritative record of cue-card turns — learner-accented Mandarin
+transcribes unreliably) and gives the co-pilot the user's off-script turns
+too. `AssistEngine` reads the transcript only, so it is indifferent to where
+user turns come from — this phase bolts on without touching P1–P3 code.
+
+If the probe fails, P4 is simply dropped; nothing else changes.
+
+## 9. Open questions (owner input wanted)
+
+1. Should "I said this" also be offered directly on a chip (skip the cue
+   card) once a suggestion has been used a few times? Default: no — the card
+   is the pronunciation aid, skipping it invites misreads.
+2. Tray refresh cadence: replace-on-new-batch (default) vs. append-and-age.
+3. Does *Explain this* deserve a hanzi-by-hanzi gloss mode for vocabulary
+   mining, or is that scope creep for a dinner-table tool?

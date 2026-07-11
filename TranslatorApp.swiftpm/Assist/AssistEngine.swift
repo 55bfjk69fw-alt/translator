@@ -72,13 +72,27 @@ final class AssistEngine: ObservableObject {
     private var conversationActive = false
     private var lastFinalizedCount = 0
     private var lastRequestAt = Date.distantPast
-    private var boundaryFireScheduled = false
-    private var inFlight = false
     private var pendingAmbient = false
     /// Bumped by manual/scoped requests and conversation end — an ambient
     /// response from an older generation is dropped; same-generation late
     /// responses are applied even if newer speech has finalized.
     private var generation = 0
+    /// Identifies the newest fired request. A completion only clears the
+    /// in-flight slot when it belongs to this request — otherwise a
+    /// superseded response would free the slot while its successor is
+    /// still airborne and let a third request overlap it.
+    private var requestCounter = 0
+    private var activeRequestID: Int?
+    private var inFlight: Bool { activeRequestID != nil }
+    /// Invalidates any scheduled boundary fire; bumped by manual/scoped
+    /// requests and conversation end so a queued ambient trigger can't
+    /// fire after being superseded (or after settings/conversation change).
+    private var boundaryToken = 0
+    private var boundaryFireScheduled = false
+    /// Chip ids consumed via "I said this" while a request was in flight —
+    /// a keep referencing one is a chip the user already said, not a new
+    /// suggestion. Cleared once the in-flight response is merged.
+    private var consumedChipIDs: Set<String> = []
     private var lastEngagedThread: String?
     private var chipCounter = 0
     private let minRequestInterval: TimeInterval = 5
@@ -91,12 +105,18 @@ final class AssistEngine: ObservableObject {
         lastEngagedThread = nil
         suggestions = []
         pendingAmbient = false
+        boundaryToken += 1
+        boundaryFireScheduled = false
+        activeRequestID = nil
+        consumedChipIDs.removeAll()
         status = .idle
     }
 
     func conversationEnded() {
         conversationActive = false
         pendingAmbient = false
+        boundaryToken += 1
+        boundaryFireScheduled = false
         generation += 1
         status = .idle
     }
@@ -116,21 +136,21 @@ final class AssistEngine: ObservableObject {
     // MARK: - Manual requests
 
     /// The "suggest now" button: bypasses the rate limit and supersedes any
-    /// in-flight ambient batch.
+    /// in-flight or scheduled ambient batch.
     func requestNow() {
         guard AppSettings.copilotEnabled else { return }
-        generation += 1
+        supersedeAmbient()
         fireAmbient(generation: generation)
     }
 
     /// Long-press "reply to this": suggestions scoped to one utterance.
     func requestScoped(speaker: String, source: String, translation: String) {
+        guard AppSettings.copilotEnabled else { return }
         guard let apiKey = apiKeyOrOffline() else { return }
-        generation += 1
+        supersedeAmbient()
         let gen = generation
+        let requestID = beginRequest()
         lastEngagedThread = speaker
-        inFlight = true
-        lastRequestAt = Date()
         status = .loading
         let window = transcriptWindow?() ?? []
         let client = ChatCompletionClient(apiKey: apiKey, model: AppSettings.assistModel)
@@ -139,18 +159,29 @@ final class AssistEngine: ObservableObject {
         Task { [weak self] in
             do {
                 let response = try await client.complete(system: system, user: message, schemaName: "suggestions", schema: AssistPrompt.suggestionsSchema(maxItems: 3))
-                await MainActor.run { self?.applyScoped(response, generation: gen) }
+                await MainActor.run { self?.applyScoped(response, generation: gen, requestID: requestID) }
             } catch {
-                await MainActor.run { self?.requestFailed(error) }
+                await MainActor.run { self?.requestFailed(error, requestID: requestID) }
             }
         }
+    }
+
+    /// A manual request pre-empts the ambient loop: drop any queued demand
+    /// and invalidate any scheduled boundary fire — generation bumps alone
+    /// only drop *responses*, not pending *triggers* (which would otherwise
+    /// fire with the new generation and clobber the manual result).
+    private func supersedeAmbient() {
+        generation += 1
+        pendingAmbient = false
+        boundaryToken += 1
+        boundaryFireScheduled = false
     }
 
     /// Composer: one sayable line from the user's draft. Independent of the
     /// ambient loop — it produces a cue card, never touches the tray.
     func compose(draft: String) async -> Suggestion? {
         let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
+        guard !trimmed.isEmpty, AppSettings.copilotEnabled else { return nil }
         guard let apiKey = KeychainStore.loadAPIKey(), !apiKey.isEmpty else {
             await MainActor.run { self.status = .offline("Add your OpenAI API key in Settings") }
             return nil
@@ -164,6 +195,7 @@ final class AssistEngine: ObservableObject {
             let response = try await client.complete(system: system, user: message, schemaName: "suggestions", schema: AssistPrompt.suggestionsSchema(maxItems: 1))
             return await MainActor.run { () -> Suggestion? in
                 self.logUsage(response.usage)
+                self.clearOfflineStatus()
                 return Self.parseSuggestions(response.content, nextID: { self.nextChipID() }).first?.suggestion
             }
         } catch {
@@ -174,6 +206,7 @@ final class AssistEngine: ObservableObject {
 
     /// Long-press "explain this": nuance + key phrases, rendered only.
     func explain(speaker: String, source: String, translation: String) async -> Explanation? {
+        guard AppSettings.copilotEnabled else { return nil }
         guard let apiKey = KeychainStore.loadAPIKey(), !apiKey.isEmpty else {
             await MainActor.run { self.status = .offline("Add your OpenAI API key in Settings") }
             return nil
@@ -183,7 +216,10 @@ final class AssistEngine: ObservableObject {
         let message = AssistPrompt.explainUserMessage(speaker: speaker, source: source, translation: translation)
         do {
             let response = try await client.complete(system: system, user: message, schemaName: "explanation", schema: AssistPrompt.explanationSchema())
-            await MainActor.run { self.logUsage(response.usage) }
+            await MainActor.run {
+                self.logUsage(response.usage)
+                self.clearOfflineStatus()
+            }
             guard let text = response.content["explanation"] as? String else { return nil }
             let phrases = (response.content["key_phrases"] as? [[String: Any]] ?? []).compactMap { raw -> KeyPhrase? in
                 guard let hanzi = raw["hanzi"] as? String,
@@ -201,11 +237,16 @@ final class AssistEngine: ObservableObject {
     // MARK: - Tray actions
 
     /// The user read this card aloud: record it, remember the thread, and
-    /// consume the chip (pinned or not — said means done).
+    /// consume the chip (pinned or not — said means done). The id is also
+    /// remembered so an in-flight response that "keeps" this chip can't
+    /// resurrect the line the user just said.
     func markSaid(_ suggestion: Suggestion) {
         onUserSaid?(suggestion)
         if let thread = suggestion.replyTo { lastEngagedThread = thread }
-        suggestions.removeAll { $0.id == suggestion.id }
+        if suggestions.contains(where: { $0.id == suggestion.id }) {
+            consumedChipIDs.insert(suggestion.id)
+            suggestions.removeAll { $0.id == suggestion.id }
+        }
         Log.info("[assist] said: \(suggestion.hanzi)")
     }
 
@@ -230,10 +271,13 @@ final class AssistEngine: ObservableObject {
             fireAmbient(generation: generation)
         } else if !boundaryFireScheduled {
             boundaryFireScheduled = true
+            let token = boundaryToken
             DispatchQueue.main.asyncAfter(deadline: .now() + (minRequestInterval - sinceLast)) { [weak self] in
-                guard let self else { return }
+                guard let self, token == self.boundaryToken else { return }
                 self.boundaryFireScheduled = false
-                guard self.conversationActive else { return }
+                // Re-check everything that can change during the wait — a
+                // superseded/disabled/stopped trigger must not fire.
+                guard self.conversationActive, AppSettings.copilotEnabled, AppSettings.autoSuggest else { return }
                 if self.inFlight {
                     self.pendingAmbient = true
                 } else {
@@ -243,12 +287,27 @@ final class AssistEngine: ObservableObject {
         }
     }
 
+    /// Claim the in-flight slot for a new request. The returned id must be
+    /// handed to completeRequest by whichever completion path runs.
+    private func beginRequest() -> Int {
+        requestCounter += 1
+        activeRequestID = requestCounter
+        lastRequestAt = Date()
+        return requestCounter
+    }
+
+    /// Only the NEWEST request may free the slot — a superseded response
+    /// arriving late must not mark its successor's flight as finished.
+    private func completeRequest(_ requestID: Int) {
+        guard activeRequestID == requestID else { return }
+        activeRequestID = nil
+    }
+
     private func fireAmbient(generation gen: Int) {
         guard let apiKey = apiKeyOrOffline() else { return }
         let window = transcriptWindow?() ?? []
         guard !window.isEmpty else { return }
-        inFlight = true
-        lastRequestAt = Date()
+        let requestID = beginRequest()
         status = .loading
         let client = ChatCompletionClient(apiKey: apiKey, model: AppSettings.assistModel)
         let system = AssistPrompt.systemPrompt()
@@ -256,15 +315,15 @@ final class AssistEngine: ObservableObject {
         Task { [weak self] in
             do {
                 let response = try await client.complete(system: system, user: message, schemaName: "suggestions", schema: AssistPrompt.suggestionsSchema(maxItems: 3))
-                await MainActor.run { self?.applyAmbient(response, generation: gen) }
+                await MainActor.run { self?.applyAmbient(response, generation: gen, requestID: requestID) }
             } catch {
-                await MainActor.run { self?.requestFailed(error) }
+                await MainActor.run { self?.requestFailed(error, requestID: requestID) }
             }
         }
     }
 
-    private func applyAmbient(_ response: ChatCompletionClient.Response, generation gen: Int) {
-        inFlight = false
+    private func applyAmbient(_ response: ChatCompletionClient.Response, generation gen: Int, requestID: Int) {
+        completeRequest(requestID)
         logUsage(response.usage)
         guard gen == generation, conversationActive else {
             drainPending()
@@ -274,7 +333,9 @@ final class AssistEngine: ObservableObject {
         // Carry-over merge (design §"Tray stability under chaos"): pinned
         // chips always survive; unpinned chips survive when the model
         // returned them with keep=<id>; genuinely new entries follow. A keep
-        // pointing at an id we no longer have counts as new.
+        // pointing at a chip the user said while this request was in flight
+        // is dropped (saying it consumed it); a keep pointing at an id we
+        // never had counts as new.
         var next: [Suggestion] = suggestions.filter(\.pinned)
         let keptIDs = Set(incoming.compactMap(\.keep))
         for chip in suggestions where !chip.pinned && keptIDs.contains(chip.id) {
@@ -282,6 +343,7 @@ final class AssistEngine: ObservableObject {
         }
         for item in incoming {
             if let keep = item.keep {
+                if consumedChipIDs.contains(keep) { continue }
                 if !suggestions.contains(where: { $0.id == keep }) {
                     next.append(item.suggestion)
                 }
@@ -289,13 +351,14 @@ final class AssistEngine: ObservableObject {
                 next.append(item.suggestion)
             }
         }
+        consumedChipIDs.removeAll()
         suggestions = Array(next.prefix(5))
         status = .idle
         drainPending()
     }
 
-    private func applyScoped(_ response: ChatCompletionClient.Response, generation gen: Int) {
-        inFlight = false
+    private func applyScoped(_ response: ChatCompletionClient.Response, generation gen: Int, requestID: Int) {
+        completeRequest(requestID)
         logUsage(response.usage)
         guard gen == generation else {
             drainPending()
@@ -303,8 +366,13 @@ final class AssistEngine: ObservableObject {
         }
         let incoming = Self.parseSuggestions(response.content, nextID: { self.nextChipID() })
         suggestions = suggestions.filter(\.pinned) + incoming.prefix(3).map(\.suggestion)
+        consumedChipIDs.removeAll()
         status = .idle
-        drainPending()
+        // Deliberately NOT draining here: queued ambient demand predates the
+        // scoped request, and letting it fire would replace these chips with
+        // a generic batch seconds after the user explicitly asked for them.
+        // New speech re-arms the loop naturally.
+        pendingAmbient = false
     }
 
     private func drainPending() {
@@ -313,8 +381,8 @@ final class AssistEngine: ObservableObject {
         scheduleAmbient()
     }
 
-    private func requestFailed(_ error: Error) {
-        inFlight = false
+    private func requestFailed(_ error: Error, requestID: Int) {
+        completeRequest(requestID)
         noteFailure(error)
         drainPending()
     }
@@ -323,6 +391,13 @@ final class AssistEngine: ObservableObject {
         let detail = String(error.localizedDescription.prefix(120))
         status = .offline(detail)
         Log.warn("[assist] request failed: \(detail)")
+    }
+
+    /// Successful compose/explain calls clear a stale offline badge —
+    /// without this, one transient failure sticks until the next
+    /// ambient/scoped batch happens to succeed.
+    private func clearOfflineStatus() {
+        if case .offline = status { status = .idle }
     }
 
     private func apiKeyOrOffline() -> String? {
@@ -356,9 +431,18 @@ final class AssistEngine: ObservableObject {
             guard let gloss = item["gloss"] as? String,
                   let hanzi = item["hanzi"] as? String, !hanzi.isEmpty else { return nil }
             // Prefer the model's pinyin (better heteronym handling); fall
-            // back to the on-device ICU transform the transcript uses.
+            // back to the on-device ICU transform the transcript uses —
+            // but only for Mandarin: the Han→Latin transform produces
+            // garbage on non-Chinese reply languages.
             let modelPinyin = item["pinyin"] as? String ?? ""
-            let pinyin = modelPinyin.isEmpty ? (hanzi.pinyin ?? "") : modelPinyin
+            let pinyin: String
+            if !modelPinyin.isEmpty {
+                pinyin = modelPinyin
+            } else if AppSettings.replyLanguage == "zh" {
+                pinyin = hanzi.pinyin ?? ""
+            } else {
+                pinyin = ""
+            }
             let replyTo = (item["reply_to"] as? String).flatMap { $0 == "table" || $0.isEmpty ? nil : $0 }
             let suggestion = Suggestion(
                 id: nextID(),

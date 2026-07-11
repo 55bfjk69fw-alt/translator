@@ -8,6 +8,12 @@ struct ConversationView: View {
     @State private var cueCard: AssistEngine.Suggestion?
     @State private var explanation: AssistEngine.Explanation?
 
+    /// The privacy switch: with the co-pilot off, NO assist affordance may
+    /// exist — the composer, tray, and long-press actions all send the
+    /// transcript window + bio to OpenAI (the engine also guards, but the
+    /// UI must not offer what the setting promises is off).
+    @AppStorage(AppSettings.copilotEnabledKey) private var copilotEnabled = true
+
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
@@ -21,14 +27,16 @@ struct ConversationView: View {
                         .background(.red)
                 }
                 transcriptList
-                AssistBarView(
-                    assist: model.assist,
-                    composerText: $composerText,
-                    composing: composing,
-                    conversationActive: model.mode == .conversation,
-                    onOpenCard: { cueCard = $0 },
-                    onCompose: composeDraft
-                )
+                if copilotEnabled {
+                    AssistBarView(
+                        assist: model.assist,
+                        composerText: $composerText,
+                        composing: composing,
+                        conversationActive: model.mode == .conversation,
+                        onOpenCard: { cueCard = $0 },
+                        onCompose: composeDraft
+                    )
+                }
             }
             .navigationTitle("Translator")
             .navigationBarTitleDisplayMode(.inline)
@@ -111,10 +119,10 @@ struct ConversationView: View {
                         UtteranceBubble(
                             utterance: utterance,
                             lane: model.lane(for: utterance.laneID),
-                            onReplyTo: !isUser && utterance.isFinal
+                            onReplyTo: copilotEnabled && !isUser && utterance.isFinal
                                 ? { requestScopedReply(to: utterance) }
                                 : nil,
-                            onExplain: !isUser && !utterance.sourceText.isEmpty
+                            onExplain: copilotEnabled && !isUser && !utterance.sourceText.isEmpty
                                 ? { explain(utterance) }
                                 : nil
                         )
@@ -197,7 +205,6 @@ private struct AssistBarView: View {
     let onCompose: () -> Void
 
     @AppStorage(AppSettings.sceneContextKey) private var scene = ""
-    @AppStorage(AppSettings.copilotEnabledKey) private var copilotEnabled = true
     @State private var editingScene = false
     @State private var sceneDraft = ""
 
@@ -207,7 +214,7 @@ private struct AssistBarView: View {
                 sceneChip
                 Spacer()
                 statusIndicator
-                if copilotEnabled && conversationActive {
+                if conversationActive {
                     Button {
                         assist.requestNow()
                     } label: {
@@ -232,9 +239,11 @@ private struct AssistBarView: View {
                 }
             }
             HStack(spacing: 8) {
-                TextField("Compose a reply to say aloud…", text: $composerText, axis: .vertical)
-                    .lineLimit(1...3)
+                // Single-line on purpose: with axis .vertical the Return
+                // key inserts a newline and .onSubmit never fires.
+                TextField("Compose a reply to say aloud…", text: $composerText)
                     .textFieldStyle(.roundedBorder)
+                    .submitLabel(.send)
                     .onSubmit(onCompose)
                 if composing {
                     ProgressView()

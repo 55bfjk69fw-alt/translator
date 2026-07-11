@@ -32,7 +32,20 @@ enum AppSettings {
     static let mandarinLevelKey = "mandarinLevel"
     static let suggestionToneKey = "suggestionTone"
     static let assistModelKey = "assistModel"
+    static let assistEndpointKey = "assistEndpoint"
     static let sceneContextKey = "sceneContext"
+
+    /// One-time key migrations, run at app start. Writes the legacy
+    /// push-to-talk output language forward to `replyLanguage` so the
+    /// Settings picker's @AppStorage (which can only read the new key)
+    /// agrees with what the engine uses.
+    static func migrateLegacyKeys() {
+        let defaults = UserDefaults.standard
+        if defaults.string(forKey: replyLanguageKey) == nil,
+           let legacy = defaults.string(forKey: legacyPTTOutputLanguageKey), !legacy.isEmpty {
+            defaults.set(legacy, forKey: replyLanguageKey)
+        }
+    }
 
     static func speakerNameKey(_ channel: Int) -> String { "speakerName\(channel)" }
     static func speakerEnabledKey(_ channel: Int) -> String { "speakerEnabled\(channel)" }
@@ -306,6 +319,18 @@ enum AppSettings {
     static var assistModel: String {
         let value = UserDefaults.standard.string(forKey: assistModelKey) ?? ""
         return value.isEmpty ? "gpt-4o-mini" : value
+    }
+
+    static let defaultAssistEndpoint = "https://api.openai.com/v1/chat/completions"
+
+    /// Chat-completions endpoint for the co-pilot — the same escape hatch
+    /// the realtime path gets via `endpointTemplate` (relay/proxy users
+    /// need BOTH paths reroutable or the co-pilot is dead where the
+    /// translator works).
+    static var assistEndpoint: URL {
+        let value = UserDefaults.standard.string(forKey: assistEndpointKey) ?? ""
+        if !value.isEmpty, let url = URL(string: value) { return url }
+        return URL(string: defaultAssistEndpoint)!
     }
 
     /// Per-meal context line, edited from the Conversation tab scene chip.

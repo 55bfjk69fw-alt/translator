@@ -34,6 +34,9 @@ struct ChatCompletionClient {
 
     let apiKey: String
     let model: String
+    /// From Settings (AppSettings.assistEndpoint) — relay/proxy users need
+    /// this reroutable just like the realtime endpoint template.
+    var endpoint: URL = AppSettings.assistEndpoint
 
     /// No token cap on purpose: the strict schema bounds output size, and
     /// the cap parameter is named differently across model generations.
@@ -43,7 +46,7 @@ struct ChatCompletionClient {
         schemaName: String,
         schema: [String: Any]
     ) async throws -> Response {
-        var request = URLRequest(url: URL(string: "https://api.openai.com/v1/chat/completions")!)
+        var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")

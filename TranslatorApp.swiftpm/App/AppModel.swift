@@ -103,6 +103,7 @@ final class AppModel: ObservableObject {
     private var cancellables: Set<AnyCancellable> = []
 
     init() {
+        AppSettings.migrateLegacyKeys()
         transcript = TranscriptStore()
         engineGraph.outputGain = AppSettings.outputGain
         // Nested ObservableObject: forward its changes so views observing
@@ -182,7 +183,7 @@ final class AppModel: ObservableObject {
         installInputHandler()
         startUITimer()
         mode = .conversation
-        assist.conversationStarted(finalizedCount: transcript.utterances.filter(\.isFinal).count)
+        assist.conversationStarted(finalizedCount: transcript.finalizedTotal)
         UIApplication.shared.isIdleTimerDisabled = true
         Log.info("Conversation started: \(channelCount) channel(s); sessions open on first speech")
     }
@@ -544,8 +545,10 @@ final class AppModel: ObservableObject {
             // The co-pilot's ambient trigger keys off finalizations — tick
             // it right after finalizeStale so a fresh utterance can fire a
             // suggestion request the same second (docs/REPLY-FLOW.md §3).
+            // finalizedTotal is monotonic, so the trigger survives the
+            // transcript's 400-utterance trim cap.
             if self.mode == .conversation {
-                self.assist.transcriptTick(finalizedCount: self.transcript.utterances.filter(\.isFinal).count)
+                self.assist.transcriptTick(finalizedCount: self.transcript.finalizedTotal)
             }
             self.closeIdleSessions()
             self.watchdogEngineCheck()

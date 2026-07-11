@@ -19,11 +19,14 @@ enum AssistPrompt {
         let tone = AppSettings.suggestionTone
         let language = languageName(AppSettings.replyLanguage)
 
+        let pronunciationAid = AppSettings.replyLanguage == "zh"
+            ? "hanzi with tone-marked pinyin"
+            : "the \(language) text with a Latin-letter pronunciation aid"
         var lines: [String] = []
         lines.append("""
         You are a real-time conversation co-pilot for \(name), an English speaker \
         at a \(language)-speaking table. Everything you suggest will be READ ALOUD \
-        BY \(name) THEMSELVES from a cue card — hanzi with tone-marked pinyin — \
+        BY \(name) THEMSELVES from a cue card — \(pronunciationAid) — \
         never played by a machine. Suggestions must therefore be natural spoken \
         \(language), sayable in one breath.
         """)
@@ -38,9 +41,10 @@ enum AssistPrompt {
         lines.append("""
         Field rules: `gloss` is a short English description of what saying it \
         accomplishes (e.g. "Ask how long the drive was"); `hanzi` is the exact \
-        line to say; `pinyin` is tone-marked pinyin for it; `register` is \
-        "casual" or "polite"; `reply_to` is the name of the person/thread it \
-        responds to, or "table" for a general contribution, or null.
+        \(language) line to say; `pinyin` is its pronunciation aid \
+        (tone-marked pinyin for Mandarin, romanization otherwise); `register` \
+        is "casual" or "polite"; `reply_to` is the name of the person/thread \
+        it responds to, or "table" for a general contribution, or null.
         """)
         return lines.joined(separator: "\n")
     }
@@ -69,10 +73,16 @@ enum AssistPrompt {
     ) -> String {
         var parts: [String] = [transcriptSection(window)]
         if !tray.isEmpty {
-            let chips = tray.map { chip in
-                "{\"id\":\"\(chip.id)\",\"gloss\":\"\(chip.gloss)\",\"reply_to\":\"\(chip.replyTo ?? "table")\",\"pinned\":\(chip.pinned)}"
+            // Real JSON serialization: glosses are model output and often
+            // contain quotes — hand-interpolated pseudo-JSON corrupts the
+            // tray section the keep/carry-over mechanism reads ids from.
+            let chips: [[String: Any]] = tray.map { chip in
+                ["id": chip.id, "gloss": chip.gloss, "reply_to": chip.replyTo ?? "table", "pinned": chip.pinned]
             }
-            parts.append("Current suggestion tray:\n" + chips.joined(separator: "\n"))
+            if let data = try? JSONSerialization.data(withJSONObject: chips),
+               let json = String(data: data, encoding: .utf8) {
+                parts.append("Current suggestion tray (JSON):\n" + json)
+            }
         }
         if let engagedThread {
             parts.append("The user most recently engaged with: \(engagedThread).")

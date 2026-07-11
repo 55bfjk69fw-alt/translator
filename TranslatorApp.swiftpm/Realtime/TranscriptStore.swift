@@ -46,6 +46,12 @@ final class TranscriptStore: ObservableObject {
 
     @Published private(set) var utterances: [Utterance] = []
 
+    /// Monotonic count of utterances EVER finalized (never decremented by
+    /// trim/clear). The co-pilot's ambient trigger diffs this — a live
+    /// `filter(\.isFinal).count` plateaus at the trim cap and would silence
+    /// the trigger for the rest of a long conversation.
+    private(set) var finalizedTotal = 0
+
     private let maxUtterances = 400
 
     /// Index of the open (partial) utterance per lane.
@@ -86,6 +92,7 @@ final class TranscriptStore: ObservableObject {
             lastSourceActivity: now,
             lastTranslationActivity: now
         ))
+        finalizedTotal += 1
         trim()
     }
 
@@ -138,6 +145,7 @@ final class TranscriptStore: ObservableObject {
             if (sourceQuiet && translationQuiet && translationDrained) || hardCap {
                 utterances[index].isFinal = true
                 openUtteranceIndex[lane] = nil
+                finalizedTotal += 1
                 finalizedAny = true
                 logFinalize(utterance, lane: lane, reason: sourceQuiet && translationQuiet && translationDrained ? "quiet" : "hard-cap")
             }

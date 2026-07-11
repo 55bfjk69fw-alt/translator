@@ -31,6 +31,7 @@ struct SettingsView: View {
     @AppStorage(AppSettings.mandarinLevelKey) private var mandarinLevelRaw = AppSettings.MandarinLevel.elementary.rawValue
     @AppStorage(AppSettings.suggestionToneKey) private var suggestionTone = "auto"
     @AppStorage(AppSettings.assistModelKey) private var assistModel = ""
+    @AppStorage(AppSettings.assistEndpointKey) private var assistEndpoint = ""
 
     private var micProfile: AppSettings.MicProfile {
         AppSettings.MicProfile(rawValue: micProfileRaw) ?? .worn
@@ -204,10 +205,14 @@ struct SettingsView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .font(.footnote)
+                    TextField("Co-pilot endpoint", text: $assistEndpoint, prompt: Text(AppSettings.defaultAssistEndpoint))
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .font(.footnote)
                 } header: {
                     Text("Advanced")
                 } footer: {
-                    Text("Only change these if OpenAI renames the model or moves the realtime translation endpoint. %@ in the template is replaced by the model name. Applies on the next Start.")
+                    Text("Only change these if OpenAI renames the model or moves an endpoint, or you route through a relay/proxy — the endpoint template covers the realtime translation sessions, the co-pilot endpoint covers the suggestion/compose calls (both must point at your relay for everything to work through it). %@ in the template is replaced by the model name. Applies on the next Start / next co-pilot request.")
                 }
 
                 Section {

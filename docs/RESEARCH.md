@@ -27,11 +27,27 @@ Realtime API. Confidence noted where it matters.
 
 ## 2. iPadOS audio architecture
 
-- **One active input route, system-wide, ever.** Apple staff confirm even
-  `.multiRoute` supports a single input (last-in wins); no aggregate devices on iOS.
-  → DJI RX + AirPods mic simultaneously is architecturally impossible.
+- **One active input route, system-wide, ever** — *in the public AVAudioSession
+  model.* Apple staff confirm even `.multiRoute` supports a single input
+  (last-in wins); no aggregate devices on iOS.
   ([QA1799](https://developer.apple.com/library/archive/qa/qa1799/_index.html),
   [forums 12710](https://developer.apple.com/forums/thread/12710))
+  **2026-07 revision:** Apple's own Live Translation demonstrably captures the
+  AirPods mics *alongside* the active input route ("in noisy environments, use
+  your iPhone's microphones in addition to AirPods",
+  [Apple Support 123185](https://support.apple.com/en-us/123185)), and the app's
+  owner reproduced it working with a DJI RX as the wired input on iPhone. So the
+  OS capability exists; it shipped via a private API, and DMA pressure reportedly
+  produced a public "simultaneous audio streams" API around iOS 26.2 that remains
+  unannounced/undocumented (EU-shaped; Numerama via
+  [mjtsai](https://mjtsai.com/blog/2025/11/06/airpods-live-translation-expands-to-the-eu/)).
+  Whether any *public* path reaches it on iPadOS is exactly what
+  **Diagnostics → Dual-input probe** measures on-device: (a) session options
+  `.allowBluetoothHFP` + `.bluetoothHighQualityRecording` with USB preferred —
+  does a BT mic appear beside USB, and does selecting it add or replace?
+  (b) an `AVCaptureSession` on its own private audio session capturing a mic
+  while our engine taps USB — do both deliver buffers at once? Probe results
+  land here once run on hardware.
 - **USB-in + AirPods-A2DP-out is a supported combo**: `.playAndRecord` with option
   `.allowBluetoothA2DP` and *not* `.allowBluetooth`(HFP). Apple-lab-endorsed pattern.
   ([forums 741513](https://developer.apple.com/forums/thread/741513))

@@ -9,6 +9,7 @@ struct DiagnosticsView: View {
     @EnvironmentObject private var model: AppModel
     @ObservedObject private var log = Log.shared
     @State private var logCopied = false
+    @StateObject private var probe = DualInputProbe()
 
     var body: some View {
         NavigationStack {
@@ -17,6 +18,7 @@ struct DiagnosticsView: View {
                 metersSection
                 pipelineSection
                 benchSection
+                probeSection
                 logSection
             }
             .navigationTitle("Diagnostics")
@@ -26,6 +28,13 @@ struct DiagnosticsView: View {
                 }
             }
             .onAppear { model.refreshRoute() }
+            // A conversation/bench start takes over the audio session; kill
+            // the probe but leave the session to its new owner.
+            .onChange(of: model.mode) { _, newMode in
+                if newMode != .idle, probe.running {
+                    probe.stop(releaseSession: false)
+                }
+            }
         }
     }
 
@@ -112,10 +121,159 @@ struct DiagnosticsView: View {
                 Button("Start bench test (no API, meters only)") {
                     model.startBenchTest()
                 }
+                .disabled(probe.running)
             } else {
                 Button("Stop", role: .destructive) {
                     model.stopConversation()
                 }
+            }
+        }
+    }
+
+    // MARK: - Dual-input probe
+
+    private var probeSection: some View {
+        Section {
+            if !probe.running {
+                Toggle("Allow Bluetooth mic in session options", isOn: $probe.allowBluetoothOptions)
+                Toggle("Request HQ Bluetooth recording (iOS 26)", isOn: $probe.requestHQRecording)
+                    .disabled(!DualInputProbe.hqRecordingSupported || !probe.allowBluetoothOptions)
+                Button("Start probe (no API cost)") { probe.start() }
+                    .disabled(model.mode != .idle)
+                if model.mode != .idle {
+                    Text("Stop the conversation or bench test first — the probe needs the audio session to itself.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                probeVerdictRow
+                if let route = probe.routeSummary {
+                    Text(route)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+                probeEngineRows
+                probeCaptureRows
+                probeSubTestRow
+                probeLogRows
+                Button("Stop probe", role: .destructive) { probe.stop() }
+            }
+        } header: {
+            Text("Dual-input probe (USB + AirPods mic)")
+        } footer: {
+            Text("Tests whether a Bluetooth mic can deliver audio while the DJI RX stays the USB input — the capability Apple's Live Translation uses privately. Decisive test: with both streams running, pocket or power off every DJI TX, then speak. Capture meter moves while USB meters stay flat = the AirPods mic is genuinely live alongside USB. Capture at 8–16 kHz that kills the USB meters = the classic single-input collapse. Share the probe log either way — the result goes in docs/RESEARCH.md.")
+        }
+    }
+
+    @ViewBuilder
+    private var probeVerdictRow: some View {
+        if probe.captureRunning {
+            if probe.engineLive && probe.captureLive {
+                Label("Both streams live at once — now do the speak test to confirm which mic feeds capture", systemImage: "checkmark.seal.fill")
+                    .font(.callout.bold())
+                    .foregroundStyle(.green)
+            } else if probe.captureLive {
+                Label("Capture live but the USB tap stalled — likely single-input collapse (route stolen)", systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+            } else if probe.engineLive {
+                Label("USB live; capture stream silent so far", systemImage: "hourglass")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else {
+                Label("No audio on either stream", systemImage: "xmark.circle")
+                    .font(.callout)
+                    .foregroundStyle(.red)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var probeEngineRows: some View {
+        HStack {
+            Label("USB engine", systemImage: probe.engineLive ? "waveform" : "pause.circle")
+                .font(.callout)
+                .foregroundStyle(probe.engineLive ? .primary : .secondary)
+            Spacer()
+            if let status = probe.engineStatus {
+                Text(status)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+        }
+        ForEach(Array(probe.engineMeters.enumerated()), id: \.offset) { index, level in
+            HStack {
+                Text("ch\(index)")
+                    .font(.caption.monospaced())
+                    .frame(width: 40, alignment: .leading)
+                MeterBar(level: level, color: SpeakerLane.laneColors[index % SpeakerLane.laneColors.count])
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var probeCaptureRows: some View {
+        if probe.devices.count > 1 {
+            Picker("Capture device", selection: $probe.selectedDeviceID) {
+                ForEach(probe.devices) { device in
+                    Text("\(device.name) [\(device.type)]").tag(device.id)
+                }
+            }
+            .disabled(probe.captureRunning)
+        } else if let only = probe.devices.first {
+            LabeledContent("Capture device", value: "\(only.name) [\(only.type)]")
+        }
+        if !probe.captureRunning {
+            Toggle("Capture on its own private audio session", isOn: $probe.privateCaptureSession)
+            HStack {
+                Button("Start capture stream") { probe.startCapture() }
+                    .buttonStyle(.bordered)
+                    .disabled(probe.devices.isEmpty)
+                Button("Rescan devices") { probe.refreshDevices() }
+                    .buttonStyle(.bordered)
+            }
+        } else {
+            HStack {
+                Label("Capture", systemImage: probe.captureLive ? "waveform" : "pause.circle")
+                    .font(.callout)
+                    .foregroundStyle(probe.captureLive ? .primary : .secondary)
+                Spacer()
+                if let status = probe.captureStatus {
+                    Text(status)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            HStack {
+                Text("mic")
+                    .font(.caption.monospaced())
+                    .frame(width: 40, alignment: .leading)
+                MeterBar(level: probe.captureMeter, color: .indigo)
+            }
+            Button("Stop capture stream", role: .destructive) { probe.stopCapture() }
+        }
+    }
+
+    private var probeSubTestRow: some View {
+        HStack {
+            Button("Prefer BT input") { probe.preferBluetoothInput() }
+            Button("Prefer USB input") { probe.preferUSBInput() }
+            Button("Restart USB tap") { probe.startEngineTap() }
+        }
+        .buttonStyle(.bordered)
+        .font(.callout)
+    }
+
+    private var probeLogRows: some View {
+        DisclosureGroup("Probe log (\(probe.probeLog.count))") {
+            ForEach(Array(probe.probeLog.enumerated().reversed()), id: \.offset) { _, line in
+                Text(line)
+                    .font(.caption.monospaced())
+                    .textSelection(.enabled)
+            }
+            ShareLink(item: probe.exportText()) {
+                Label("Share probe log", systemImage: "square.and.arrow.up")
+                    .font(.callout)
             }
         }
     }

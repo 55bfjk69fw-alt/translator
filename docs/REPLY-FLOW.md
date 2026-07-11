@@ -132,9 +132,19 @@ Integration points in existing code:
 
 ### Trigger logic (the "agentic loop")
 
-- **Ambient trigger**: fires 2.5 s after the most recent finalization
-  (coalescing — a new finalization during the window restarts it), only if
-  auto-suggest is on and there is new content since the last batch.
+Designed for the worst case the app exists for: several conversations
+running simultaneously across four lanes, where a global lull may never
+arrive.
+
+- **Ambient trigger — debounce with a max-wait cap**: fires 2.5 s after the
+  most recent finalization (a new finalization restarts the window), **but
+  never later than 8 s after the first unconsumed finalization**. Single
+  conversation with turn-taking → refresh lands in the lull. Continuous
+  multi-thread chatter → the cap guarantees a steady ~8 s cadence instead of
+  a starved debounce that keeps restarting forever. Quiet table → no
+  finalizations, no calls, no cost.
+- Fires only if auto-suggest is on and there is new content since the last
+  batch.
 - **One request in flight, ever.** A newer trigger while in flight marks the
   response stale; stale responses are dropped (generation counter), then the
   trigger re-arms. No queues.
@@ -144,6 +154,25 @@ Integration points in existing code:
   the tray, retry the *next* trigger (no retry storms). Errors never block
   the transcript or listening pipeline.
 
+### Tray stability under chaos
+
+A steady ~8 s replace cadence would make chips churn faster than anyone can
+read at a loud table. Three mechanisms keep the tray calm:
+
+- **Carry-over, not just replace**: each ambient request includes the current
+  tray (id + gloss + reply_to). The model returns the new set with a `keep`
+  id where an existing chip is still the right suggestion — kept chips stay
+  in place untouched, so a chip only moves or vanishes when the conversation
+  actually moved past it. Pinned chips are never dropped regardless.
+- **Engagement bias**: the prompt tells the model which thread the user most
+  recently engaged with ("I said this" / scoped replies are the signal) and
+  asks for suggestions biased to that thread, plus at most one option from
+  elsewhere at the table. Chaos becomes: *your* conversation dominates the
+  tray, with one "join the other thread" escape hatch.
+- **Pinning + `reply_to` labels** (already decided): pins survive any batch,
+  and every chip names its target, so grabbing the right thread is a glance,
+  not a read.
+
 ### Request shape
 
 One `chat/completions` call, `response_format: json_schema (strict)`:
@@ -152,6 +181,7 @@ One `chat/completions` call, `response_format: json_schema (strict)`:
 {
   "suggestions": [
     {
+      "keep":     "b3",
       "gloss":    "Ask how long the drive from Chongqing was",
       "hanzi":    "你们从重庆开了多久的车？",
       "pinyin":   "Nǐmen cóng Chóngqìng kāi le duō jiǔ de chē?",
@@ -161,6 +191,11 @@ One `chat/completions` call, `response_format: json_schema (strict)`:
   ]
 }
 ```
+
+`keep` (nullable) points at a current-tray chip id when the entry is that
+chip carried over — the tray leaves it in place instead of animating a
+replacement. The request includes the current tray (id, gloss, reply_to,
+pinned flag) so the model can make that call.
 
 System prompt contract (assembled by `AssistPrompt`):
 
@@ -182,9 +217,11 @@ stored.
 
 ### Cost & model
 
-~1.5k tokens in / ~250 out per call, one call per finalized burst of speech.
-At `gpt-4o-mini` pricing that is under $0.25/hour of continuous conversation —
-noise against the ~$10/hour realtime sessions. Token usage per call is logged
+~1.8k tokens in / ~250 out per call. Worst case (continuous multi-thread
+chatter pinning the loop to the 8 s max-wait cadence) is ~450 calls/hour —
+about $0.20/hour at `gpt-4o-mini` pricing, noise against the ~$10/hour
+realtime sessions; typical turn-taking conversation costs a fraction of
+that. Token usage per call is logged
 to Diagnostics (no UI meter for now). The model field is a Settings
 escape-hatch, same philosophy as the realtime model/endpoint fields.
 

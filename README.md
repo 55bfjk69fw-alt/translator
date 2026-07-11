@@ -53,6 +53,36 @@ channels to iPadOS (DJI certifies it for GarageBand on iOS; this app is the seco
 4. Confirm *Outputs* shows your AirPods as `BluetoothA2DPOutput` — that's the
    high-quality playback path.
 
+## Dual-input probe — can the AirPods mic run beside the DJI?
+
+iPadOS publicly allows one active input route, which is why the AirPods are
+output-only. But Apple's Live Translation captures the AirPods mics *alongside*
+the phone's active input through a private path, and it works with a DJI RX
+plugged in — so **Diagnostics → Dual-input probe** tests whether any public API
+reaches the same capability on this hardware (no API cost):
+
+1. Stop any conversation/bench test, connect AirPods and the RX, tap
+   **Start probe**. The probe configures USB as the input with Bluetooth
+   options enabled (including the iOS 26 high-quality recording link) and taps
+   it — the per-channel meters should move when you tap the TXs.
+2. Tap **Start capture stream**. This runs a second, independent capture stack
+   (`AVCaptureSession`, on its own private audio session by default) and
+   meters whatever it hears.
+3. **The decisive test**: pocket or power off every DJI TX, then speak.
+   - Capture meter moves while the USB meters stay flat → the AirPods mic is
+     genuinely live next to USB. 48 kHz in the capture format line means the
+     HQ link; 8–16 kHz means HFP.
+   - Starting capture kills the USB meters (route stolen) → the classic
+     single-input collapse.
+4. The **Prefer BT / Prefer USB input** buttons run the route-flip experiment
+   explicitly, and **Restart USB tap** recovers the engine after a flip. Every
+   observation lands in the shareable probe log — paste the result into
+   `docs/RESEARCH.md` either way.
+
+If the probe succeeds, the AirPods mic can become an always-on personal lane
+(your own speech captured without wearing a TX) while the DJI channels keep
+translating the table.
+
 ## Using the app
 
 1. **Settings** tab: paste your OpenAI API key (stored in the device Keychain),

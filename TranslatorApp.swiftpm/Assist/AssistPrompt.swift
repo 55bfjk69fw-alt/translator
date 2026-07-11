@@ -34,10 +34,12 @@ enum AssistPrompt {
         The conversation lines are real-time speech-to-text from a noisy, \
         multi-microphone table and WILL contain errors: wrong homophones or \
         characters, merged or split utterances, missing words, mislabeled \
-        speakers, and occasional gibberish. Read through the noise for intent \
-        using the surrounding context. Never build a suggestion that hinges on \
-        a detail that could be a mis-transcription, and never quote garbled \
-        text back.
+        speakers, and occasional gibberish. Lines are given in the speaker's \
+        original language; a line marked [English machine translation] is a \
+        translation of speech whose original transcript was lost — treat it \
+        as doubly approximate. Read through the noise for intent using the \
+        surrounding context. Never build a suggestion that hinges on a detail \
+        that could be a mis-transcription, and never quote garbled text back.
         """)
         if !bio.isEmpty { lines.append("About \(name): \(bio)") }
         if !scene.isEmpty { lines.append("Scene right now: \(scene)") }
@@ -68,9 +70,19 @@ enum AssistPrompt {
         let lines = window.map { line in
             let speaker = line.isUser ? "\(line.speaker) (the user, said aloud)" : line.speaker
             let progress = line.isFinal ? "" : " [mid-speech, transcript still arriving]"
-            let source = line.source.isEmpty ? "(no transcript)" : line.source
-            let translation = line.translation.isEmpty ? "" : " — \(line.translation)"
-            return "[\(speaker)]\(progress) \(source)\(translation)"
+            // The original-language transcript is one step closer to what
+            // was said than the English rendering (translation errors stack
+            // on STT errors), so send hanzi alone when it exists; the
+            // English fallback covers segments whose source stream was lost.
+            let body: String
+            if !line.source.isEmpty {
+                body = line.source
+            } else if !line.translation.isEmpty {
+                body = "\(line.translation) [English machine translation — original-language transcript missing]"
+            } else {
+                body = "(no transcript yet)"
+            }
+            return "[\(speaker)]\(progress) \(body)"
         }
         return "Recent conversation, oldest first:\n" + lines.joined(separator: "\n")
     }

@@ -57,6 +57,11 @@ final class AppModel: ObservableObject {
     /// only re-renders views that observe it directly.
     let signalAnalyzer = SignalAnalyzer()
 
+    /// Metrics-tab collector (cost/latency/throughput/prompter usage). Its
+    /// own ObservableObject for the same reason as SignalAnalyzer: its 1 Hz
+    /// snapshot churn only re-renders the Metrics tab.
+    let metrics = MetricsStore()
+
     // MARK: - Pipeline components
 
     let audioSession = AudioSessionController()
@@ -130,6 +135,9 @@ final class AppModel: ObservableObject {
             // records what was actually said.
             self?.transcript.addUserUtterance(source: suggestion.hanzi, gloss: suggestion.meaning)
         }
+        assist.recordMetric = { [weak self] sample in
+            self?.metrics.recordAssist(sample)
+        }
         observeNotifications()
     }
 
@@ -144,8 +152,10 @@ final class AppModel: ObservableObject {
         errorBanner = nil
         stopping = false
         // The estimate next to the lane dots reads as "this conversation's
-        // cost" — start it from zero.
+        // cost" — start it from zero. The Metrics tab follows the same
+        // "this conversation" framing.
         costMeter.reset()
+        metrics.startSession()
         refreshCost()
 
         do {
@@ -402,6 +412,15 @@ final class AppModel: ObservableObject {
         client.onBilledSeconds = { [weak self] seconds in
             self?.costMeter.addBilledSeconds(seconds)
         }
+        // Like onBilledSeconds, deliberately not identity-guarded: latency
+        // measured on a client that was idle-closed mid-flight is still a
+        // real measurement. MetricsStore is main-confined, so hop.
+        client.onConnectSeconds = { [weak self] seconds in
+            DispatchQueue.main.async { self?.metrics.recordConnect(lane: lane, seconds: seconds) }
+        }
+        client.onFirstResponseSeconds = { [weak self] seconds in
+            DispatchQueue.main.async { self?.metrics.recordFirstResponse(lane: lane, seconds: seconds) }
+        }
         client.onTranslatedAudio = { [weak self] audio in
             DispatchQueue.main.async { self?.playEnglishAudio(audio, lane: lane) }
         }
@@ -570,6 +589,7 @@ final class AppModel: ObservableObject {
             return
         }
         let (clientsCopy, voiceTimes) = audioQueue.sync { (clients, lastVoiceAt) }
+        let sessionSnapshots = clientsCopy.mapValues { $0.snapshot() }
         let now = Date()
         pipelineStatuses = lanes.map { lane in
             LanePipelineStatus(
@@ -577,9 +597,12 @@ final class AppModel: ObservableObject {
                 name: lane.name,
                 gateOpen: lane.id < gateOpen.count ? gateOpen[lane.id] : false,
                 secondsSinceSpeech: voiceTimes[lane.id].map { now.timeIntervalSince($0) },
-                session: clientsCopy[lane.id]?.snapshot()
+                session: sessionSnapshots[lane.id]
             )
         }
+        // The Metrics tab samples the same 1 Hz snapshots the pipeline
+        // panel reads — no extra client-queue hops.
+        metrics.sample(realtimeCost: costMeter.estimatedDollars, lanes: sessionSnapshots)
     }
 
     /// AVAudioEngine auto-stops on configuration changes (Bluetooth codec

@@ -136,18 +136,29 @@ Designed for the worst case the app exists for: several conversations
 running simultaneously across four lanes, where a global lull may never
 arrive.
 
-- **Ambient trigger — debounce with a max-wait cap**: fires 2.5 s after the
-  most recent finalization (a new finalization restarts the window), **but
-  never later than 8 s after the first unconsumed finalization**. Single
-  conversation with turn-taking → refresh lands in the lull. Continuous
-  multi-thread chatter → the cap guarantees a steady ~8 s cadence instead of
-  a starved debounce that keeps restarting forever. Quiet table → no
-  finalizations, no calls, no cost.
+- **Ambient trigger — rate-limited immediate fire.** A finalization fires a
+  request *immediately* unless a request was made in the last 5 s; in that
+  case one fire is scheduled for the boundary (further finalizations fold
+  into it). Turn-taking conversation → chips land ~3–4 s after someone stops
+  talking (the ~2.5 s the transcript itself needs to finalize, plus the model
+  call — no artificial wait). Continuous multi-thread chatter → a steady
+  ~5 s cadence by construction, no starvation possible. Quiet table → no
+  finalizations, no calls, no cost. There is deliberately no debounce: its
+  only benefit was saving calls that cost fractions of a cent, and it bought
+  that with seconds of latency at exactly the moments the tray should feel
+  live.
 - Fires only if auto-suggest is on and there is new content since the last
   batch.
-- **One request in flight, ever.** A newer trigger while in flight marks the
-  response stale; stale responses are dropped (generation counter), then the
-  trigger re-arms. No queues.
+- **One request in flight, ever; responses are shown, not discarded.** A
+  response that arrives after newer speech finalized is still applied — it
+  is one or two utterances behind, and carry-over keeps it coherent — and
+  the newer content immediately schedules the next fire. The only responses
+  dropped outright are ambient batches superseded by a manual/scoped
+  request. No queues.
+- If the ~2.5 s finalization delay itself proves to be the bottleneck in the
+  field, the escape hatch is triggering on source-stream quiet instead of
+  full finalization (translation trails source; suggestions only need the
+  source text) — noted here, not built until real use demands it.
 - **Scoped/compose/explain requests** fire immediately and pre-empt the
   ambient loop (its next batch just comes later).
 - **Failure**: log to Diagnostics, show a subtle "co-pilot offline" chip in
@@ -156,7 +167,7 @@ arrive.
 
 ### Tray stability under chaos
 
-A steady ~8 s replace cadence would make chips churn faster than anyone can
+A steady ~5 s replace cadence would make chips churn faster than anyone can
 read at a loud table. Three mechanisms keep the tray calm:
 
 - **Carry-over, not just replace**: each ambient request includes the current
@@ -218,10 +229,9 @@ stored.
 ### Cost & model
 
 ~1.8k tokens in / ~250 out per call. Worst case (continuous multi-thread
-chatter pinning the loop to the 8 s max-wait cadence) is ~450 calls/hour —
-about $0.20/hour at `gpt-4o-mini` pricing, noise against the ~$10/hour
-realtime sessions; typical turn-taking conversation costs a fraction of
-that. Token usage per call is logged
+chatter pinning the loop to the 5 s rate limit) is ~720 calls/hour — about
+$0.30/hour at `gpt-4o-mini` pricing, noise against the ~$10/hour realtime
+sessions; typical turn-taking conversation costs a fraction of that. Token usage per call is logged
 to Diagnostics (no UI meter for now). The model field is a Settings
 escape-hatch, same philosophy as the realtime model/endpoint fields.
 

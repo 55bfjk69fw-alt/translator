@@ -99,6 +99,7 @@ New **"About you (reply prompter)"** section:
 | Bio | multi-line text | "" | Who you are, relationship to the group, safe topics |
 | Mandarin level | picker | elementary | beginner / elementary / intermediate / advanced — caps sentence length & vocabulary in the prompt |
 | Tone | picker | auto | casual / polite / auto (model reads the room) |
+| Suggestions in tray | picker | 10 | Caps UNPINNED chips only — pins never count. Each batch requests up to `min(limit, 8)` suggestions, so the ask scales with the limit |
 | Auto-suggest | toggle | on | Off = tray fills only via "suggest now" / scoped requests |
 | Model | picker | `gpt-5-mini` | Populated from the account's `/v1/models` (chat-capable ids only), static fallback list offline; `reasoning_effort: low` is pinned for reasoning models |
 
@@ -326,3 +327,8 @@ If the probe fails, P4 is simply dropped; nothing else changes.
 3. **Explain this = nuance + key phrases.** A short meaning/idiom
    explanation plus 2–3 key phrases (hanzi, pinyin, meaning). No word-by-word
    breakdown — this is a dinner-table tool, not a flashcard generator.
+4. **Tray limit is configurable and excludes pins** (owner, post-field-test):
+   default 10 unpinned chips; pinned chips never count against or get
+   truncated by the limit; the per-batch request size scales with the limit
+   (`min(limit, 8)` ambient, `min(limit/2, 5)` scoped) so a bigger tray
+   actually fills.

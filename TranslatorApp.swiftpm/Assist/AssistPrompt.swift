@@ -69,10 +69,12 @@ enum AssistPrompt {
 
     /// Ambient batch. Includes the current tray for carry-over and the
     /// engagement signal for thread bias (docs/REPLY-FLOW.md §3).
+    /// `batchSize` scales with the tray-limit setting.
     static func ambientUserMessage(
         window: [AssistEngine.TranscriptLine],
         tray: [AssistEngine.Suggestion],
-        engagedThread: String?
+        engagedThread: String?,
+        batchSize: Int
     ) -> String {
         var parts: [String] = [transcriptSection(window)]
         if !tray.isEmpty {
@@ -91,12 +93,15 @@ enum AssistPrompt {
             parts.append("The user most recently engaged with: \(engagedThread).")
         }
         parts.append("""
-        Task: identify the conversation threads currently active, then return 2-3 \
-        things the user could say out loud RIGHT NOW. Bias toward the thread the \
-        user is engaged with; include at most one option from a different thread. \
-        If a current tray suggestion is still among the best options, return it \
-        UNCHANGED with `keep` set to its id — otherwise `keep` is null. Never \
-        duplicate a pinned tray suggestion as a new entry.
+        Task: identify the conversation threads currently active, then return up \
+        to \(batchSize) DISTINCT things the user could say out loud RIGHT NOW — \
+        aim for \(batchSize) when the conversation offers enough angles (a \
+        question, a reaction, a follow-up, a contribution of the user's own), \
+        fewer only if the moment is genuinely thin. Weight them toward the \
+        thread the user is engaged with, but include an option or two from other \
+        active threads. If a current tray suggestion is still among the best \
+        options, return it UNCHANGED with `keep` set to its id — otherwise \
+        `keep` is null. Never duplicate a pinned tray suggestion as a new entry.
         """)
         return parts.joined(separator: "\n\n")
     }
@@ -106,7 +111,8 @@ enum AssistPrompt {
         window: [AssistEngine.TranscriptLine],
         speaker: String,
         source: String,
-        translation: String
+        translation: String,
+        batchSize: Int
     ) -> String {
         """
         \(transcriptSection(window))
@@ -114,8 +120,8 @@ enum AssistPrompt {
         The user wants to respond to THIS specific utterance:
         [\(speaker)] \(source)\(translation.isEmpty ? "" : " — \(translation)")
 
-        Task: return 2-3 direct responses to it, all with `reply_to` = "\(speaker)" \
-        and `keep` = null.
+        Task: return 2-\(batchSize) direct responses to it, all with `reply_to` = \
+        "\(speaker)" and `keep` = null.
         """
     }
 

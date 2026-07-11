@@ -32,6 +32,7 @@ enum AppSettings {
     static let userBioKey = "userBio"
     static let mandarinLevelKey = "mandarinLevel"
     static let suggestionToneKey = "suggestionTone"
+    static let suggestionLimitKey = "suggestionLimit"
     static let assistModelKey = "assistModel"
     static let assistEndpointKey = "assistEndpoint"
     static let sceneContextKey = "sceneContext"
@@ -324,6 +325,25 @@ enum AppSettings {
     static var suggestionTone: String {
         let value = UserDefaults.standard.string(forKey: suggestionToneKey) ?? ""
         return value.isEmpty ? "auto" : value
+    }
+
+    /// Maximum UNPINNED chips kept in the tray — pinned chips never count
+    /// (or expire), so pinning can't crowd out fresh suggestions.
+    static var suggestionLimit: Int {
+        let value = UserDefaults.standard.integer(forKey: suggestionLimitKey)
+        return value > 0 ? min(max(value, 3), 20) : 10
+    }
+
+    /// Suggestions each ambient batch asks the model for — scales with the
+    /// tray limit, capped so a single response stays fast.
+    static var suggestionBatchSize: Int {
+        max(3, min(suggestionLimit, 8))
+    }
+
+    /// Scoped "reply to this" batches stay tighter: they answer one
+    /// utterance, not the whole table.
+    static var scopedBatchSize: Int {
+        max(3, min(suggestionLimit / 2, 5))
     }
 
     static let defaultAssistModel = "gpt-5-mini"

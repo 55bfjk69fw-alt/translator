@@ -160,10 +160,11 @@ final class AssistEngine: ObservableObject {
         let window = transcriptWindow?() ?? []
         let client = ChatCompletionClient(apiKey: apiKey, model: AppSettings.assistModel)
         let system = AssistPrompt.systemPrompt()
-        let message = AssistPrompt.scopedUserMessage(window: window, speaker: speaker, source: source, translation: translation)
+        let batchSize = AppSettings.scopedBatchSize
+        let message = AssistPrompt.scopedUserMessage(window: window, speaker: speaker, source: source, translation: translation, batchSize: batchSize)
         Task { [weak self] in
             do {
-                let response = try await client.complete(system: system, user: message, schemaName: "suggestions", schema: AssistPrompt.suggestionsSchema(maxItems: 3))
+                let response = try await client.complete(system: system, user: message, schemaName: "suggestions", schema: AssistPrompt.suggestionsSchema(maxItems: batchSize))
                 await MainActor.run { self?.applyScoped(response, generation: gen, requestID: requestID) }
             } catch {
                 await MainActor.run { self?.requestFailed(error, requestID: requestID) }
@@ -316,10 +317,11 @@ final class AssistEngine: ObservableObject {
         status = .loading
         let client = ChatCompletionClient(apiKey: apiKey, model: AppSettings.assistModel)
         let system = AssistPrompt.systemPrompt()
-        let message = AssistPrompt.ambientUserMessage(window: window, tray: suggestions, engagedThread: lastEngagedThread)
+        let batchSize = AppSettings.suggestionBatchSize
+        let message = AssistPrompt.ambientUserMessage(window: window, tray: suggestions, engagedThread: lastEngagedThread, batchSize: batchSize)
         Task { [weak self] in
             do {
-                let response = try await client.complete(system: system, user: message, schemaName: "suggestions", schema: AssistPrompt.suggestionsSchema(maxItems: 3))
+                let response = try await client.complete(system: system, user: message, schemaName: "suggestions", schema: AssistPrompt.suggestionsSchema(maxItems: batchSize))
                 await MainActor.run { self?.applyAmbient(response, generation: gen, requestID: requestID) }
             } catch {
                 await MainActor.run { self?.requestFailed(error, requestID: requestID) }
@@ -336,28 +338,30 @@ final class AssistEngine: ObservableObject {
         }
         let incoming = Self.parseSuggestions(response.content, nextID: { self.nextChipID() })
         // Carry-over merge (design §"Tray stability under chaos"): pinned
-        // chips always survive; unpinned chips survive when the model
-        // returned them with keep=<id>; genuinely new entries follow. A keep
-        // pointing at a chip the user said while this request was in flight
-        // is dropped (saying it consumed it); a keep pointing at an id we
-        // never had counts as new.
-        var next: [Suggestion] = suggestions.filter(\.pinned)
+        // chips always survive AND never count against the tray limit;
+        // unpinned chips survive when the model returned them with
+        // keep=<id>; genuinely new entries follow, truncated to the
+        // configured limit. A keep pointing at a chip the user said while
+        // this request was in flight is dropped (saying it consumed it); a
+        // keep pointing at an id we never had counts as new.
+        let pinned = suggestions.filter(\.pinned)
+        var rest: [Suggestion] = []
         let keptIDs = Set(incoming.compactMap(\.keep))
         for chip in suggestions where !chip.pinned && keptIDs.contains(chip.id) {
-            next.append(chip)
+            rest.append(chip)
         }
         for item in incoming {
             if let keep = item.keep {
                 if consumedChipIDs.contains(keep) { continue }
                 if !suggestions.contains(where: { $0.id == keep }) {
-                    next.append(item.suggestion)
+                    rest.append(item.suggestion)
                 }
             } else {
-                next.append(item.suggestion)
+                rest.append(item.suggestion)
             }
         }
         consumedChipIDs.removeAll()
-        suggestions = Array(next.prefix(5))
+        suggestions = pinned + rest.prefix(AppSettings.suggestionLimit)
         status = .idle
         drainPending()
     }
@@ -370,7 +374,7 @@ final class AssistEngine: ObservableObject {
             return
         }
         let incoming = Self.parseSuggestions(response.content, nextID: { self.nextChipID() })
-        suggestions = suggestions.filter(\.pinned) + incoming.prefix(3).map(\.suggestion)
+        suggestions = suggestions.filter(\.pinned) + incoming.prefix(AppSettings.scopedBatchSize).map(\.suggestion)
         consumedChipIDs.removeAll()
         status = .idle
         // Deliberately NOT draining here: queued ambient demand predates the

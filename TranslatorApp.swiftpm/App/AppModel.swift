@@ -152,10 +152,8 @@ final class AppModel: ObservableObject {
         errorBanner = nil
         stopping = false
         // The estimate next to the lane dots reads as "this conversation's
-        // cost" — start it from zero. The Metrics tab follows the same
-        // "this conversation" framing.
+        // cost" — start it from zero.
         costMeter.reset()
-        metrics.startSession()
         refreshCost()
 
         do {
@@ -192,6 +190,11 @@ final class AppModel: ObservableObject {
         sessionStates = Dictionary(uniqueKeysWithValues: (0..<channelCount).map { ($0, RealtimeTranslationClient.State.idle) })
 
         signalAnalyzer.startSession()
+        // Reset only after every fallible setup step: a Start that dies on
+        // the audio session/engine must not wipe the previous conversation's
+        // still-inspectable metrics. Same "this conversation" framing as the
+        // cost meter above.
+        metrics.startSession()
         installInputHandler()
         startUITimer()
         mode = .conversation
@@ -227,6 +230,7 @@ final class AppModel: ObservableObject {
         // just during a conversation.
         UIApplication.shared.isIdleTimerDisabled = AppSettings.keepScreenAwake
         refreshCost()
+        metrics.endSession()
         Log.info("Conversation stopped")
     }
 
@@ -320,7 +324,7 @@ final class AppModel: ObservableObject {
                 outgoing = EngineGraph.silentBuffer(frames: frames, sampleRate: sampleRate)
             }
             if let outgoing, let data = resampler.convert(outgoing) {
-                client.sendAudio(data)
+                client.sendAudio(data, containsSpeech: speech)
             }
         }
         pushMeters(decisions)
@@ -601,8 +605,14 @@ final class AppModel: ObservableObject {
             )
         }
         // The Metrics tab samples the same 1 Hz snapshots the pipeline
-        // panel reads — no extra client-queue hops.
-        metrics.sample(realtimeCost: costMeter.estimatedDollars, lanes: sessionSnapshots)
+        // panel reads — no extra client-queue hops. Lane names ride along so
+        // MetricsView never has to observe AppModel (whose meters churn at
+        // 10 Hz and would re-render every chart at meter rate).
+        metrics.sample(
+            realtimeCost: costMeter.estimatedDollars,
+            lanes: sessionSnapshots,
+            laneNames: Dictionary(uniqueKeysWithValues: lanes.map { ($0.id, $0.name) })
+        )
     }
 
     /// AVAudioEngine auto-stops on configuration changes (Bluetooth codec

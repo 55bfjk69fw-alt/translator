@@ -164,21 +164,13 @@ final class AssistEngine: ObservableObject {
         let client = ChatCompletionClient(apiKey: apiKey, model: AppSettings.assistModel)
         let system = AssistPrompt.systemPrompt()
         let message = AssistPrompt.scopedUserMessage(window: window, speaker: speaker, source: source, translation: translation)
-        let startedAt = Date()
         Task { [weak self] in
+            guard let self else { return }
             do {
-                let response = try await client.complete(system: system, user: message, schemaName: "suggestions", schema: AssistPrompt.suggestionsSchema(maxItems: 3))
-                await MainActor.run {
-                    guard let self else { return }
-                    self.recordRequestMetric(kind: "reply", startedAt: startedAt, usage: response.usage)
-                    self.applyScoped(response, generation: gen, requestID: requestID)
-                }
+                let response = try await self.timedComplete(kind: "reply", client: client, system: system, user: message, schemaName: "suggestions", schema: AssistPrompt.suggestionsSchema(maxItems: 3))
+                await MainActor.run { self.applyScoped(response, generation: gen, requestID: requestID) }
             } catch {
-                await MainActor.run {
-                    guard let self else { return }
-                    self.recordRequestMetric(kind: "reply", startedAt: startedAt, usage: nil, failed: true)
-                    self.requestFailed(error, requestID: requestID)
-                }
+                await MainActor.run { self.requestFailed(error, requestID: requestID) }
             }
         }
     }
@@ -208,20 +200,15 @@ final class AssistEngine: ObservableObject {
         }
         let client = ChatCompletionClient(apiKey: apiKey, model: AppSettings.assistModel)
         let message = AssistPrompt.composeUserMessage(window: window, draft: trimmed)
-        let startedAt = Date()
         do {
-            let response = try await client.complete(system: system, user: message, schemaName: "suggestions", schema: AssistPrompt.suggestionsSchema(maxItems: 1))
+            let response = try await timedComplete(kind: "compose", client: client, system: system, user: message, schemaName: "suggestions", schema: AssistPrompt.suggestionsSchema(maxItems: 1))
             return await MainActor.run { () -> Suggestion? in
-                self.recordRequestMetric(kind: "compose", startedAt: startedAt, usage: response.usage)
                 self.logUsage(response.usage)
                 self.clearOfflineStatus()
                 return Self.parseSuggestions(response.content, nextID: { self.nextChipID() }).first?.suggestion
             }
         } catch {
-            await MainActor.run {
-                self.recordRequestMetric(kind: "compose", startedAt: startedAt, usage: nil, failed: true)
-                self.noteFailure(error)
-            }
+            await MainActor.run { self.noteFailure(error) }
             return nil
         }
     }
@@ -236,11 +223,9 @@ final class AssistEngine: ObservableObject {
         let client = ChatCompletionClient(apiKey: apiKey, model: AppSettings.assistModel)
         let system = await MainActor.run { AssistPrompt.systemPrompt() }
         let message = AssistPrompt.explainUserMessage(speaker: speaker, source: source, translation: translation)
-        let startedAt = Date()
         do {
-            let response = try await client.complete(system: system, user: message, schemaName: "explanation", schema: AssistPrompt.explanationSchema())
+            let response = try await timedComplete(kind: "explain", client: client, system: system, user: message, schemaName: "explanation", schema: AssistPrompt.explanationSchema())
             await MainActor.run {
-                self.recordRequestMetric(kind: "explain", startedAt: startedAt, usage: response.usage)
                 self.logUsage(response.usage)
                 self.clearOfflineStatus()
             }
@@ -253,10 +238,7 @@ final class AssistEngine: ObservableObject {
             }
             return Explanation(about: source, explanation: text, phrases: phrases)
         } catch {
-            await MainActor.run {
-                self.recordRequestMetric(kind: "explain", startedAt: startedAt, usage: nil, failed: true)
-                self.noteFailure(error)
-            }
+            await MainActor.run { self.noteFailure(error) }
             return nil
         }
     }
@@ -339,21 +321,13 @@ final class AssistEngine: ObservableObject {
         let client = ChatCompletionClient(apiKey: apiKey, model: AppSettings.assistModel)
         let system = AssistPrompt.systemPrompt()
         let message = AssistPrompt.ambientUserMessage(window: window, tray: suggestions, engagedThread: lastEngagedThread)
-        let startedAt = Date()
         Task { [weak self] in
+            guard let self else { return }
             do {
-                let response = try await client.complete(system: system, user: message, schemaName: "suggestions", schema: AssistPrompt.suggestionsSchema(maxItems: 3))
-                await MainActor.run {
-                    guard let self else { return }
-                    self.recordRequestMetric(kind: "ambient", startedAt: startedAt, usage: response.usage)
-                    self.applyAmbient(response, generation: gen, requestID: requestID)
-                }
+                let response = try await self.timedComplete(kind: "ambient", client: client, system: system, user: message, schemaName: "suggestions", schema: AssistPrompt.suggestionsSchema(maxItems: 3))
+                await MainActor.run { self.applyAmbient(response, generation: gen, requestID: requestID) }
             } catch {
-                await MainActor.run {
-                    guard let self else { return }
-                    self.recordRequestMetric(kind: "ambient", startedAt: startedAt, usage: nil, failed: true)
-                    self.requestFailed(error, requestID: requestID)
-                }
+                await MainActor.run { self.requestFailed(error, requestID: requestID) }
             }
         }
     }
@@ -454,11 +428,39 @@ final class AssistEngine: ObservableObject {
         Log.info("[assist] \(AppSettings.assistModel): \(usage.promptTokens) prompt + \(usage.completionTokens) completion tokens")
     }
 
-    /// One Metrics-tab entry per request outcome (main thread). Failed
-    /// requests carry the duration and zero tokens — the failure itself is
-    /// worth charting against latency spikes.
-    private func recordRequestMetric(kind: String, startedAt: Date, usage: ChatCompletionClient.Usage?, failed: Bool = false) {
-        let model = AppSettings.assistModel
+    /// ChatCompletionClient.complete with Metrics-tab timing wrapped around
+    /// it. Every request path goes through here, so no path can forget the
+    /// success/failure recording pair — failures record too, with the
+    /// duration and zero tokens (a failure is worth charting against
+    /// latency spikes).
+    private func timedComplete(
+        kind: String,
+        client: ChatCompletionClient,
+        system: String,
+        user: String,
+        schemaName: String,
+        schema: [String: Any]
+    ) async throws -> ChatCompletionClient.Response {
+        let startedAt = Date()
+        do {
+            let response = try await client.complete(system: system, user: user, schemaName: schemaName, schema: schema)
+            await MainActor.run {
+                self.recordRequestMetric(kind: kind, startedAt: startedAt, model: client.model, usage: response.usage)
+            }
+            return response
+        } catch {
+            await MainActor.run {
+                self.recordRequestMetric(kind: kind, startedAt: startedAt, model: client.model, usage: nil, failed: true)
+            }
+            throw error
+        }
+    }
+
+    /// One Metrics-tab entry per request outcome (main thread). The model
+    /// comes from the client that made the request — reading
+    /// AppSettings.assistModel here would misattribute (and misprice) a
+    /// response landing after a mid-flight model change in Settings.
+    private func recordRequestMetric(kind: String, startedAt: Date, model: String, usage: ChatCompletionClient.Usage?, failed: Bool = false) {
         recordMetric?(AssistRequestSample(
             date: Date(),
             kind: kind,

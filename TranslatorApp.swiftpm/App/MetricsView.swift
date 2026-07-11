@@ -7,12 +7,16 @@ import Charts
 /// whole conversation whether or not this tab is visible; snapshot
 /// publishing (the expensive copy) only runs while it is.
 ///
+/// Deliberately observes ONLY MetricsStore — never AppModel, whose meters
+/// publish at 10 Hz during a conversation and would re-render every chart
+/// at meter rate. Everything the charts need (lane names, live state) rides
+/// in the snapshot.
+///
 /// Color roles: speaker-identity charts reuse the lane palette used
-/// everywhere else in the app; paired-series charts use teal (outbound /
-/// input side) vs indigo (inbound / output side); red is reserved for
+/// everywhere else in the app; paired-series charts use teal (input /
+/// outbound side) vs indigo (output / inbound side); red is reserved for
 /// failures.
 struct MetricsView: View {
-    @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var metrics: MetricsStore
 
     private enum TimeWindow: String, CaseIterable, Identifiable {
@@ -34,19 +38,8 @@ struct MetricsView: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    if metrics.snapshot.isEmpty {
-                        emptyCard
-                    } else {
-                        overviewCard
-                        costCard
-                        latencyCard
-                        throughputCard
-                        sessionsCard
-                        prompterCard
-                    }
-                }
-                .padding()
+                content
+                    .padding()
             }
             .navigationTitle("Metrics")
             .navigationBarTitleDisplayMode(.inline)
@@ -65,17 +58,35 @@ struct MetricsView: View {
         }
     }
 
-    // MARK: - Windowed data
+    /// Windowing/decimation runs once per body evaluation here, then the
+    /// results are handed down — the cards must not each re-filter the
+    /// full history.
+    private var content: some View {
+        let snapshot = metrics.snapshot
+        let end = latestDataDate(snapshot)
+        let samples = windowed(snapshot.samples, \.date, end: end)
+        let connects = windowed(snapshot.connects, \.date, end: end)
+        let firstResponses = windowed(snapshot.firstResponses, \.date, end: end)
+        let assistRequests = windowed(snapshot.assistRequests, \.date, end: end)
+        return VStack(alignment: .leading, spacing: 14) {
+            if snapshot.isEmpty {
+                emptyCard
+            } else {
+                overviewCard(snapshot, samples: samples)
+                costCard(samples)
+                latencyCard(snapshot, firstResponses: firstResponses, connects: connects)
+                throughputCard(samples)
+                sessionsCard(samples)
+                prompterCard(assistRequests)
+            }
+        }
+    }
 
-    private var snapshot: MetricsSnapshot { metrics.snapshot }
-    private var samples: [PipelineSample] { windowed(snapshot.samples, \.date) }
-    private var connects: [ConnectSample] { windowed(snapshot.connects, \.date) }
-    private var firstResponses: [FirstResponseSample] { windowed(snapshot.firstResponses, \.date) }
-    private var assistRequests: [AssistRequestSample] { windowed(snapshot.assistRequests, \.date) }
+    // MARK: - Windowed data
 
     /// The window's "now" is the newest recorded timestamp, so a finished
     /// conversation still shows its tail instead of an empty chart.
-    private var latestDataDate: Date? {
+    private func latestDataDate(_ snapshot: MetricsSnapshot) -> Date? {
         [snapshot.samples.last?.date,
          snapshot.connects.last?.date,
          snapshot.firstResponses.last?.date,
@@ -84,9 +95,9 @@ struct MetricsView: View {
             .max()
     }
 
-    private func windowed<T>(_ items: [T], _ date: KeyPath<T, Date>) -> [T] {
+    private func windowed<T>(_ items: [T], _ date: KeyPath<T, Date>, end: Date?) -> [T] {
         var result = items
-        if let seconds = timeWindow.seconds, let end = latestDataDate {
+        if let seconds = timeWindow.seconds, let end {
             let cutoff = end.addingTimeInterval(-seconds)
             result = result.filter { $0[keyPath: date] >= cutoff }
         }
@@ -103,11 +114,31 @@ struct MetricsView: View {
         return result
     }
 
-    /// Lane-identity color scale for whatever lanes appear in the data —
-    /// the same colors those speakers wear on every other tab.
-    private func laneScale(_ lanes: [Int]) -> (domain: [String], range: [Color]) {
+    // MARK: - Lane identity
+
+    private func laneName(_ lane: Int, _ snapshot: MetricsSnapshot) -> String {
+        snapshot.laneNames[lane] ?? "Speaker \(lane + 1)"
+    }
+
+    private func laneColor(_ lane: Int) -> Color {
+        SpeakerLane.laneColors[max(0, lane) % SpeakerLane.laneColors.count]
+    }
+
+    /// Lane-identity labels and color scale for whatever lanes appear in the
+    /// data — the same colors those speakers wear on every other tab. Two
+    /// speakers renamed identically in Settings must not merge into one
+    /// series, so name collisions get channel suffixes.
+    private func laneScale(_ lanes: [Int], _ snapshot: MetricsSnapshot) -> (labels: [Int: String], domain: [String], range: [Color]) {
         let unique = Set(lanes).sorted()
-        return (unique.map { model.laneName($0) }, unique.map { model.lane(for: $0).color })
+        var names = unique.map { laneName($0, snapshot) }
+        if Set(names).count != names.count {
+            names = zip(unique, names).map { "\($1) (ch \($0 + 1))" }
+        }
+        return (
+            Dictionary(uniqueKeysWithValues: zip(unique, names)),
+            names,
+            unique.map { laneColor($0) }
+        )
     }
 
     // MARK: - Empty state
@@ -122,7 +153,7 @@ struct MetricsView: View {
 
     // MARK: - Overview tiles
 
-    private var overviewCard: some View {
+    private func overviewCard(_ snapshot: MetricsSnapshot, samples: [PipelineSample]) -> some View {
         let realtime = snapshot.realtimeCostTotal
         let assist = snapshot.assistCostTotal
         let billedMinutes = realtime / CostMeter.dollarsPerSessionMinute
@@ -141,7 +172,8 @@ struct MetricsView: View {
                      detail: "median of last \(min(20, snapshot.firstResponses.count))")
                 tile("Connect", connectMedian.map { secondsString($0) } ?? "—",
                      detail: "median of last \(min(20, snapshot.connects.count))")
-                tile("Duration", elapsedString, detail: sessionStateDetail)
+                tile("Duration", elapsedString(snapshot),
+                     detail: liveDetail(snapshot, samples: samples))
             }
         }
     }
@@ -164,169 +196,148 @@ struct MetricsView: View {
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.08)))
     }
 
-    private var elapsedString: String {
+    private func elapsedString(_ snapshot: MetricsSnapshot) -> String {
         guard let start = snapshot.sessionStartedAt else { return "—" }
         // The newest recorded timestamp, not Date(): a finished conversation
         // shows its actual length, and a live one updates at the 1 Hz tick.
-        let end = latestDataDate ?? start
-        let total = Int(max(0, end.timeIntervalSince(start)))
-        let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60)
-        return h > 0
-            ? "\(h):" + String(format: "%02ld:%02ld", m, s)
-            : "\(m):" + String(format: "%02ld", s)
+        let total = max(0, (latestDataDate(snapshot) ?? start).timeIntervalSince(start))
+        return Duration.seconds(total)
+            .formatted(.time(pattern: total >= 3600 ? .hourMinuteSecond : .minuteSecond))
     }
 
-    private var sessionStateDetail: String {
-        if model.mode == .conversation {
-            let open = samples.last?.openSessions ?? 0
-            return "live · \(open) session\(open == 1 ? "" : "s") open"
-        }
-        return "ended"
+    private func liveDetail(_ snapshot: MetricsSnapshot, samples: [PipelineSample]) -> String {
+        guard snapshot.isLive else { return "ended" }
+        let open = samples.last?.openSessions ?? 0
+        return "live · \(open) session\(open == 1 ? "" : "s") open"
     }
 
     // MARK: - Cost
 
-    private var costCard: some View {
+    private func costCard(_ samples: [PipelineSample]) -> some View {
         card("Cost over time") {
             Text("Cumulative dollars: realtime audio sessions ($\(String(format: "%.3f", CostMeter.dollarsPerSessionMinute))/min) vs prompter chat requests (estimated from token prices).")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
             chartOrPlaceholder(samples, "No samples yet.") {
-                Chart(samples) { sample in
-                    LineMark(
-                        x: .value("Time", sample.date),
-                        y: .value("Dollars", sample.realtimeCost),
-                        series: .value("Series", "Realtime audio")
-                    )
-                    .foregroundStyle(by: .value("Series", "Realtime audio"))
-                    .lineStyle(StrokeStyle(lineWidth: 2))
-                    LineMark(
-                        x: .value("Time", sample.date),
-                        y: .value("Dollars", sample.assistCost),
-                        series: .value("Series", "Prompter")
-                    )
-                    .foregroundStyle(by: .value("Series", "Prompter"))
-                    .lineStyle(StrokeStyle(lineWidth: 2))
-                }
-                .chartForegroundStyleScale(["Realtime audio": Color.indigo, "Prompter": Color.teal])
-                .frame(height: 160)
+                pairedLineChart(
+                    samples,
+                    series: [("Realtime audio", \.realtimeCost), ("Prompter", \.assistCost)],
+                    colors: [.indigo, .teal],
+                    height: 160
+                )
             }
         }
     }
 
     // MARK: - Latency
 
-    private var latencyCard: some View {
+    private func latencyCard(_ snapshot: MetricsSnapshot, firstResponses: [FirstResponseSample], connects: [ConnectSample]) -> some View {
         card("Latency") {
             Text("First response — speech leaving the app until the first transcript or audio back (includes connect + queue flush for lazily-opened sessions).")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
-            firstResponseChart
+            chartOrPlaceholder(firstResponses, "No responses measured yet — they appear once speech gets translated.") {
+                laneChart(scale: laneScale(firstResponses.map(\.lane), snapshot), height: 150) { labels in
+                    Chart(firstResponses) { sample in
+                        PointMark(
+                            x: .value("Time", sample.date),
+                            y: .value("Seconds", sample.seconds)
+                        )
+                        .symbolSize(45)
+                        .foregroundStyle(by: .value("Speaker", labels[sample.lane] ?? "?"))
+                    }
+                }
+            }
             Divider()
             Text("Connect — WebSocket open time per session.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
-            connectChart
+            chartOrPlaceholder(connects, "No connections yet — sessions open on each speaker's first speech.") {
+                laneChart(scale: laneScale(connects.map(\.lane), snapshot), height: 110) { labels in
+                    Chart(connects) { sample in
+                        PointMark(
+                            x: .value("Time", sample.date),
+                            y: .value("Seconds", sample.seconds)
+                        )
+                        .symbol(.diamond)
+                        .symbolSize(45)
+                        .foregroundStyle(by: .value("Speaker", labels[sample.lane] ?? "?"))
+                    }
+                }
+            }
         }
     }
 
-    @ViewBuilder
-    private var firstResponseChart: some View {
-        let scale = laneScale(firstResponses.map(\.lane))
-        chartOrPlaceholder(firstResponses, "No responses measured yet — they appear once speech gets translated.") {
-            Chart(firstResponses) { sample in
-                PointMark(
-                    x: .value("Time", sample.date),
-                    y: .value("Seconds", sample.seconds)
-                )
-                .symbolSize(45)
-                .foregroundStyle(by: .value("Speaker", model.laneName(sample.lane)))
-            }
+    /// Applies a lane color scale and frame to a scatter chart body.
+    private func laneChart<C: View>(
+        scale: (labels: [Int: String], domain: [String], range: [Color]),
+        height: CGFloat,
+        @ViewBuilder chart: ([Int: String]) -> C
+    ) -> some View {
+        chart(scale.labels)
             .chartForegroundStyleScale(domain: scale.domain, range: scale.range)
-            .frame(height: 150)
-        }
-    }
-
-    @ViewBuilder
-    private var connectChart: some View {
-        let scale = laneScale(connects.map(\.lane))
-        chartOrPlaceholder(connects, "No connections yet — sessions open on each speaker's first speech.") {
-            Chart(connects) { sample in
-                PointMark(
-                    x: .value("Time", sample.date),
-                    y: .value("Seconds", sample.seconds)
-                )
-                .symbol(.diamond)
-                .symbolSize(45)
-                .foregroundStyle(by: .value("Speaker", model.laneName(sample.lane)))
-            }
-            .chartForegroundStyleScale(domain: scale.domain, range: scale.range)
-            .frame(height: 110)
-        }
+            .frame(height: height)
     }
 
     // MARK: - Throughput
 
-    private var throughputCard: some View {
+    private func throughputCard(_ samples: [PipelineSample]) -> some View {
         card("Throughput") {
             Text("Audio — seconds of audio per wall-clock second, all lanes summed (1.0 = one lane streaming continuously).")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
             chartOrPlaceholder(samples, "No samples yet.") {
-                Chart(samples) { sample in
-                    LineMark(
-                        x: .value("Time", sample.date),
-                        y: .value("Audio s/s", sample.audioInRate),
-                        series: .value("Direction", "Mic → server")
-                    )
-                    .foregroundStyle(by: .value("Direction", "Mic → server"))
-                    .interpolationMethod(.monotone)
-                    .lineStyle(StrokeStyle(lineWidth: 2))
-                    LineMark(
-                        x: .value("Time", sample.date),
-                        y: .value("Audio s/s", sample.audioOutRate),
-                        series: .value("Direction", "Translation ← server")
-                    )
-                    .foregroundStyle(by: .value("Direction", "Translation ← server"))
-                    .interpolationMethod(.monotone)
-                    .lineStyle(StrokeStyle(lineWidth: 2))
-                }
-                .chartForegroundStyleScale(["Mic → server": Color.teal, "Translation ← server": Color.indigo])
-                .frame(height: 140)
+                pairedLineChart(
+                    samples,
+                    series: [("Mic → server", \.audioInRate), ("Translation ← server", \.audioOutRate)],
+                    colors: [.teal, .indigo],
+                    height: 140
+                )
             }
             Divider()
             Text("Text — transcript characters received per second.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
             chartOrPlaceholder(samples, "No samples yet.") {
-                Chart(samples) { sample in
-                    LineMark(
-                        x: .value("Time", sample.date),
-                        y: .value("Chars/s", sample.sourceCharsPerSecond),
-                        series: .value("Stream", "Source text")
-                    )
-                    .foregroundStyle(by: .value("Stream", "Source text"))
-                    .interpolationMethod(.monotone)
-                    .lineStyle(StrokeStyle(lineWidth: 2))
-                    LineMark(
-                        x: .value("Time", sample.date),
-                        y: .value("Chars/s", sample.translationCharsPerSecond),
-                        series: .value("Stream", "Translation text")
-                    )
-                    .foregroundStyle(by: .value("Stream", "Translation text"))
-                    .interpolationMethod(.monotone)
-                    .lineStyle(StrokeStyle(lineWidth: 2))
-                }
-                .chartForegroundStyleScale(["Source text": Color.teal, "Translation text": Color.indigo])
-                .frame(height: 140)
+                pairedLineChart(
+                    samples,
+                    series: [("Source text", \.sourceCharsPerSecond), ("Translation text", \.translationCharsPerSecond)],
+                    colors: [.teal, .indigo],
+                    height: 140
+                )
             }
         }
     }
 
+    /// Two (or more) PipelineSample series as labeled lines — the one shape
+    /// behind the cost, audio, and text charts, so mark styling stays
+    /// consistent across all three.
+    private func pairedLineChart(
+        _ samples: [PipelineSample],
+        series: [(label: String, value: KeyPath<PipelineSample, Double>)],
+        colors: [Color],
+        height: CGFloat
+    ) -> some View {
+        Chart(samples) { sample in
+            ForEach(series, id: \.label) { entry in
+                LineMark(
+                    x: .value("Time", sample.date),
+                    y: .value(entry.label, sample[keyPath: entry.value]),
+                    series: .value("Series", entry.label)
+                )
+                .foregroundStyle(by: .value("Series", entry.label))
+                .interpolationMethod(.monotone)
+                .lineStyle(StrokeStyle(lineWidth: 2))
+            }
+        }
+        .chartForegroundStyleScale(domain: series.map(\.label), range: colors)
+        .frame(height: height)
+    }
+
     // MARK: - Sessions
 
-    private var sessionsCard: some View {
-        let maxSessions = max(samples.map(\.openSessions).max() ?? 1, 1)
+    private func sessionsCard(_ samples: [PipelineSample]) -> some View {
+        let maxSessions = max(samples.max(by: { $0.openSessions < $1.openSessions })?.openSessions ?? 1, 1)
         let idleClose = AppSettings.idleCloseSeconds
         return card("Open sessions") {
             Text(idleClose > 0
@@ -359,7 +370,7 @@ struct MetricsView: View {
 
     // MARK: - Prompter
 
-    private var prompterCard: some View {
+    private func prompterCard(_ assistRequests: [AssistRequestSample]) -> some View {
         card("Prompter") {
             Text("Tokens per request — the prompt segment is the request's whole context (system + transcript window), so its trend is the context size.")
                 .font(.caption2)

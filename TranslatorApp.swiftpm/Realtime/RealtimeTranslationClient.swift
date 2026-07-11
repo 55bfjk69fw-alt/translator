@@ -123,16 +123,23 @@ final class RealtimeTranslationClient: NSObject {
     /// so progress is reported as monotonic increments.
     private var reportedBilledSeconds: Double = 0
 
-    /// First-response clock (queue-confined): armed by the first speech
-    /// chunk that arrives while the server is quiet, cleared by the first
-    /// content event back. The interval is the listener's time-to-first-
-    /// response — for a lazily-opened session it includes the connect and
-    /// the pre-open queue flush, which is exactly the delay the user feels.
+    /// First-response clock (queue-confined): armed by the first chunk the
+    /// gate marked as speech that arrives while the server is quiet, cleared
+    /// by the first content event back. The interval is the listener's
+    /// time-to-first-response — for a lazily-opened session it includes the
+    /// connect and the pre-open queue flush, which is exactly the delay the
+    /// user feels.
     private var awaitingResponseSince: Date?
     /// When the server last produced content on any stream (heartbeats
     /// excluded) — a speech chunk only arms a fresh measurement once the
     /// server has been quiet, so mid-stream chunks don't count as "waits".
     private var lastContentEventAt: Date?
+    /// Regenerated on every connect. Snapshot consumers diff the cumulative
+    /// traffic counters between samples; comparing this identity is how they
+    /// detect a counter reset — a value dip can't be trusted for that, since
+    /// a reconnect's pre-open queue flush can outrun the old total within
+    /// one sampling tick.
+    private var connectionID = UUID()
 
     // Audio arriving while the socket is still connecting is queued and
     // flushed on open, so lazily-opened sessions don't drop the words that
@@ -178,6 +185,10 @@ final class RealtimeTranslationClient: NSObject {
     /// gate → session → transcript chain is breaking for this lane.
     struct Snapshot {
         var state: State
+        /// Changes on every reconnect; counters below restart at zero with
+        /// it. Consumers diffing counters across snapshots must treat a new
+        /// ID as a fresh baseline.
+        var connectionID: UUID
         /// Seconds since the socket reached .open (nil while not open).
         var openForSeconds: TimeInterval?
         /// Total audio streamed vs. the part that carried actual signal.
@@ -206,6 +217,7 @@ final class RealtimeTranslationClient: NSObject {
             let now = Date()
             return Snapshot(
                 state: state,
+                connectionID: connectionID,
                 openForSeconds: state == .open ? openedAt.map { now.timeIntervalSince($0) } : nil,
                 audioSecondsSent: Double(stats.audioBytesSent) / Self.billedBytesPerSecond,
                 speechSecondsSent: Double(stats.speechBytesSent) / Self.billedBytesPerSecond,
@@ -258,8 +270,14 @@ final class RealtimeTranslationClient: NSObject {
     /// Translation sessions accept exactly: session.update,
     /// session.input_audio_buffer.append, session.close — note the
     /// "session." prefix on all client events.
-    func sendAudio(_ pcm16: Data) {
-        queue.async { self.sendAudioOnQueue(pcm16) }
+    ///
+    /// `containsSpeech` is the gate's voicing verdict for this chunk; it
+    /// drives the first-response clock. Keyed on the gate (not a silence
+    /// scan here) so that with the gate disabled — where every noisy room
+    /// buffer flows through — ambient noise can't arm bogus latency
+    /// measurements.
+    func sendAudio(_ pcm16: Data, containsSpeech: Bool = false) {
+        queue.async { self.sendAudioOnQueue(pcm16, containsSpeech: containsSpeech) }
     }
 
     // MARK: - Lifecycle (queue-confined)
@@ -273,6 +291,7 @@ final class RealtimeTranslationClient: NSObject {
         intentionallyClosed = false
         seenEventTypes.removeAll()
         stats = Stats()
+        connectionID = UUID()
         // Each connection is a fresh billed session server-side: elapsed_ms
         // restarts at zero, so the billed-progress baseline must too.
         maxElapsedMs = 0
@@ -285,9 +304,12 @@ final class RealtimeTranslationClient: NSObject {
         lastSourceDeltaAt = nil
         lastTranslationDeltaAt = nil
         lastAudioFrameAt = nil
-        // A wait armed against a dead connection would measure the outage,
-        // not the server: the speech that armed it was lost with the socket.
-        awaitingResponseSince = nil
+        // pendingAudio survives a reconnect and flushes on open, so a wait
+        // armed by still-queued speech keeps its clock (the reconnect delay
+        // IS part of what the listener waits through). A wait with nothing
+        // queued was armed by audio that died with the old socket — clearing
+        // it stops the measurement from including a whole outage.
+        if pendingAudio.isEmpty { awaitingResponseSince = nil }
         lastContentEventAt = nil
         warnedNothingReturned = false
         warnedNoSourceText = false
@@ -351,12 +373,12 @@ final class RealtimeTranslationClient: NSObject {
 
     // MARK: - Sending (queue-confined)
 
-    private func sendAudioOnQueue(_ pcm16: Data) {
+    private func sendAudioOnQueue(_ pcm16: Data, containsSpeech: Bool) {
         // Appending after session.close is a protocol violation.
         guard !intentionallyClosed else { return }
         // Armed here (not in sendAppendEvent) so audio queued while the
         // socket connects starts the clock at speech time, not flush time.
-        if !Self.isPureSilence(pcm16) { armResponseClock() }
+        if containsSpeech { armResponseClock() }
         if state == .open {
             sendAppendEvent(pcm16)
         } else {

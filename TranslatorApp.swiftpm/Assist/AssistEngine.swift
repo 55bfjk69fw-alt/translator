@@ -26,7 +26,12 @@ final class AssistEngine: ObservableObject {
 
     struct Suggestion: Identifiable, Equatable {
         let id: String
+        /// Short intent description ("Ask how long the drive was") — what
+        /// the chips show.
         var gloss: String
+        /// Literal English translation of the exact line — what the cue
+        /// card shows so the user knows precisely what they're saying.
+        var meaning: String
         var hanzi: String
         var pinyin: String
         var register: String
@@ -444,9 +449,11 @@ final class AssistEngine: ObservableObject {
                 pinyin = ""
             }
             let replyTo = (item["reply_to"] as? String).flatMap { $0 == "table" || $0.isEmpty ? nil : $0 }
+            let meaning = (item["meaning"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? gloss
             let suggestion = Suggestion(
                 id: nextID(),
                 gloss: gloss,
+                meaning: meaning,
                 hanzi: hanzi,
                 pinyin: pinyin,
                 register: item["register"] as? String ?? "casual",

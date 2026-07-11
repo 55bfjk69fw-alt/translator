@@ -326,9 +326,11 @@ enum AppSettings {
         return value.isEmpty ? "auto" : value
     }
 
+    static let defaultAssistModel = "gpt-5-mini"
+
     static var assistModel: String {
         let value = UserDefaults.standard.string(forKey: assistModelKey) ?? ""
-        return value.isEmpty ? "gpt-4o-mini" : value
+        return value.isEmpty ? defaultAssistModel : value
     }
 
     static let defaultAssistEndpoint = "https://api.openai.com/v1/chat/completions"

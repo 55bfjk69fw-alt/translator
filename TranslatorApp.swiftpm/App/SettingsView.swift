@@ -7,6 +7,16 @@ struct SettingsView: View {
     @State private var apiKey: String = KeychainStore.loadAPIKey() ?? ""
     @State private var keySaved = false
 
+    // Prompter model picker: fetched from the account's /v1/models at
+    // view load; the static list covers fetch failure / no key yet.
+    @State private var availableModels: [String] = []
+    @State private var modelsNote: String?
+
+    private static let fallbackModels = [
+        "gpt-5.1", "gpt-5", "gpt-5-mini", "gpt-5-nano",
+        "gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini"
+    ]
+
     @AppStorage(AppSettings.noiseGateEnabledKey) private var noiseGateEnabled = true
     @AppStorage(AppSettings.neuralVADEnabledKey) private var neuralVADEnabled = true
     @AppStorage(AppSettings.micProfileKey) private var micProfileRaw = AppSettings.MicProfile.worn.rawValue
@@ -145,9 +155,16 @@ struct SettingsView: View {
                         axis: .vertical
                     )
                     .lineLimit(3...8)
-                    TextField("Assist model", text: $assistModel, prompt: Text("gpt-4o-mini"))
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
+                    Picker("Model", selection: $assistModel) {
+                        ForEach(modelChoices, id: \.self) { model in
+                            Text(model).tag(model)
+                        }
+                    }
+                    if let modelsNote {
+                        Text(modelsNote)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                 } header: {
                     Text("Reply prompter")
                 } footer: {
@@ -235,6 +252,38 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("Settings")
+            .task { await loadAssistModels() }
+            .onAppear {
+                // The picker needs a concrete selection; materialize the
+                // default so the stored value and the UI always agree.
+                if assistModel.isEmpty { assistModel = AppSettings.defaultAssistModel }
+            }
+        }
+    }
+
+    /// Fetched list first, static fallback otherwise; the current selection
+    /// is always present so the picker never shows an unselectable state.
+    private var modelChoices: [String] {
+        var choices = availableModels.isEmpty ? Self.fallbackModels : availableModels
+        let current = assistModel.isEmpty ? AppSettings.defaultAssistModel : assistModel
+        if !choices.contains(current) { choices.insert(current, at: 0) }
+        return choices
+    }
+
+    private func loadAssistModels() async {
+        guard let key = KeychainStore.loadAPIKey(), !key.isEmpty else {
+            modelsNote = "Add an API key to list your account's models — showing common ones."
+            return
+        }
+        do {
+            let models = try await ChatCompletionClient.listModels(apiKey: key)
+            if !models.isEmpty {
+                availableModels = models
+                modelsNote = nil
+            }
+        } catch {
+            modelsNote = "Couldn't fetch your model list — showing common models."
+            Log.warn("[assist] model list fetch failed: \(error.localizedDescription)")
         }
     }
 

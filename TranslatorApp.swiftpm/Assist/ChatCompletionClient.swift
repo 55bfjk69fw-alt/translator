@@ -52,7 +52,7 @@ struct ChatCompletionClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 25
 
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "model": model,
             "messages": [
                 ["role": "system", "content": system],
@@ -67,6 +67,13 @@ struct ChatCompletionClient {
                 ]
             ]
         ]
+        // Reasoning models default to slow multi-second thinking — this is
+        // a latency-sensitive JSON task, so pin low effort. The gpt-5-chat-*
+        // variants are non-reasoning and reject the parameter.
+        if (model.hasPrefix("gpt-5") && !model.contains("chat"))
+            || model.hasPrefix("o1") || model.hasPrefix("o3") || model.hasPrefix("o4") {
+            payload["reasoning_effort"] = "low"
+        }
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -98,5 +105,42 @@ struct ChatCompletionClient {
             )
         }
         return Response(content: object, usage: usage)
+    }
+
+    /// Chat-capable model ids available to this API key, for the Settings
+    /// picker. Derived from the configured chat endpoint so relay users
+    /// list through their relay too.
+    static func listModels(apiKey: String) async throws -> [String] {
+        let chat = AppSettings.assistEndpoint.absoluteString
+        let suffix = "/chat/completions"
+        let modelsURLString = chat.hasSuffix(suffix)
+            ? String(chat.dropLast(suffix.count)) + "/models"
+            : "https://api.openai.com/v1/models"
+        guard let url = URL(string: modelsURLString) else {
+            throw ClientError.malformedResponse("bad models URL")
+        }
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 15
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw ClientError.badStatus(code, String(data: data.prefix(200), encoding: .utf8) ?? "")
+        }
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let list = root["data"] as? [[String: Any]] else {
+            throw ClientError.malformedResponse("missing data array")
+        }
+        // Text-chat models only: the account list is full of audio/image/
+        // embedding/realtime variants that would 400 on chat completions.
+        let excluded = ["realtime", "audio", "tts", "transcribe", "whisper",
+                        "embedding", "image", "dall-e", "moderation", "search",
+                        "computer-use", "codex", "instruct"]
+        let ids = list.compactMap { $0["id"] as? String }.filter { id in
+            (id.hasPrefix("gpt") || id.hasPrefix("o1") || id.hasPrefix("o3") || id.hasPrefix("o4"))
+                && !excluded.contains(where: { id.contains($0) })
+        }
+        // Descending so the newest families list first.
+        return Array(Set(ids)).sorted(by: >)
     }
 }

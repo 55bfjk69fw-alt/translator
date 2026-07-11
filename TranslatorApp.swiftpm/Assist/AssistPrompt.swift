@@ -41,10 +41,13 @@ enum AssistPrompt {
         lines.append("""
         Field rules: `gloss` is a short English description of what saying it \
         accomplishes (e.g. "Ask how long the drive was"); `hanzi` is the exact \
-        \(language) line to say; `pinyin` is its pronunciation aid \
-        (tone-marked pinyin for Mandarin, romanization otherwise); `register` \
-        is "casual" or "polite"; `reply_to` is the name of the person/thread \
-        it responds to, or "table" for a general contribution, or null.
+        \(language) line to say; `meaning` is the LITERAL English translation \
+        of that exact line (e.g. "How long did you drive from Chongqing?") — \
+        the user reads it to know precisely what they are committing to say; \
+        `pinyin` is the line's pronunciation aid (tone-marked pinyin for \
+        Mandarin, romanization otherwise); `register` is "casual" or \
+        "polite"; `reply_to` is the name of the person/thread it responds \
+        to, or "table" for a general contribution, or null.
         """)
         return lines.joined(separator: "\n")
     }
@@ -160,10 +163,11 @@ enum AssistPrompt {
                     "items": [
                         "type": "object",
                         "additionalProperties": false,
-                        "required": ["keep", "gloss", "hanzi", "pinyin", "register", "reply_to"],
+                        "required": ["keep", "gloss", "meaning", "hanzi", "pinyin", "register", "reply_to"],
                         "properties": [
                             "keep": ["type": ["string", "null"]],
                             "gloss": ["type": "string"],
+                            "meaning": ["type": "string"],
                             "hanzi": ["type": "string"],
                             "pinyin": ["type": "string"],
                             "register": ["type": "string", "enum": ["casual", "polite"]],

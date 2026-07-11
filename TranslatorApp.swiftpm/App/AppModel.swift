@@ -126,7 +126,9 @@ final class AppModel: ObservableObject {
             }
         }
         assist.onUserSaid = { [weak self] suggestion in
-            self?.transcript.addUserUtterance(source: suggestion.hanzi, gloss: suggestion.gloss)
+            // The literal meaning, not the intent gloss — the transcript
+            // records what was actually said.
+            self?.transcript.addUserUtterance(source: suggestion.hanzi, gloss: suggestion.meaning)
         }
         observeNotifications()
     }

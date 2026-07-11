@@ -350,7 +350,12 @@ private struct CueCardView: View {
 
     var body: some View {
         VStack(spacing: 18) {
-            Spacer(minLength: 8)
+            // The intent (what the chip showed) as a small anchor…
+            Text(suggestion.gloss)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Spacer(minLength: 4)
             Text(suggestion.hanzi)
                 .font(.system(size: 40, weight: .semibold))
                 .multilineTextAlignment(.center)
@@ -362,10 +367,12 @@ private struct CueCardView: View {
                     .multilineTextAlignment(.center)
                     .textSelection(.enabled)
             }
-            Text("“\(suggestion.gloss)”")
-                .font(.body)
-                .foregroundStyle(.secondary)
+            // …and the LITERAL meaning of the exact line, so the user
+            // knows precisely what they're committing to say.
+            Text("“\(suggestion.meaning)”")
+                .font(.title3)
                 .multilineTextAlignment(.center)
+                .textSelection(.enabled)
             HStack(spacing: 8) {
                 tag(suggestion.register)
                 if let replyTo = suggestion.replyTo {

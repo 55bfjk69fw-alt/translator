@@ -64,9 +64,10 @@ The PTT bar at the bottom is replaced by an **assist bar**:
   iPad):
 
   ```
+  Ask how long the drive was      ← gloss (intent), small anchor
   你们开了多久的车？             ← .largeTitle, the thing to read
   Nǐmen kāi le duō jiǔ de chē?   ← .title2, teal, the pronunciation aid
-  "How long did you all drive?"   ← gloss, secondary
+  "How long did you all drive?"   ← meaning: LITERAL translation of the line
   casual · replies to Uncle Wang  ← register + target
   [ I said this ]  [ Refine… ]    ← actions
   ```
@@ -99,7 +100,7 @@ New **"About you (reply prompter)"** section:
 | Mandarin level | picker | elementary | beginner / elementary / intermediate / advanced — caps sentence length & vocabulary in the prompt |
 | Tone | picker | auto | casual / polite / auto (model reads the room) |
 | Auto-suggest | toggle | on | Off = tray fills only via "suggest now" / scoped requests |
-| Assist model | text | `gpt-4o-mini` | Same escape-hatch pattern as the realtime model field |
+| Model | picker | `gpt-5-mini` | Populated from the account's `/v1/models` (chat-capable ids only), static fallback list offline; `reasoning_effort: low` is pinned for reasoning models |
 
 `userName` already exists and is reused. Reply language stays a setting
 (`pttOutputLanguage` renamed → `replyLanguage`, default `zh`) so the flow
@@ -198,6 +199,7 @@ One `chat/completions` call, `response_format: json_schema (strict)`:
     {
       "keep":     "b3",
       "gloss":    "Ask how long the drive from Chongqing was",
+      "meaning":  "How long did you drive from Chongqing?",
       "hanzi":    "你们从重庆开了多久的车？",
       "pinyin":   "Nǐmen cóng Chóngqìng kāi le duō jiǔ de chē?",
       "register": "casual",
@@ -232,9 +234,9 @@ stored.
 
 ### Cost & model
 
-~1.8k tokens in / ~250 out per call. Worst case (continuous multi-thread
-chatter pinning the loop to the 5 s rate limit) is ~720 calls/hour — about
-$0.30/hour at `gpt-4o-mini` pricing, noise against the ~$10/hour realtime
+~1.8k tokens in / ~300 out per call. Worst case (continuous multi-thread
+chatter pinning the loop to the 5 s rate limit) is ~720 calls/hour — under
+$1/hour at `gpt-5-mini` pricing, noise against the ~$10/hour realtime
 sessions; typical turn-taking conversation costs a fraction of that. Token usage per call is logged
 to Diagnostics (no UI meter for now). The model field is a Settings
 escape-hatch, same philosophy as the realtime model/endpoint fields.

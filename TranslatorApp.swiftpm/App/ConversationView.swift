@@ -2,6 +2,9 @@ import SwiftUI
 
 struct ConversationView: View {
     @EnvironmentObject private var model: AppModel
+    /// Observed directly (not through AppModel) so streaming deltas only
+    /// re-render the transcript-reading parts of this view.
+    @EnvironmentObject private var transcript: TranscriptStore
 
     @State private var composerText = ""
     @State private var composing = false
@@ -55,7 +58,7 @@ struct ConversationView: View {
                 titleVisibility: .visible
             ) {
                 Button("Clear conversation", role: .destructive) {
-                    model.transcript.clear()
+                    transcript.clear()
                 }
             } message: {
                 Text("Removes every bubble from the transcript. This can't be undone.")
@@ -82,25 +85,13 @@ struct ConversationView: View {
     // MARK: - Status bar
 
     private var statusBar: some View {
-        HStack(spacing: 14) {
-            ForEach(Array(model.lanes.enumerated()), id: \.element.id) { index, lane in
-                LaneStatusDot(
-                    lane: lane,
-                    level: index < model.meters.count ? model.meters[index] : 0,
-                    open: index < model.gateOpen.count ? model.gateOpen[index] : false,
-                    state: model.sessionStates[lane.id]
-                )
-            }
-            Spacer()
-            if model.mode != .idle {
-                Text(String(format: "~$%.2f", model.estimatedCost))
-                    .font(.footnote.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .padding(.horizontal)
-        .padding(.vertical, 6)
-        .background(.thinMaterial)
+        StatusBarView(
+            meters: model.channelMeters,
+            lanes: model.lanes,
+            sessionStates: model.sessionStates,
+            estimatedCost: model.estimatedCost,
+            showCost: model.mode != .idle
+        )
     }
 
     private var clearButton: some View {
@@ -109,7 +100,7 @@ struct ConversationView: View {
         } label: {
             Label("Clear conversation", systemImage: "trash")
         }
-        .disabled(model.transcript.utterances.isEmpty)
+        .disabled(transcript.utterances.isEmpty)
     }
 
     private var startStopButton: some View {
@@ -133,15 +124,15 @@ struct ConversationView: View {
 
     private var transcriptList: some View {
         PinnedScrollView(
-            bottomID: model.transcript.utterances.last?.id,
-            contentRevision: model.transcript.contentRevision,
-            itemCount: model.transcript.utterances.count
+            bottomID: transcript.utterances.last?.id,
+            contentRevision: transcript.contentRevision,
+            itemCount: transcript.utterances.count
         ) {
             LazyVStack(alignment: .leading, spacing: 10) {
-                if model.transcript.utterances.isEmpty {
+                if transcript.utterances.isEmpty {
                     emptyHint
                 }
-                ForEach(model.transcript.utterances) { utterance in
+                ForEach(transcript.utterances) { utterance in
                     let isUser = utterance.laneID == SpeakerLane.userLaneID
                     UtteranceBubble(
                         utterance: utterance,
@@ -209,6 +200,40 @@ struct ConversationView: View {
                 explanation = result
             }
         }
+    }
+}
+
+// MARK: - Status bar
+
+/// Observes ChannelMeters directly so the 10 Hz level churn re-renders only
+/// this bar — not the transcript list above the fold.
+private struct StatusBarView: View {
+    @ObservedObject var meters: ChannelMeters
+    let lanes: [SpeakerLane]
+    let sessionStates: [Int: RealtimeTranslationClient.State]
+    let estimatedCost: Double
+    let showCost: Bool
+
+    var body: some View {
+        HStack(spacing: 14) {
+            ForEach(Array(lanes.enumerated()), id: \.element.id) { index, lane in
+                LaneStatusDot(
+                    lane: lane,
+                    level: index < meters.levels.count ? meters.levels[index] : 0,
+                    open: index < meters.gateOpen.count ? meters.gateOpen[index] : false,
+                    state: sessionStates[lane.id]
+                )
+            }
+            Spacer()
+            if showCost {
+                Text(String(format: "~$%.2f", estimatedCost))
+                    .font(.footnote.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 6)
+        .background(.thinMaterial)
     }
 }
 
@@ -608,7 +633,7 @@ private struct UtteranceBubble: View {
                 if !utterance.sourceText.isEmpty {
                     Text(utterance.sourceText)
                         .font(.body)
-                    if showPinyin, let pinyin = utterance.sourceText.pinyin {
+                    if showPinyin, let pinyin = utterance.sourcePinyin {
                         Text(pinyin)
                             .font(.footnote.italic())
                             .foregroundStyle(.teal)
@@ -619,7 +644,7 @@ private struct UtteranceBubble: View {
                     Text(utterance.translatedText)
                         .font(.callout)
                         .foregroundStyle(.secondary)
-                    if showPinyin, let pinyin = utterance.translatedText.pinyin {
+                    if showPinyin, let pinyin = utterance.translatedPinyin {
                         Text(pinyin)
                             .font(.footnote.italic())
                             .foregroundStyle(.teal)

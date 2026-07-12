@@ -9,6 +9,7 @@ struct TranslatorApp: App {
         WindowGroup {
             ContentView()
                 .environmentObject(model)
+                .environmentObject(model.transcript)
                 .environmentObject(model.signalAnalyzer)
                 .environmentObject(model.metrics)
                 .onAppear {

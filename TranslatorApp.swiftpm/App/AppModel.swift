@@ -4,6 +4,29 @@ import Combine
 import SwiftUI
 import UIKit
 
+/// 10 Hz per-channel level/gate state for the status dots and bench meters.
+/// Deliberately its own ObservableObject (the SignalAnalyzer pattern): meter
+/// churn re-renders only the views that draw meters, not everything that
+/// observes AppModel — at 10 Hz for hours with the screen locked awake, that
+/// difference is real CPU and battery. Main thread only.
+final class ChannelMeters: ObservableObject {
+    @Published private(set) var levels: [Float] = []
+    @Published private(set) var gateOpen: [Bool] = []
+
+    func reset(channelCount: Int) {
+        levels = Array(repeating: 0, count: channelCount)
+        gateOpen = Array(repeating: false, count: channelCount)
+    }
+
+    /// Drops pushes whose shape doesn't match the current session (a late
+    /// hop from a torn-down pipeline), like the old AppModel guard did.
+    func update(levels: [Float], gateOpen: [Bool]) {
+        guard levels.count == self.levels.count else { return }
+        self.levels = levels
+        self.gateOpen = gateOpen
+    }
+}
+
 /// Central coordinator: audio session/engine, per-channel gating and
 /// resampling, one translation session per speaker, the reply prompter,
 /// and transcript/cost bookkeeping.
@@ -23,8 +46,6 @@ final class AppModel: ObservableObject {
 
     @Published private(set) var mode: Mode = .idle
     @Published private(set) var lanes: [SpeakerLane] = []
-    @Published private(set) var meters: [Float] = []
-    @Published private(set) var gateOpen: [Bool] = []
     @Published private(set) var sessionStates: [Int: RealtimeTranslationClient.State] = [:]
     @Published private(set) var route: AudioSessionController.RouteSnapshot?
     @Published private(set) var estimatedCost: Double = 0
@@ -47,6 +68,11 @@ final class AppModel: ObservableObject {
     @Published private(set) var pipelineStatuses: [LanePipelineStatus] = []
 
     let transcript: TranscriptStore
+
+    /// 10 Hz level/gate dots. Its own ObservableObject so meter churn only
+    /// re-renders the status bar and Diagnostics meter rows (see the class
+    /// comment above).
+    let channelMeters = ChannelMeters()
 
     /// Reply prompter (docs/REPLY-FLOW.md). Its own ObservableObject so the
     /// assist bar re-renders on suggestion churn without re-rendering the
@@ -106,7 +132,6 @@ final class AppModel: ObservableObject {
 
     private var uiTimer: Timer?
     private var stopping = false
-    private var cancellables: Set<AnyCancellable> = []
 
     // Start-window bookkeeping (main thread): the chime playing under the
     // AirPods-claim session, the poll waiting for the hop, and the one-shot
@@ -119,11 +144,10 @@ final class AppModel: ObservableObject {
         AppSettings.migrateLegacyKeys()
         transcript = TranscriptStore()
         engineGraph.outputGain = AppSettings.outputGain
-        // Nested ObservableObject: forward its changes so views observing
-        // AppModel re-render on transcript updates.
-        transcript.objectWillChange
-            .sink { [weak self] _ in self?.objectWillChange.send() }
-            .store(in: &cancellables)
+        // TranscriptStore's changes are deliberately NOT forwarded through
+        // objectWillChange: views that show the transcript observe it
+        // directly (it's injected as its own environment object), so a
+        // streaming delta doesn't re-render everything observing AppModel.
         // Prompter wiring: the engine reads the transcript through these
         // closures and writes "I said this" turns back through them — it
         // never touches the audio pipeline (docs/REPLY-FLOW.md §3).
@@ -306,8 +330,7 @@ final class AppModel: ObservableObject {
 
         let channelCount = min(4, engineGraph.inputChannelCount)
         lanes = (0..<channelCount).map { SpeakerLane.djiLane(channel: $0, name: AppSettings.speakerName($0)) }
-        meters = Array(repeating: 0, count: channelCount)
-        gateOpen = Array(repeating: false, count: channelCount)
+        channelMeters.reset(channelCount: channelCount)
 
         audioQueue.sync {
             applyGateTuningLocked()
@@ -491,10 +514,7 @@ final class AppModel: ObservableObject {
         let levels = decisions.map { min(1, $0.rms * 12) }
         let open = decisions.map(\.pass)
         DispatchQueue.main.async {
-            if self.meters.count == levels.count {
-                self.meters = levels
-                self.gateOpen = open
-            }
+            self.channelMeters.update(levels: levels, gateOpen: open)
         }
     }
 
@@ -680,8 +700,7 @@ final class AppModel: ObservableObject {
         }
         let channelCount = min(4, engineGraph.inputChannelCount)
         lanes = (0..<channelCount).map { SpeakerLane.djiLane(channel: $0, name: AppSettings.speakerName($0)) }
-        meters = Array(repeating: 0, count: channelCount)
-        gateOpen = Array(repeating: false, count: channelCount)
+        channelMeters.reset(channelCount: channelCount)
         // Run the gate with the real settings (it used to be disabled here)
         // so the Signal tab shows genuine gate behavior without any API
         // cost. Bench meters/gate dots now reflect gating too.
@@ -735,11 +754,12 @@ final class AppModel: ObservableObject {
         let (clientsCopy, voiceTimes) = audioQueue.sync { (clients, lastVoiceAt) }
         let sessionSnapshots = clientsCopy.mapValues { $0.snapshot() }
         let now = Date()
+        let open = channelMeters.gateOpen
         pipelineStatuses = lanes.map { lane in
             LanePipelineStatus(
                 id: lane.id,
                 name: lane.name,
-                gateOpen: lane.id < gateOpen.count ? gateOpen[lane.id] : false,
+                gateOpen: lane.id < open.count ? open[lane.id] : false,
                 secondsSinceSpeech: voiceTimes[lane.id].map { now.timeIntervalSince($0) },
                 session: sessionSnapshots[lane.id]
             )
@@ -808,7 +828,10 @@ final class AppModel: ObservableObject {
     }
 
     private func refreshCost() {
-        estimatedCost = costMeter.estimatedDollars
+        // @Published fires objectWillChange even on same-value writes, and
+        // this runs at 1 Hz — only publish when the estimate actually moved.
+        let cost = costMeter.estimatedDollars
+        if estimatedCost != cost { estimatedCost = cost }
     }
 
     private func observeNotifications() {

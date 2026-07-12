@@ -244,6 +244,10 @@ profile.
 
 ## Roadmap
 
+- [ ] Multi-speaker bleed separation for chaotic multi-conversation settings
+  (per-band masking, cross-channel subtraction): problem-space exploration in
+  `docs/BLEED-SEPARATION.md`; first step is a raw 4-channel field recorder in
+  Diagnostics to capture measurement data.
 - [ ] M6: TestFlight self-install (Apple Developer Program, upload from Playgrounds)
   for a home-screen app; CI (GitHub Actions + fastlane) only if background audio is
   ever required.

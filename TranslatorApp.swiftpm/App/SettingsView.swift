@@ -274,6 +274,16 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("Settings")
+            // The form is mostly text fields with no submit action — the
+            // bio field's Return even inserts a newline — so scrolling and
+            // a keyboard-bar Done are the ways out from under the keyboard.
+            .scrollDismissesKeyboard(.immediately)
+            .toolbar {
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("Done") { dismissKeyboard() }
+                }
+            }
             .task { await loadAssistModels() }
             .onAppear {
                 // The picker needs a concrete selection; materialize the

@@ -7,6 +7,7 @@ struct ConversationView: View {
     @State private var composing = false
     @State private var cueCard: AssistEngine.Suggestion?
     @State private var explanation: AssistEngine.Explanation?
+    @State private var confirmingClear = false
 
     /// The privacy switch: with the prompter off, NO assist affordance may
     /// exist — the composer, tray, and long-press actions all send the
@@ -41,9 +42,23 @@ struct ConversationView: View {
             .navigationTitle("Translator")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    clearButton
+                }
                 ToolbarItem(placement: .primaryAction) {
                     startStopButton
                 }
+            }
+            .confirmationDialog(
+                "Clear the conversation?",
+                isPresented: $confirmingClear,
+                titleVisibility: .visible
+            ) {
+                Button("Clear conversation", role: .destructive) {
+                    model.transcript.clear()
+                }
+            } message: {
+                Text("Removes every bubble from the transcript. This can't be undone.")
             }
             .sheet(item: $cueCard) { suggestion in
                 CueCardView(
@@ -86,6 +101,15 @@ struct ConversationView: View {
         .padding(.horizontal)
         .padding(.vertical, 6)
         .background(.thinMaterial)
+    }
+
+    private var clearButton: some View {
+        Button(role: .destructive) {
+            confirmingClear = true
+        } label: {
+            Label("Clear conversation", systemImage: "trash")
+        }
+        .disabled(model.transcript.utterances.isEmpty)
     }
 
     private var startStopButton: some View {

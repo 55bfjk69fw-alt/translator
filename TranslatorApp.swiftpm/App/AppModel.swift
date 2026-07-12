@@ -44,7 +44,12 @@ final class AppModel: ObservableObject {
 
     // MARK: - Published UI state (main thread only)
 
-    @Published private(set) var mode: Mode = .idle
+    @Published private(set) var mode: Mode = .idle {
+        // Every transition re-derives the idle-timer flag, so abort/error
+        // paths back to .idle can't leave the screen pinned awake (or a
+        // session mode running with auto-lock enabled).
+        didSet { applyIdleTimerPolicy() }
+    }
     @Published private(set) var lanes: [SpeakerLane] = []
     @Published private(set) var sessionStates: [Int: RealtimeTranslationClient.State] = [:]
     @Published private(set) var route: AudioSessionController.RouteSnapshot?
@@ -355,7 +360,6 @@ final class AppModel: ObservableObject {
         startUITimer()
         mode = .conversation
         assist.conversationStarted(contentEvents: transcript.finalizedTotal + transcript.sentenceEventTotal)
-        UIApplication.shared.isIdleTimerDisabled = true
         Log.info("Conversation started: \(channelCount) channel(s); sessions open on first speech")
     }
 
@@ -387,13 +391,21 @@ final class AppModel: ObservableObject {
         sessionOpenedAt.removeAll()
         pipelineStatuses = []
         resetPlaybackState()
-        // Restore the user's Display preference rather than forcing the
-        // idle timer back on — "Keep screen awake" applies app-wide, not
-        // just during a conversation.
-        UIApplication.shared.isIdleTimerDisabled = AppSettings.keepScreenAwake
         refreshCost()
         metrics.endSession()
         Log.info("Conversation stopped")
+    }
+
+    /// Single source of truth for `isIdleTimerDisabled`. iOS silently resets
+    /// the flag to false whenever the app is deactivated (app switch, incoming
+    /// call, Siri, lock button), so a one-shot assignment does not survive a
+    /// trip through the background — the scene reasserts this on every return
+    /// to `.active`. The screen is kept awake whenever the user asked for it
+    /// app-wide, or whenever audio is live (starting/bench/conversation):
+    /// letting the screen sleep mid-session suspends the app and drops every
+    /// open translation session.
+    func applyIdleTimerPolicy() {
+        UIApplication.shared.isIdleTimerDisabled = AppSettings.keepScreenAwake || mode != .idle
     }
 
     private func buildResamplers(channelCount: Int) {

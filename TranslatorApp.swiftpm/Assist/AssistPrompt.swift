@@ -8,9 +8,11 @@ enum AssistPrompt {
 
     // MARK: - Shared persona
 
-    /// The base system prompt. The load-bearing facts: suggestions are
+    /// The base system prompt for ambient/scoped/explain — the tasks where
+    /// the model invents content. The load-bearing facts: suggestions are
     /// SPOKEN ALOUD BY THE USER (never played by a machine), and the level
-    /// rule is a hard cap, not a style hint.
+    /// rule is a hard cap, not a style hint. Compose uses
+    /// composeSystemPrompt() instead.
     static func systemPrompt() -> String {
         let name = AppSettings.userName
         let bio = AppSettings.userBio.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -80,6 +82,73 @@ enum AssistPrompt {
         best first). Score `fit` fresh on every batch, including for kept \
         suggestions — a line gets less natural as the conversation moves past \
         its moment.
+        """)
+        return lines.joined(separator: "\n")
+    }
+
+    /// Compose-specific system prompt. The ambient persona is built to
+    /// INVENT good contributions — infer missing context, match the room,
+    /// hard-cap the language level — which is exactly wrong once the user
+    /// has typed what they want to say. Compose is a translator: the draft
+    /// is the content, and fidelity to it outranks everything else.
+    static func composeSystemPrompt() -> String {
+        let name = AppSettings.userName
+        let bio = AppSettings.userBio.trimmingCharacters(in: .whitespacesAndNewlines)
+        let scene = AppSettings.sceneContext.trimmingCharacters(in: .whitespacesAndNewlines)
+        let level = AppSettings.mandarinLevel
+        let language = languageName(AppSettings.replyLanguage)
+
+        let pronunciationAid = AppSettings.replyLanguage == "zh"
+            ? "hanzi with tone-marked pinyin"
+            : "the \(language) text with a Latin-letter pronunciation aid"
+        var lines: [String] = []
+        lines.append("""
+        You render cue cards for \(name), an English speaker at a \
+        \(language)-speaking table. \(name) has TYPED a draft of exactly what \
+        they want to say. Your only job is to render that draft as natural \
+        spoken \(language) — \(pronunciationAid) — which \(name) will read \
+        aloud themselves, in one breath.
+        """)
+        lines.append("""
+        FIDELITY OUTRANKS EVERYTHING. The line must say everything the draft \
+        says and nothing it does not: keep every fact, name, number, \
+        qualifier, hedge, and joke. Do not add greetings, politeness \
+        formulas, softeners, follow-up questions, or any content the draft \
+        lacks. Do not answer the draft, improve on it, or redirect it — \
+        translate it. If the draft is blunt, the line is blunt; if it is \
+        odd or off-topic for the conversation, render it anyway. Match the \
+        draft's own register and directness; the conversation's register \
+        matters only where the draft itself is neutral.
+        """)
+        lines.append("""
+        The conversation transcript, scene, and bio below are context for \
+        DISAMBIGUATION ONLY — resolving who "he" or "that" refers to, \
+        choosing the right sense of an ambiguous word, picking pronouns and \
+        particles. Never reshape, trim, or extend the draft to better "fit" \
+        the conversation. Transcript lines are error-prone speech-to-text \
+        from a noisy table; lean on them lightly.
+        """)
+        if !bio.isEmpty { lines.append("About \(name): \(bio)") }
+        if !scene.isEmpty { lines.append("Scene right now: \(scene)") }
+        lines.append("""
+        Language level (\(level.promptRule)) is a WORDING PREFERENCE here, \
+        not a content cap: prefer the simplest phrasing within the level \
+        that expresses the FULL draft, but when the draft's content needs \
+        vocabulary or length beyond the level, keep the content — the \
+        pronunciation aid carries \(name) through harder words. Never drop \
+        or dilute content to stay within the level.
+        """)
+        lines.append("""
+        Field rules: `hanzi` is the exact \(language) line to say; `meaning` \
+        is the LITERAL English back-translation of that exact line — \(name) \
+        checks it against their draft to verify the line says what they \
+        typed, so keep it strictly literal, not a paraphrase; `gloss` is a \
+        short English restatement of the draft's intent; `pinyin` is the \
+        line's pronunciation aid (tone-marked pinyin for Mandarin, \
+        romanization otherwise); `register` is "casual" or "polite", \
+        following the draft; `reply_to` is the person/thread the draft \
+        addresses, or "table"; `keep` is null; `fit` is unused here — \
+        return 100.
         """)
         return lines.joined(separator: "\n")
     }
@@ -193,17 +262,19 @@ enum AssistPrompt {
     }
 
     /// Compose: turn the user's typed draft into one sayable line.
+    /// Pairs with composeSystemPrompt(), not the ambient persona.
     static func composeUserMessage(window: [AssistEngine.TranscriptLine], draft: String) -> String {
         """
+        Conversation context (for disambiguation only):
         \(transcriptSection(window))
 
         The user typed this draft of what they want to say (English, or mixed):
         "\(draft)"
 
-        Task: return exactly 1 suggestion — the most natural spoken rendering of \
-        the draft that fits the conversation and the level cap. Preserve the \
-        user's intent exactly; do not add content. `keep` = null; `reply_to` = \
-        the thread it fits, or "table".
+        Task: return exactly 1 suggestion — the faithful spoken rendering of \
+        the draft, per the fidelity rules. Everything the draft says, nothing \
+        it does not. `meaning` must literally back-translate your line so the \
+        user can check it against their draft.
         """
     }
 

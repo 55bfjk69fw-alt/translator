@@ -49,6 +49,20 @@ final class AudioSessionController {
         try session.setActive(true)
     }
 
+    /// Release the session (used when a Start is aborted or the claim ends).
+    /// Two jobs: hand audio focus back so whatever the claim paused can
+    /// resume, and — before configureForConversation() — return to an
+    /// inactive session, because recategorizing an *active* session settles
+    /// its route asynchronously (the USB input can read as 0- or 2-channel
+    /// for a beat) while a fresh activation settles synchronously.
+    func deactivate() {
+        do {
+            try session.setActive(false, options: [.notifyOthersOnDeactivation])
+        } catch {
+            Log.warn("Session deactivation failed: \(error.localizedDescription)")
+        }
+    }
+
     @discardableResult
     func selectUSBInput() -> Bool {
         guard let usb = session.availableInputs?.first(where: { $0.portType == .usbAudio }) else {
@@ -97,5 +111,16 @@ final class AudioSessionController {
 
     var airPodsOutputActive: Bool {
         session.currentRoute.outputs.contains { $0.portType == .bluetoothA2DP }
+    }
+
+    /// True when audio would come out of the iPad itself — the only state
+    /// worth running the AirPods claim from. Wired headphones, a Bluetooth
+    /// speaker, or the AirPods already being here all mean there is either
+    /// nothing to grab or something deliberately better attached.
+    var outputIsBuiltInSpeaker: Bool {
+        let outputs = session.currentRoute.outputs
+        return !outputs.isEmpty && outputs.allSatisfy {
+            $0.portType == .builtInSpeaker || $0.portType == .builtInReceiver
+        }
     }
 }

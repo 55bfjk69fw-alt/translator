@@ -120,7 +120,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Playback")
                 } footer: {
-                    Text("Volume of translated audio, on top of the iPad's hardware volume. Above 100% is a digital boost for loud rooms — the very top of the range can distort. Takes effect immediately. \"Pull AirPods over at Start\" plays a short chime under a media-playback session when a conversation starts — the same signal YouTube sends when it starts playing — so AirPods currently on your iPhone switch to this device by themselves. Hear the chime in your ears and it worked; hear it from the iPad speaker and they didn't move (check Bluetooth → AirPods → Connect to This iPad → Automatically). Turn off if you don't use AirPods — it adds a few seconds to Start.")
+                    Text("Volume of translated audio, on top of the iPad's hardware volume. Above 100% is a digital boost for loud rooms — the very top of the range can distort. Takes effect immediately. \"Pull AirPods over at Start\" plays a short chime under a media-playback session when a conversation starts — the same signal YouTube sends when it starts playing — so AirPods currently on your iPhone switch to this device by themselves. Hear the chime in your ears and it worked; hear it from the iPad speaker and they didn't move (check Bluetooth → AirPods → Connect to This iPad → Automatically). Only runs when the iPad speaker would otherwise be the output — wired or already-connected headphones skip it. Turn off if you never use AirPods; the grab-and-wait adds a few seconds to Start.")
                 }
 
                 Section {

@@ -335,42 +335,59 @@ happens; D replaces B/C wholesale if it ever becomes feasible.
 ## 5. What to measure before writing any DSP (the actual next steps)
 
 The whole design hinges on four numbers nobody has measured on this
-hardware. The Signal tab export can answer (1) today; (2)–(4) need raw
-audio, which we currently cannot capture — that tooling gap is the first
-implementable unit of work, and it's small (a Diagnostics "field
-recorder": tap → 4 × mono WAV (or one 4-ch WAV) to the Files app;
-48 kHz × 4 ch × float32 ≈ 46 MB/min, fine for a few minutes of dinner).
+hardware. The Signal tab export answers (1) today; the TXs' own
+timecode-synced internal recordings (see below) answer (2) and the
+acoustic core of (3) with zero code; (4) and the delivered-path
+confirmation of (3) need raw audio as the app receives it, which we
+currently cannot capture. That tooling gap — a Diagnostics "field
+recorder": tap → 4 × mono WAV (or one 4-ch WAV) to the Files app,
+48 kHz × 4 ch × float32 ≈ 46 MB/min — is small, but build it only once
+the internal-recording measurements say option C is worth pursuing.
 
-**What about the TXs' own internal recordings?** Each TX records onboard
-(32-bit float, the only place that format exists in this rig —
-docs/RESEARCH.md §1), so it's tempting to skip the field recorder. They
-answer a *different* question:
+**The TXs' own internal recordings — better than first assumed.**
+Verified against the DJI Mic 3 FAQ and user manual (2026-07): the TXs
+are not free-running recorders, and they capture more than one file.
+Three facts change the measurement plan:
 
-- **As measurement data for (2)–(4): no.** Each TX records on its own
-  free-running crystal — the four files share no clock and no start
-  trigger, drifting apart on the order of milliseconds per minute.
-  Coherence (3) needs sub-0.1 ms alignment to preserve phase, and lag
-  stability (4) is *specifically* a property of the radio + RX-resampler
-  path that internal recordings bypass entirely. The signal we must
-  characterize is the one the app receives — post-radio, post-RX-ASRC,
-  on the shared USB clock. Only an in-app capture sees it.
-- **As ground truth: absolutely.** A clean, unclippable, close-mic record
-  of what each wearer actually said is exactly what's needed to *score*
-  any separation algorithm (which words on lane 3 belong to speaker 1?)
-  and to build an offline eval set — and it's available at the very next
-  dinner with zero code. Clap or tap chopsticks near all four mics at
-  start and end of dinner so the files can be coarsely aligned (word
-  level, not sample level — plenty for scoring transcripts) and linear
-  drift estimated.
-- **Bench check worth doing once:** whether onboard NC is applied to the
-  internal recording or only to the transmitted stream (record a phrase
-  with NC Strong, compare the internal file against the USB capture). If
-  internal files are pre-NC, they double as the "how much does NC mangle
-  bleed" probe; if post-NC, they don't.
+- **Timecode, RX-distributed, 0.5 ppm.** The RX generates timecode
+  itself (Master Run mode, the default — no external TC box needed) and
+  continuously distributes it to every linked TX; spec'd drift is
+  0.5 ppm (< 1 frame per 24 h), and the TC is embedded in the internal
+  recording files. So the four WAVs align to ~millisecond out of the box,
+  and within any short analysis window (0.5–2 s) relative clock drift is
+  sub-microsecond — negligible. Seed alignment from TC, refine to
+  sub-sample per segment with cross-correlation on single-talk stretches,
+  and **phase-sensitive cross-TX measurements are feasible** from
+  internal recordings alone.
+- **Dual-file recording answers the NC question by construction.** With
+  File Option → Dual-File, each TX simultaneously stores the **original**
+  (raw, pre-DSP, `orig` suffix) and the **edited** file (noise
+  cancellation, low-cut, tone preset, adaptive gain applied, `edit`
+  suffix), 32-bit float WAV, split every 30 min, ~21.5 h total capacity.
+  `orig` pairs measure the pure *acoustic* mixing path (β and coherence
+  uncontaminated by NC); `orig` vs `edit` on one TX measures exactly what
+  NC does to bleed; `edit`-pair coherence upper-bounds the delivered-path
+  coherence.
+- **Group start from the RX.** Swipe up on the main RX home screen to
+  start internal recording on all TXs at once (or enable Startup Auto
+  Recording per TX). No per-mic fumbling at the table.
 
-So the next-dinner kit is: TX internal recording on everywhere + the
-Signal-tab export for (1); the in-app field recorder remains the
-prerequisite for (2)–(4).
+This upgrades the internal recordings from "ground truth only" to the
+primary instrument for measurements (2) and the acoustic core of (3),
+plus ground truth for scoring — all zero-code. The asymmetry is useful:
+if `edit`-pair coherence is already low, option C is dead and we learned
+it without building anything; only if it's high does the in-app recorder
+become necessary, to confirm coherence survives the *delivered* path —
+the radio link (compressed by default; the "Lossless Audio" option
+removes the codec at the cost of range) and the RX's resampling onto the
+USB clock — and to measure lag stability (4), which only exists on that
+path. Masking (§3B) doesn't care about (4); only cancellation (§3C) does.
+
+Next-dinner kit, app unchanged: firmware current on RX+TXs; RX timecode
+Master Run, one frame rate everywhere; every TX set to Dual-File 32-bit
+float via RX group settings; group-start recording at sit-down; one clap
+near all mics anyway (verifies the TC chain end-to-end); Signal-tab
+freeze + export during heavy overlap for (1).
 
 1. **Correlation distribution at a real party** *(available now)*: freeze
    + export the Signal window during overlapping speech; check where

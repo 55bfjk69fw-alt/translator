@@ -25,6 +25,9 @@ final class AssistEngine: ObservableObject {
         /// false = still streaming (included so sentence-boundary-triggered
         /// requests can see the sentence that triggered them).
         let isFinal: Bool
+        /// Seconds since this line's last activity — the model's recency
+        /// signal ("12s ago" is live, "4m ago" is history).
+        let ageSeconds: Int
     }
 
     struct Suggestion: Identifiable, Equatable {

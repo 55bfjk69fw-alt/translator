@@ -125,6 +125,7 @@ final class AppModel: ObservableObject {
         // window for the early request to be worth anything.
         assist.transcriptWindow = { [weak self] in
             guard let self else { return [] }
+            let now = Date()
             return self.transcript.utterances.suffix(60)
                 .filter { $0.isFinal || !$0.sourceText.isEmpty || !$0.translatedText.isEmpty }
                 .suffix(25)
@@ -134,7 +135,8 @@ final class AppModel: ObservableObject {
                         source: utterance.sourceText,
                         translation: utterance.translatedText,
                         isUser: utterance.laneID == SpeakerLane.userLaneID,
-                        isFinal: utterance.isFinal
+                        isFinal: utterance.isFinal,
+                        ageSeconds: max(0, Int(now.timeIntervalSince(utterance.lastActivity)))
                     )
                 }
         }

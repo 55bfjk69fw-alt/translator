@@ -41,6 +41,16 @@ enum AssistPrompt {
         surrounding context. Never build a suggestion that hinges on a detail \
         that could be a mis-transcription, and never quote garbled text back.
         """)
+        lines.append("""
+        Coverage is PARTIAL: only some people at the table wear microphones. \
+        Expect unmic'd speakers whose turns are entirely missing, lines that \
+        reply to something you never saw, abrupt topic changes that happened \
+        off-mic, and gaps where the conversation moved without you. Never \
+        assume the transcript is the whole conversation — when a line seems \
+        to come out of nowhere, the missing turn is more likely off-mic than \
+        mis-transcribed, and safe suggestions acknowledge or ask rather than \
+        presume what was missed.
+        """)
         if !bio.isEmpty { lines.append("About \(name): \(bio)") }
         if !scene.isEmpty { lines.append("Scene right now: \(scene)") }
         lines.append("Language level (HARD CAP, never exceed it): \(level.promptRule).")
@@ -70,26 +80,45 @@ enum AssistPrompt {
 
     // MARK: - Transcript serialization
 
+    /// Number of trailing lines presented as the live moment. Small on
+    /// purpose: "just now" should mean seconds, not the whole window.
+    private static let liveLineCount = 4
+
     static func transcriptSection(_ window: [AssistEngine.TranscriptLine]) -> String {
         guard !window.isEmpty else { return "The conversation has not started yet." }
-        let lines = window.map { line in
-            let speaker = line.isUser ? "\(line.speaker) (the user, said aloud)" : line.speaker
-            let progress = line.isFinal ? "" : " [mid-speech, transcript still arriving]"
-            // The original-language transcript is one step closer to what
-            // was said than the English rendering (translation errors stack
-            // on STT errors), so send hanzi alone when it exists; the
-            // English fallback covers segments whose source stream was lost.
-            let body: String
-            if !line.source.isEmpty {
-                body = line.source
-            } else if !line.translation.isEmpty {
-                body = "\(line.translation) [English machine translation — original-language transcript missing]"
-            } else {
-                body = "(no transcript yet)"
-            }
-            return "[\(speaker)]\(progress) \(body)"
+        // Recency is made STRUCTURAL, not left to inference: every line is
+        // stamped with its age, and the trailing lines are split out as the
+        // live moment suggestions must speak to.
+        let liveCount = min(Self.liveLineCount, window.count)
+        let earlier = window.dropLast(liveCount)
+        let live = window.suffix(liveCount)
+        var parts: [String] = []
+        if !earlier.isEmpty {
+            parts.append("Earlier context (background only — the conversation may have moved past this):\n"
+                + earlier.map(render).joined(separator: "\n"))
         }
-        return "Recent conversation, oldest first:\n" + lines.joined(separator: "\n")
+        parts.append("JUST NOW — the live moment suggestions must speak to:\n"
+            + live.map(render).joined(separator: "\n"))
+        return parts.joined(separator: "\n\n")
+    }
+
+    private static func render(_ line: AssistEngine.TranscriptLine) -> String {
+        let speaker = line.isUser ? "\(line.speaker) (the user, said aloud)" : line.speaker
+        let age = line.ageSeconds < 60 ? "\(line.ageSeconds)s ago" : "\(line.ageSeconds / 60)m ago"
+        let progress = line.isFinal ? "" : ", mid-speech"
+        // The original-language transcript is one step closer to what was
+        // said than the English rendering (translation errors stack on STT
+        // errors), so send hanzi alone when it exists; the English fallback
+        // covers segments whose source stream was lost.
+        let body: String
+        if !line.source.isEmpty {
+            body = line.source
+        } else if !line.translation.isEmpty {
+            body = "\(line.translation) [English machine translation — original-language transcript missing]"
+        } else {
+            body = "(no transcript yet)"
+        }
+        return "[\(speaker), \(age)\(progress)] \(body)"
     }
 
     // MARK: - Task prompts
@@ -120,16 +149,20 @@ enum AssistPrompt {
             parts.append("The user most recently engaged with: \(engagedThread).")
         }
         parts.append("""
-        Task: identify the conversation threads currently active, then return up \
-        to \(batchSize) DISTINCT things the user could say out loud RIGHT NOW — \
-        aim for \(batchSize) when the conversation offers enough angles (a \
-        question, a reaction, a follow-up, a contribution of the user's own), \
-        fewer only if the moment is genuinely thin. Weight them toward the \
-        thread the user is engaged with, but include an option or two from other \
-        active threads. If a current tray suggestion is still among the best \
-        options, return it UNCHANGED except for a freshly scored `fit`, with \
-        `keep` set to its id — otherwise `keep` is null. Never duplicate a \
-        pinned tray suggestion as a new entry.
+        Task: return up to \(batchSize) DISTINCT things the user could say out \
+        loud RIGHT NOW — aim for \(batchSize) when the moment offers enough \
+        angles (a question, a reaction, a follow-up, a contribution of the \
+        user's own), fewer only if it is genuinely thin. PRIORITY ORDER: \
+        (1) respond to the JUST NOW lines — that is where the conversation \
+        actually is; a suggestion that answers something from minutes ago \
+        lands as a non-sequitur at a live table; (2) within the live moment, \
+        prefer the thread the user is engaged with; (3) at most an option or \
+        two may reach back to an earlier thread, and only if it plausibly \
+        still hangs in the air. Score `fit` by the same rule: responsiveness \
+        to the last few lines dominates. If a current tray suggestion is \
+        still among the best options, return it UNCHANGED except for a \
+        freshly scored `fit`, with `keep` set to its id — otherwise `keep` \
+        is null. Never duplicate a pinned tray suggestion as a new entry.
         """)
         return parts.joined(separator: "\n\n")
     }

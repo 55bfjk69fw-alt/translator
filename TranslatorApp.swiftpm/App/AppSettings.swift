@@ -25,6 +25,7 @@ enum AppSettings {
     static let legacyPTTOutputLanguageKey = "pttOutputLanguage"
     static let noiseReductionKey = "noiseReduction"
     static let keepScreenAwakeKey = "keepScreenAwake"
+    static let claimAirPodsAtStartKey = "claimAirPodsAtStart"
     /// Last-selected pane of the Monitor tab (Signal/Metrics/Diagnostics).
     static let monitorPaneKey = "monitorPane"
 
@@ -253,6 +254,18 @@ enum AppSettings {
         UserDefaults.standard.object(forKey: keepScreenAwakeKey) == nil
             ? true
             : UserDefaults.standard.bool(forKey: keepScreenAwakeKey)
+    }
+
+    /// Pull the AirPods over from the phone when a conversation starts
+    /// (default on): Start briefly plays a chime under a media-playback
+    /// session — the signal iPadOS's automatic switching listens for, the
+    /// same one YouTube emits when playback starts — then flips to the
+    /// conversation session (AppModel.beginAirPodsClaim). Needs the
+    /// AirPods' "Connect to This iPad" setting on "Automatically".
+    static var claimAirPodsAtStart: Bool {
+        UserDefaults.standard.object(forKey: claimAirPodsAtStartKey) == nil
+            ? true
+            : UserDefaults.standard.bool(forKey: claimAirPodsAtStartKey)
     }
 
     /// Whether a DJI channel participates at all (default on). Disabled

@@ -25,6 +25,14 @@ See `docs/RESEARCH.md` for the feasibility research behind every design decision
 4. Connect your **AirPods** (Pro 2 / Pro 3 / 4 recommended). They are the *output*;
    the DJI RX is the *input*. iPadOS publicly allows one active input, so the
    AirPods mic is never used (except by the Diagnostics dual-input probe).
+   If the AirPods are currently on your **iPhone**, just tap **Start**: the app
+   briefly plays a start chime under a media-playback session — the "this device
+   started playing" signal that iPadOS automatic switching listens for (the same
+   thing YouTube does when you hit play) — so the AirPods hop to the iPad on
+   their own. Hear the chime in your ears and the handoff worked; hear it from
+   the iPad speaker and it didn't — check Settings → Bluetooth → AirPods →
+   **Connect to This iPad** → **Automatically** (and note the iPad can't steal
+   them mid-phone-call). Toggleable in Settings → Playback.
 
 ## Getting the app onto your iPad
 

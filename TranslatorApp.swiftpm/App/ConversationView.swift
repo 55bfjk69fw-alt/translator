@@ -31,6 +31,12 @@ struct ConversationView: View {
                         .background(.red)
                 }
                 transcriptList
+                    // Dragging the transcript tucks the keyboard away with
+                    // the finger (Messages-style); a plain tap on it does
+                    // too. simultaneousGesture so bubble long-presses and
+                    // the jump-to-latest pill keep working untouched.
+                    .scrollDismissesKeyboard(.interactively)
+                    .simultaneousGesture(TapGesture().onEnded { dismissKeyboard() })
                 if prompterEnabled {
                     AssistBarView(
                         assist: model.assist,
@@ -291,12 +297,21 @@ private struct AssistBarView: View {
                 TextField("Compose a reply to say aloud…", text: $composerText)
                     .textFieldStyle(.roundedBorder)
                     .submitLabel(.send)
-                    .onSubmit(onCompose)
+                    .onSubmit(submit)
+                    // The keyboard's own escape hatch: Return sends rather
+                    // than dismissing, so without this bar a stray tap into
+                    // the composer leaves no way to put the keyboard away.
+                    .toolbar {
+                        ToolbarItemGroup(placement: .keyboard) {
+                            Spacer()
+                            Button("Done") { dismissKeyboard() }
+                        }
+                    }
                 if composing {
                     ProgressView()
                         .controlSize(.small)
                 } else {
-                    Button(action: onCompose) {
+                    Button(action: submit) {
                         Image(systemName: "arrow.up.circle.fill")
                             .font(.title2)
                     }
@@ -315,6 +330,13 @@ private struct AssistBarView: View {
         } message: {
             Text("One line of context that makes suggestions land — where you are, who's at the table, what's going on.")
         }
+    }
+
+    /// Sending opens the cue-card sheet, so drop the keyboard first —
+    /// otherwise it's still standing under the sheet when the card closes.
+    private func submit() {
+        dismissKeyboard()
+        onCompose()
     }
 
     private var sceneChip: some View {

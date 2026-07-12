@@ -239,8 +239,16 @@ System prompt contract (assembled by `AssistPrompt`):
 - Pinyin must be tone-marked. (Fallback: if the model omits it, derive via
   the existing ICU `String.pinyin` transform.)
 
-Compose variant: same contract, input is the user's draft, output is exactly
-one suggestion. Explain variant: input is one utterance, output is
+Compose variant: a **separate system prompt**, not the ambient persona
+(owner feedback, 2026-07-12: composed cards drifted from the typed draft).
+The ambient contract optimizes for inventing lines that fit the room —
+context inference, tone matching, the level hard cap — all of which pull a
+translation away from its source. The compose persona is fidelity-first:
+the draft is the content, verbatim; the transcript/scene/bio are for
+disambiguation only (resolving "he"/"that", word senses); the level cap
+demotes to a wording preference that never drops content; `meaning` must be
+a literal back-translation so the user can verify the line against their
+draft. Output is exactly one suggestion. Explain variant: input is one utterance, output is
 `{explanation, key_phrases: [{hanzi, pinyin, meaning}]}` — rendered, never
 stored.
 

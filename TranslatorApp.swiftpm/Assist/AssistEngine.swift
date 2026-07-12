@@ -212,8 +212,11 @@ final class AssistEngine: ObservableObject {
             await MainActor.run { self.status = .offline("Add your OpenAI API key in Settings") }
             return nil
         }
+        // Compose gets its own persona: the ambient prompt optimizes for
+        // inventing suggestions that fit the room, which is what made
+        // composed cards drift from the typed draft.
         let (window, system) = await MainActor.run {
-            (self.transcriptWindow?() ?? [], AssistPrompt.systemPrompt())
+            (self.transcriptWindow?() ?? [], AssistPrompt.composeSystemPrompt())
         }
         let client = ChatCompletionClient(apiKey: apiKey, model: AppSettings.assistModel)
         let message = AssistPrompt.composeUserMessage(window: window, draft: trimmed)

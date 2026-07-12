@@ -341,6 +341,37 @@ implementable unit of work, and it's small (a Diagnostics "field
 recorder": tap → 4 × mono WAV (or one 4-ch WAV) to the Files app;
 48 kHz × 4 ch × float32 ≈ 46 MB/min, fine for a few minutes of dinner).
 
+**What about the TXs' own internal recordings?** Each TX records onboard
+(32-bit float, the only place that format exists in this rig —
+docs/RESEARCH.md §1), so it's tempting to skip the field recorder. They
+answer a *different* question:
+
+- **As measurement data for (2)–(4): no.** Each TX records on its own
+  free-running crystal — the four files share no clock and no start
+  trigger, drifting apart on the order of milliseconds per minute.
+  Coherence (3) needs sub-0.1 ms alignment to preserve phase, and lag
+  stability (4) is *specifically* a property of the radio + RX-resampler
+  path that internal recordings bypass entirely. The signal we must
+  characterize is the one the app receives — post-radio, post-RX-ASRC,
+  on the shared USB clock. Only an in-app capture sees it.
+- **As ground truth: absolutely.** A clean, unclippable, close-mic record
+  of what each wearer actually said is exactly what's needed to *score*
+  any separation algorithm (which words on lane 3 belong to speaker 1?)
+  and to build an offline eval set — and it's available at the very next
+  dinner with zero code. Clap or tap chopsticks near all four mics at
+  start and end of dinner so the files can be coarsely aligned (word
+  level, not sample level — plenty for scoring transcripts) and linear
+  drift estimated.
+- **Bench check worth doing once:** whether onboard NC is applied to the
+  internal recording or only to the transmitted stream (record a phrase
+  with NC Strong, compare the internal file against the USB capture). If
+  internal files are pre-NC, they double as the "how much does NC mangle
+  bleed" probe; if post-NC, they don't.
+
+So the next-dinner kit is: TX internal recording on everywhere + the
+Signal-tab export for (1); the in-app field recorder remains the
+prerequisite for (2)–(4).
+
 1. **Correlation distribution at a real party** *(available now)*: freeze
    + export the Signal window during overlapping speech; check where
    voiced-pair correlations actually land. If they still bimodally split

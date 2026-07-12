@@ -35,27 +35,27 @@ struct MetricsView: View {
 
     @State private var timeWindow: TimeWindow = .tenMinutes
 
+    // Hosted inside MonitorView's NavigationStack (which owns the pane
+    // switcher); this view supplies only its title and toolbar items.
     var body: some View {
-        NavigationStack {
-            ScrollView {
-                content
-                    .padding()
-            }
-            .navigationTitle("Metrics")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .primaryAction) {
-                    Picker("Window", selection: $timeWindow) {
-                        ForEach(TimeWindow.allCases) { option in
-                            Text(option.rawValue).tag(option)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                }
-            }
-            .onAppear { metrics.setVisible(true) }
-            .onDisappear { metrics.setVisible(false) }
+        ScrollView {
+            content
+                .padding()
         }
+        .navigationTitle("Metrics")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Picker("Window", selection: $timeWindow) {
+                    ForEach(TimeWindow.allCases) { option in
+                        Text(option.rawValue).tag(option)
+                    }
+                }
+                .pickerStyle(.segmented)
+            }
+        }
+        .onAppear { metrics.setVisible(true) }
+        .onDisappear { metrics.setVisible(false) }
     }
 
     /// Windowing/decimation runs once per body evaluation here, then the

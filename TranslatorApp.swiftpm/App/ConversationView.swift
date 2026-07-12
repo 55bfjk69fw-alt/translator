@@ -453,38 +453,57 @@ private struct CueCardView: View {
     let onSaid: () -> Void
     let onRefine: () -> Void
 
+    /// Measured ideal heights of the text block and the button bar. They
+    /// drive a custom detent so the sheet opens exactly as tall as the
+    /// line needs — never clipping it at a fixed height. The system caps
+    /// custom detents at full-sheet height; past that the ScrollView
+    /// takes over, so the text is always fully readable.
+    @State private var textHeight: CGFloat = 0
+    @State private var barHeight: CGFloat = 0
+
     var body: some View {
-        VStack(spacing: 18) {
-            // The intent (what the chip showed) as a small anchor…
-            Text(suggestion.gloss)
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-            Spacer(minLength: 4)
-            Text(suggestion.hanzi)
-                .font(.system(size: 40, weight: .semibold))
-                .multilineTextAlignment(.center)
-                .textSelection(.enabled)
-            if !suggestion.pinyin.isEmpty {
-                Text(suggestion.pinyin)
-                    .font(.title2)
-                    .foregroundStyle(.teal)
+        ScrollView {
+            VStack(spacing: 18) {
+                // The intent (what the chip showed) as a small anchor…
+                Text(suggestion.gloss)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                Text(suggestion.hanzi)
+                    .font(.system(size: 40, weight: .semibold))
                     .multilineTextAlignment(.center)
                     .textSelection(.enabled)
-            }
-            // …and the LITERAL meaning of the exact line, so the user
-            // knows precisely what they're committing to say.
-            Text("“\(suggestion.meaning)”")
-                .font(.title3)
-                .multilineTextAlignment(.center)
-                .textSelection(.enabled)
-            HStack(spacing: 8) {
-                tag(suggestion.register)
-                if let replyTo = suggestion.replyTo {
-                    tag("→ \(replyTo)")
+                if !suggestion.pinyin.isEmpty {
+                    Text(suggestion.pinyin)
+                        .font(.title2)
+                        .foregroundStyle(.teal)
+                        .multilineTextAlignment(.center)
+                        .textSelection(.enabled)
+                }
+                // …and the LITERAL meaning of the exact line, so the user
+                // knows precisely what they're committing to say.
+                Text("“\(suggestion.meaning)”")
+                    .font(.title3)
+                    .multilineTextAlignment(.center)
+                    .textSelection(.enabled)
+                HStack(spacing: 8) {
+                    tag(suggestion.register)
+                    if let replyTo = suggestion.replyTo {
+                        tag("→ \(replyTo)")
+                    }
                 }
             }
-            Spacer(minLength: 8)
+            .frame(maxWidth: .infinity)
+            .padding(24)
+            .onGeometryChange(for: CGFloat.self) { proxy in
+                proxy.size.height
+            } action: { height in
+                textHeight = height
+            }
+        }
+        .scrollBounceBehavior(.basedOnSize)
+        // Buttons stay reachable even when the text itself has to scroll.
+        .safeAreaInset(edge: .bottom) {
             HStack(spacing: 12) {
                 Button(action: onSaid) {
                     Label("I said this", systemImage: "checkmark.bubble.fill")
@@ -500,9 +519,25 @@ private struct CueCardView: View {
                 .buttonStyle(.bordered)
                 .controlSize(.large)
             }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 12)
+            .background(.bar)
+            .onGeometryChange(for: CGFloat.self) { proxy in
+                proxy.size.height
+            } action: { height in
+                barHeight = height
+            }
         }
-        .padding(24)
-        .presentationDetents([.medium])
+        .presentationDetents(detents)
+        .presentationDragIndicator(.visible)
+    }
+
+    /// Fit-to-content once measured; `.large` stays available as a manual
+    /// escape hatch, and until the first layout pass we fall back to the
+    /// old medium height so the sheet doesn't flash at zero size.
+    private var detents: Set<PresentationDetent> {
+        guard textHeight > 0, barHeight > 0 else { return [.medium] }
+        return [.height(textHeight + barHeight), .large]
     }
 
     private func tag(_ text: String) -> some View {

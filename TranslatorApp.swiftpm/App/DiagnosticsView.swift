@@ -75,27 +75,7 @@ struct DiagnosticsView: View {
     }
 
     private var metersSection: some View {
-        Section("Channel meters") {
-            if model.lanes.isEmpty {
-                Text("Start the bench test or a conversation to see per-channel levels.")
-                    .foregroundStyle(.secondary)
-            } else {
-                ForEach(Array(model.lanes.enumerated()), id: \.element.id) { index, lane in
-                    HStack {
-                        Text(lane.name)
-                            .frame(width: 100, alignment: .leading)
-                            .font(.callout)
-                        MeterBar(
-                            level: index < model.meters.count ? model.meters[index] : 0,
-                            color: lane.color
-                        )
-                    }
-                }
-                Text("Tap each transmitter in turn — exactly one meter should move per tap if channels are independent.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            }
-        }
+        ChannelMetersSection(meters: model.channelMeters, lanes: model.lanes)
     }
 
     /// Per-lane trace of gate → session → server streams, refreshed at 1 Hz
@@ -315,6 +295,37 @@ struct DiagnosticsView: View {
         case .info: return .primary
         case .warn: return .orange
         case .error: return .red
+        }
+    }
+}
+
+/// Observes ChannelMeters directly so the 10 Hz level churn re-renders only
+/// these rows, not the whole Diagnostics list.
+private struct ChannelMetersSection: View {
+    @ObservedObject var meters: ChannelMeters
+    let lanes: [SpeakerLane]
+
+    var body: some View {
+        Section("Channel meters") {
+            if lanes.isEmpty {
+                Text("Start the bench test or a conversation to see per-channel levels.")
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(Array(lanes.enumerated()), id: \.element.id) { index, lane in
+                    HStack {
+                        Text(lane.name)
+                            .frame(width: 100, alignment: .leading)
+                            .font(.callout)
+                        MeterBar(
+                            level: index < meters.levels.count ? meters.levels[index] : 0,
+                            color: lane.color
+                        )
+                    }
+                }
+                Text("Tap each transmitter in turn — exactly one meter should move per tap if channels are independent.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 }

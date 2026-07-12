@@ -205,7 +205,18 @@ final class ChannelGate {
         var probabilities = [Float?](repeating: nil, count: count)
         for i in 0..<count {
             floors[i] = noiseFloor[i]
-            if isEnabled(i), useVAD,
+            if isEnabled(i), useVAD, rms[i] < minimumVoiceThreshold {
+                // Sub-threshold buffers can never be voiced (VAD voicing
+                // also requires rms >= minimumVoiceThreshold), so skip the
+                // neural inference entirely — otherwise every silent
+                // channel (a powered-off TX is pure zeros) pays the full
+                // forward pass continuously. Clearing the hold mirrors the
+                // disabled-channel path below; the model recovers from the
+                // state gap within a frame or two of speech returning.
+                vadHold[i] = false
+                thresholds[i] = minimumVoiceThreshold
+                voicedNow[i] = false
+            } else if isEnabled(i), useVAD,
                let probability = vads[i].feed(channels[i], count: frames, sampleRate: sampleRate) {
                 probabilities[i] = probability
                 thresholds[i] = minimumVoiceThreshold

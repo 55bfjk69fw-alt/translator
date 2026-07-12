@@ -36,6 +36,11 @@ final class TranscriptStore: ObservableObject {
         let date: Date
         var sourceText: String
         var translatedText: String
+        /// Pinyin of the texts above, cached at append time. The ICU
+        /// transliteration is far too slow for render time — bubbles used
+        /// to re-derive it on every status-bar meter tick.
+        var sourcePinyin: String?
+        var translatedPinyin: String?
         var isFinal: Bool
         var lastActivity: Date
         // The translation stream trails the source stream by 1-2 s, so the
@@ -82,6 +87,7 @@ final class TranscriptStore: ObservableObject {
         reopenRecentIfNeeded(lane: lane, stream: .source)
         withOpenUtterance(lane: lane, stream: .source) {
             $0.sourceText += text
+            $0.sourcePinyin = $0.sourceText.pinyin
             $0.lastSourceActivity = Date()
         }
         noteSentenceBoundary(in: text)
@@ -91,6 +97,7 @@ final class TranscriptStore: ObservableObject {
         reopenRecentIfNeeded(lane: lane, stream: .translation)
         withOpenUtterance(lane: lane, stream: .translation) {
             $0.translatedText += text
+            $0.translatedPinyin = $0.translatedText.pinyin
             $0.lastTranslationActivity = Date()
         }
         noteSentenceBoundary(in: text)
@@ -106,6 +113,8 @@ final class TranscriptStore: ObservableObject {
             date: now,
             sourceText: source,
             translatedText: gloss,
+            sourcePinyin: source.pinyin,
+            translatedPinyin: gloss.pinyin,
             isFinal: true,
             lastActivity: now,
             lastSourceActivity: now,
@@ -203,6 +212,8 @@ final class TranscriptStore: ObservableObject {
                 date: Date(),
                 sourceText: "",
                 translatedText: "",
+                sourcePinyin: nil,
+                translatedPinyin: nil,
                 isFinal: false,
                 lastActivity: Date(),
                 lastSourceActivity: nil,

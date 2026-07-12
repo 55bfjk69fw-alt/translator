@@ -7,6 +7,7 @@ import UIKit
 /// visible; freezing stops the displays without touching the audio pipeline.
 struct SignalView: View {
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var transcript: TranscriptStore
     @EnvironmentObject private var analyzer: SignalAnalyzer
 
     @State private var exportJSON: String?
@@ -186,7 +187,7 @@ struct SignalView: View {
 
     private var miniTranscriptCard: some View {
         card("Transcript") {
-            if model.transcript.utterances.isEmpty {
+            if transcript.utterances.isEmpty {
                 Text("No speech translated yet.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -194,7 +195,7 @@ struct SignalView: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 6) {
-                            ForEach(model.transcript.utterances.suffix(30)) { utterance in
+                            ForEach(transcript.utterances.suffix(30)) { utterance in
                                 MiniTranscriptRow(
                                     utterance: utterance,
                                     lane: model.lane(for: utterance.laneID)
@@ -205,12 +206,12 @@ struct SignalView: View {
                     }
                     .frame(height: 150)
                     .onAppear {
-                        if let last = model.transcript.utterances.last {
+                        if let last = transcript.utterances.last {
                             proxy.scrollTo(last.id, anchor: .bottom)
                         }
                     }
-                    .onChange(of: model.transcript.utterances.count) {
-                        if let last = model.transcript.utterances.last {
+                    .onChange(of: transcript.utterances.count) {
+                        if let last = transcript.utterances.last {
                             withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
                         }
                     }

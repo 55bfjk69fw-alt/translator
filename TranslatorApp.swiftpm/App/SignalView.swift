@@ -12,41 +12,41 @@ struct SignalView: View {
     @State private var exportJSON: String?
     @State private var exportCopied = false
 
+    // Hosted inside MonitorView's NavigationStack (which owns the pane
+    // switcher); this view supplies only its title and toolbar items.
     var body: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    // A frozen window stays inspectable/exportable even
-                    // after the session that produced it has stopped.
-                    if model.mode == .idle && !(analyzer.isFrozen && analyzer.snapshot.channelCount > 0) {
-                        idleCard
-                    } else if analyzer.snapshot.channelCount == 0 {
-                        waitingCard
-                    } else {
-                        gateTimelineCard
-                        if model.mode == .conversation {
-                            miniTranscriptCard
-                        }
-                        correlationCard
-                        channelCards
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                // A frozen window stays inspectable/exportable even
+                // after the session that produced it has stopped.
+                if model.mode == .idle && !(analyzer.isFrozen && analyzer.snapshot.channelCount > 0) {
+                    idleCard
+                } else if analyzer.snapshot.channelCount == 0 {
+                    waitingCard
+                } else {
+                    gateTimelineCard
+                    if model.mode == .conversation {
+                        miniTranscriptCard
                     }
-                    tuningCard
-                    if analyzer.isFrozen {
-                        exportCard
-                    }
+                    correlationCard
+                    channelCards
                 }
-                .padding()
-            }
-            .navigationTitle("Signal")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .primaryAction) {
-                    freezeButton
+                tuningCard
+                if analyzer.isFrozen {
+                    exportCard
                 }
             }
-            .onAppear { analyzer.setEnabled(true) }
-            .onDisappear { analyzer.setEnabled(false) }
+            .padding()
         }
+        .navigationTitle("Signal")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                freezeButton
+            }
+        }
+        .onAppear { analyzer.setEnabled(true) }
+        .onDisappear { analyzer.setEnabled(false) }
     }
 
     // MARK: - Controls

@@ -11,29 +11,30 @@ struct DiagnosticsView: View {
     @State private var logCopied = false
     @StateObject private var probe = DualInputProbe()
 
+    // Hosted inside MonitorView's NavigationStack (which owns the pane
+    // switcher); this view supplies only its title and toolbar items.
     var body: some View {
-        NavigationStack {
-            List {
-                routeSection
-                metersSection
-                pipelineSection
-                benchSection
-                probeSection
-                logSection
+        List {
+            routeSection
+            metersSection
+            pipelineSection
+            benchSection
+            probeSection
+            logSection
+        }
+        .navigationTitle("Diagnostics")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button("Refresh") { model.refreshRoute() }
             }
-            .navigationTitle("Diagnostics")
-            .toolbar {
-                ToolbarItem(placement: .primaryAction) {
-                    Button("Refresh") { model.refreshRoute() }
-                }
-            }
-            .onAppear { model.refreshRoute() }
-            // A conversation/bench start takes over the audio session; kill
-            // the probe but leave the session to its new owner.
-            .onChange(of: model.mode) { _, newMode in
-                if newMode != .idle, probe.running {
-                    probe.stop(releaseSession: false)
-                }
+        }
+        .onAppear { model.refreshRoute() }
+        // A conversation/bench start takes over the audio session; kill
+        // the probe but leave the session to its new owner.
+        .onChange(of: model.mode) { _, newMode in
+            if newMode != .idle, probe.running {
+                probe.stop(releaseSession: false)
             }
         }
     }

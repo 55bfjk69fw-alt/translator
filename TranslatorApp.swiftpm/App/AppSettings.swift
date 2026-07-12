@@ -25,6 +25,8 @@ enum AppSettings {
     static let legacyPTTOutputLanguageKey = "pttOutputLanguage"
     static let noiseReductionKey = "noiseReduction"
     static let keepScreenAwakeKey = "keepScreenAwake"
+    /// Last-selected pane of the Monitor tab (Signal/Metrics/Diagnostics).
+    static let monitorPaneKey = "monitorPane"
 
     // Reply prompter (docs/REPLY-FLOW.md)
     static let prompterEnabledKey = "prompterEnabled"

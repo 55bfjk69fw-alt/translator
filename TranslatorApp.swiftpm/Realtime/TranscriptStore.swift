@@ -69,6 +69,13 @@ final class TranscriptStore: ObservableObject {
         onSentenceBoundary?()
     }
 
+    /// Monotonic revision of visible transcript content. Bumped by every
+    /// mutation that can change layout at the BOTTOM of the transcript
+    /// (deltas, new bubbles, user utterances, finalization, clear) — but
+    /// NOT by trim(), which removes rows from the front and must not
+    /// re-trigger the transcript's pinned auto-scroll.
+    private(set) var contentRevision = 0
+
     private let maxUtterances = 400
 
     /// Index of the open (partial) utterance per lane.
@@ -112,6 +119,7 @@ final class TranscriptStore: ObservableObject {
             lastTranslationActivity: now
         ))
         finalizedTotal += 1
+        contentRevision += 1
         trim()
     }
 
@@ -165,6 +173,7 @@ final class TranscriptStore: ObservableObject {
                 utterances[index].isFinal = true
                 openUtteranceIndex[lane] = nil
                 finalizedTotal += 1
+                contentRevision += 1
                 finalizedAny = true
                 logFinalize(utterance, lane: lane, reason: sourceQuiet && translationQuiet && translationDrained ? "quiet" : "hard-cap")
             }
@@ -175,6 +184,7 @@ final class TranscriptStore: ObservableObject {
     func clear() {
         utterances.removeAll()
         openUtteranceIndex.removeAll()
+        contentRevision += 1
     }
 
     /// One WARN per half-empty bubble: these lines are the direct evidence
@@ -213,6 +223,7 @@ final class TranscriptStore: ObservableObject {
         }
         mutate(&utterances[index])
         utterances[index].lastActivity = Date()
+        contentRevision += 1
     }
 
     private func trim() {

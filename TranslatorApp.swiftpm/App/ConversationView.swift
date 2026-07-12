@@ -132,34 +132,31 @@ struct ConversationView: View {
     // MARK: - Transcript
 
     private var transcriptList: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 10) {
-                    if model.transcript.utterances.isEmpty {
-                        emptyHint
-                    }
-                    ForEach(model.transcript.utterances) { utterance in
-                        let isUser = utterance.laneID == SpeakerLane.userLaneID
-                        UtteranceBubble(
-                            utterance: utterance,
-                            lane: model.lane(for: utterance.laneID),
-                            onReplyTo: prompterEnabled && !isUser && utterance.isFinal
-                                ? { requestScopedReply(to: utterance) }
-                                : nil,
-                            onExplain: prompterEnabled && !isUser && !utterance.sourceText.isEmpty
-                                ? { explain(utterance) }
-                                : nil
-                        )
-                        .id(utterance.id)
-                    }
+        PinnedScrollView(
+            bottomID: model.transcript.utterances.last?.id,
+            contentRevision: model.transcript.contentRevision,
+            itemCount: model.transcript.utterances.count
+        ) {
+            LazyVStack(alignment: .leading, spacing: 10) {
+                if model.transcript.utterances.isEmpty {
+                    emptyHint
                 }
-                .padding()
-            }
-            .onChange(of: model.transcript.utterances.count) {
-                if let last = model.transcript.utterances.last {
-                    withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                ForEach(model.transcript.utterances) { utterance in
+                    let isUser = utterance.laneID == SpeakerLane.userLaneID
+                    UtteranceBubble(
+                        utterance: utterance,
+                        lane: model.lane(for: utterance.laneID),
+                        onReplyTo: prompterEnabled && !isUser && utterance.isFinal
+                            ? { requestScopedReply(to: utterance) }
+                            : nil,
+                        onExplain: prompterEnabled && !isUser && !utterance.sourceText.isEmpty
+                            ? { explain(utterance) }
+                            : nil
+                    )
+                    .id(utterance.id)
                 }
             }
+            .padding()
         }
     }
 

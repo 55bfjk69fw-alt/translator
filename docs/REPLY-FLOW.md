@@ -155,9 +155,10 @@ arrive.
   for the boundary (further triggers fold into it). Sentence-boundary firing means
   chips can land while the speaker is still mid-utterance — the window
   includes open utterances marked "[mid-speech]", and the system prompt
-  warns the model that all lines are error-prone speech-to-text. Turn-taking conversation → chips land ~3–4 s after someone stops
-  talking (the ~2.5 s the transcript itself needs to finalize, plus the model
-  call — no artificial wait). Continuous multi-thread chatter → a steady
+  warns the model that all lines are error-prone speech-to-text. Turn-taking conversation → chips land ~2–3 s after someone stops
+  talking (the ~1–2.5 s the transcript itself needs to finalize — 1 s when
+  both streams end on a sentence boundary, 2.5 s otherwise, checked at 4 Hz —
+  plus the model call, no artificial wait). Continuous multi-thread chatter → a steady
   ~5 s cadence by construction, no starvation possible. Quiet table → no
   finalizations, no calls, no cost. There is deliberately no debounce: its
   only benefit was saving calls that cost fractions of a cent, and it bought
@@ -171,10 +172,13 @@ arrive.
   the newer content immediately schedules the next fire. The only responses
   dropped outright are ambient batches superseded by a manual/scoped
   request. No queues.
-- If the ~2.5 s finalization delay itself proves to be the bottleneck in the
-  field, the escape hatch is triggering on source-stream quiet instead of
-  full finalization (translation trails source; suggestions only need the
-  source text) — noted here, not built until real use demands it.
+- Field-tested (dinner, 2026-07-12): the finalization delay WAS the felt
+  bottleneck in fluid conversation. First response: sentence-complete bubbles
+  now close on a 1 s quiet window (2.5 s stays for mid-sentence), and the
+  finalize check runs at 4 Hz instead of 1 Hz. The remaining escape hatch if
+  still too slow is triggering on source-stream quiet instead of full
+  finalization (translation trails source; suggestions only need the source
+  text) — noted here, not built until real use demands it.
 - **Scoped/compose/explain requests** fire immediately and pre-empt the
   ambient loop (its next batch just comes later).
 - **Failure**: log to Diagnostics, show a subtle "prompter offline" chip in

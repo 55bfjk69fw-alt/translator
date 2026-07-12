@@ -143,7 +143,7 @@ final class AssistEngine: ObservableObject {
         status = .idle
     }
 
-    /// Called at 1 Hz right after finalizeStale AND immediately on each
+    /// Called at 4 Hz right after finalizeStale AND immediately on each
     /// streamed sentence boundary. Fires the ambient loop when there is
     /// new content since the last request; the rate limit inside
     /// scheduleAmbient bounds how aggressive this can get.

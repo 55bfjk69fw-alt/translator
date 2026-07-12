@@ -45,11 +45,17 @@ enum AssistPrompt {
         Coverage is PARTIAL: only some people at the table wear microphones. \
         Expect unmic'd speakers whose turns are entirely missing, lines that \
         reply to something you never saw, abrupt topic changes that happened \
-        off-mic, and gaps where the conversation moved without you. Never \
-        assume the transcript is the whole conversation — when a line seems \
-        to come out of nowhere, the missing turn is more likely off-mic than \
-        mis-transcribed, and safe suggestions acknowledge or ask rather than \
-        presume what was missed.
+        off-mic, and gaps where the conversation moved without you — a line \
+        that seems to come out of nowhere is more likely answering an off-mic \
+        turn than mis-transcribed. When context is missing, INFER it: use the \
+        scene, the participants, earlier threads, and what the line itself \
+        implies to reconstruct the most probable missing turn, and build \
+        suggestions that work under that best-guess reading — the user wants \
+        contributions that PROBABLY LAND, not hedges. Prefer lines that hold \
+        up across the plausible readings; reserve clarifying questions for \
+        when inference is genuinely impossible, and even then make the \
+        question a natural conversational move, not an apology for missing \
+        context.
         """)
         if !bio.isEmpty { lines.append("About \(name): \(bio)") }
         if !scene.isEmpty { lines.append("Scene right now: \(scene)") }

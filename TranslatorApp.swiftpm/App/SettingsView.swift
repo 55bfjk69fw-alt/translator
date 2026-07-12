@@ -194,9 +194,12 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    // Route through the policy rather than writing the flag
+                    // directly: toggling this off mid-conversation must not
+                    // re-enable auto-lock while sessions are live.
                     Toggle("Keep screen awake", isOn: $keepScreenAwake)
-                        .onChange(of: keepScreenAwake) { _, newValue in
-                            UIApplication.shared.isIdleTimerDisabled = newValue
+                        .onChange(of: keepScreenAwake) { _, _ in
+                            model.applyIdleTimerPolicy()
                         }
                 } header: {
                     Text("Display")

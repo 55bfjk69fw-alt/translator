@@ -36,6 +36,7 @@ struct SettingsView: View {
     @AppStorage(AppSettings.outputGainKey) private var outputGain = 1.0
     @AppStorage(AppSettings.outputLanguageKey) private var outputLanguage = "en"
     @AppStorage(AppSettings.keepScreenAwakeKey) private var keepScreenAwake = true
+    @AppStorage(AppSettings.claimAirPodsAtStartKey) private var claimAirPodsAtStart = true
     @AppStorage(AppSettings.replyLanguageKey) private var replyLanguage = "zh"
     @AppStorage(AppSettings.prompterEnabledKey) private var prompterEnabled = true
     @AppStorage(AppSettings.autoSuggestKey) private var autoSuggest = true
@@ -115,10 +116,11 @@ struct SettingsView: View {
                     .onChange(of: outputGain) { _, newValue in
                         model.setOutputGain(Float(newValue))
                     }
+                    Toggle("Pull AirPods over at Start", isOn: $claimAirPodsAtStart)
                 } header: {
                     Text("Playback")
                 } footer: {
-                    Text("Volume of translated audio, on top of the iPad's hardware volume. Above 100% is a digital boost for loud rooms — the very top of the range can distort. Takes effect immediately.")
+                    Text("Volume of translated audio, on top of the iPad's hardware volume. Above 100% is a digital boost for loud rooms — the very top of the range can distort. Takes effect immediately. \"Pull AirPods over at Start\" plays a short chime under a media-playback session when a conversation starts — the same signal YouTube sends when it starts playing — so AirPods currently on your iPhone switch to this device by themselves. Hear the chime in your ears and it worked; hear it from the iPad speaker and they didn't move (check Bluetooth → AirPods → Connect to This iPad → Automatically). Turn off if you don't use AirPods — it adds a few seconds to Start.")
                 }
 
                 Section {

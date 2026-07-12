@@ -14,6 +14,7 @@ final class AppModel: ObservableObject {
 
     enum Mode: Equatable {
         case idle
+        case claimingAirPods // Start's brief playback-session AirPods grab
         case bench          // meters only, no translation sessions
         case conversation
     }
@@ -107,6 +108,11 @@ final class AppModel: ObservableObject {
     private var stopping = false
     private var cancellables: Set<AnyCancellable> = []
 
+    // AirPods-claim bookkeeping (main thread): the chime playing under the
+    // claim session and the poll waiting for the AirPods to hop over.
+    private var claimChime: AirPodsClaimChime?
+    private var claimTimer: Timer?
+
     init() {
         AppSettings.migrateLegacyKeys()
         transcript = TranscriptStore()
@@ -173,10 +179,79 @@ final class AppModel: ObservableObject {
         costMeter.reset()
         refreshCost()
 
+        // Grab the AirPods from the phone before the conversation session
+        // goes up (they only auto-switch for media playback, which
+        // .playAndRecord never looks like — see configureForPlaybackClaim).
+        // Skipped when something Bluetooth is already this device's output.
+        if AppSettings.claimAirPodsAtStart && !audioSession.airPodsOutputActive {
+            beginAirPodsClaim(apiKey: apiKey)
+        } else {
+            beginConversation(apiKey: apiKey)
+        }
+    }
+
+    /// Briefly impersonate a media-playback app — .playback session plus an
+    /// audible chime — so iPadOS's automatic switching pulls the AirPods to
+    /// this device, the way YouTube does when it starts playing. Polls the
+    /// route until the AirPods arrive (then lets the chime finish) or a
+    /// timeout passes, then starts the conversation either way; a late hop
+    /// is still caught by the route-change handler's engine rebuild.
+    /// Best-effort: any failure just starts the conversation directly.
+    private func beginAirPodsClaim(apiKey: String) {
+        do {
+            try audioSession.configureForPlaybackClaim()
+        } catch {
+            Log.warn("AirPods claim skipped — playback session failed: \(error.localizedDescription)")
+            beginConversation(apiKey: apiKey)
+            return
+        }
+        mode = .claimingAirPods
+        refreshRoute()
+        let chime = AirPodsClaimChime()
+        claimChime = chime
+        chime.play()
+        Log.info("Claiming AirPods: start chime playing under a media-playback session")
+        let chimeDone = Date().addingTimeInterval(AirPodsClaimChime.duration)
+        let deadline = Date().addingTimeInterval(3.5)
+        claimTimer?.invalidate()
+        claimTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] timer in
+            guard let self, self.mode == .claimingAirPods else {
+                timer.invalidate()
+                return
+            }
+            let now = Date()
+            let claimed = self.audioSession.airPodsOutputActive
+            guard (claimed && now >= chimeDone) || now >= deadline else { return }
+            timer.invalidate()
+            self.claimTimer = nil
+            self.claimChime?.stop()
+            self.claimChime = nil
+            if claimed {
+                Log.info("AirPods claim succeeded — AirPods are now this device's output")
+            } else {
+                Log.warn("AirPods claim timed out — output is \(self.audioSession.snapshot().outputs.joined(separator: ", ")). If they stayed on the phone, set Bluetooth → AirPods → Connect to This iPad → Automatically.")
+            }
+            self.beginConversation(apiKey: apiKey)
+        }
+    }
+
+    private func cancelAirPodsClaim() {
+        claimTimer?.invalidate()
+        claimTimer = nil
+        claimChime?.stop()
+        claimChime = nil
+        mode = .idle
+        Log.info("AirPods claim cancelled — Start aborted")
+    }
+
+    /// The real conversation start — audio session, engine, lanes, timers.
+    /// Runs straight from Start, or after the AirPods claim settles.
+    private func beginConversation(apiKey: String) {
         do {
             try audioSession.configureForConversation()
         } catch {
             errorBanner = "Audio session setup failed: \(error.localizedDescription)"
+            mode = .idle
             return
         }
         refreshRoute()
@@ -185,6 +260,7 @@ final class AppModel: ObservableObject {
             try engineGraph.start(playerCount: playbackLaneCount)
         } catch {
             errorBanner = "Audio engine failed to start: \(error.localizedDescription)"
+            mode = .idle
             return
         }
 
@@ -221,6 +297,12 @@ final class AppModel: ObservableObject {
     }
 
     func stopConversation() {
+        // Stop during the claim window: nothing is running yet beyond the
+        // chime — just abort the pending start.
+        if mode == .claimingAirPods {
+            cancelAirPodsClaim()
+            return
+        }
         guard mode != .idle else { return }
         stopping = true
         mode = .idle

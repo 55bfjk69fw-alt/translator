@@ -31,6 +31,24 @@ final class AudioSessionController {
         maximizeInputChannels()
     }
 
+    /// Media-playback session shape for the Start-time AirPods claim.
+    ///
+    /// AirPods automatic switching follows *media playback*: iPadOS pulls
+    /// the AirPods over from the phone when this device starts playing
+    /// under a .playback session — what YouTube does the moment you hit
+    /// play — but a .playAndRecord session activating quietly is not
+    /// treated as that signal, so starting a conversation used to leave
+    /// them on the phone. There is no API to command the switch; looking
+    /// like playback for a moment is the only lever. Start runs this
+    /// category while AirPodsClaimChime plays, then flips to
+    /// configureForConversation() once the AirPods hop over (or a timeout
+    /// passes — the switch also needs the AirPods' "Connect to This iPad"
+    /// setting to be "Automatically", which the app can't check).
+    func configureForPlaybackClaim() throws {
+        try session.setCategory(.playback, mode: .default, options: [])
+        try session.setActive(true)
+    }
+
     @discardableResult
     func selectUSBInput() -> Bool {
         guard let usb = session.availableInputs?.first(where: { $0.portType == .usbAudio }) else {

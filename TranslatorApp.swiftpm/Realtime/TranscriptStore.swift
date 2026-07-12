@@ -68,6 +68,20 @@ final class TranscriptStore: ObservableObject {
 
     private static let sentenceEnders: Set<Character> = ["。", "！", "？", "…", ".", "!", "?"]
 
+    /// Closing quotes/brackets that legitimately trail a sentence ender
+    /// ("……」" / ".\"") and must not hide it from the completeness check.
+    private static let trailingClosers: Set<Character> = ["\"", "\u{201D}", "\u{2019}", "'", ")", "）", "」", "』", "]", "】"]
+
+    /// True when the text's last meaningful character is a sentence ender —
+    /// strong evidence the stream has delivered a complete thought.
+    private func endsWithCompleteSentence(_ text: String) -> Bool {
+        for char in text.reversed() {
+            if char.isWhitespace || Self.trailingClosers.contains(char) { continue }
+            return Self.sentenceEnders.contains(char)
+        }
+        return false
+    }
+
     private func noteSentenceBoundary(in text: String) {
         guard text.contains(where: { Self.sentenceEnders.contains($0) }) else { return }
         sentenceEventTotal += 1
@@ -165,7 +179,13 @@ final class TranscriptStore: ObservableObject {
     /// sourceless bubbles. A bubble closes only when BOTH streams are quiet
     /// and a translation has arrived, or after a hard cap (some segments
     /// never get transcript deltas).
-    func finalizeStale(timeout: TimeInterval) {
+    ///
+    /// When both texts already end on a sentence boundary, the segment is
+    /// almost certainly done, so `completedSentenceTimeout` (shorter) applies
+    /// instead — fluid turn-taking was waiting out the full conservative
+    /// window on bubbles that were visibly complete. A wrong call here is
+    /// cheap: a trailing delta reattaches via reopenRecentIfNeeded.
+    func finalizeStale(timeout: TimeInterval, completedSentenceTimeout: TimeInterval? = nil) {
         let now = Date()
         var finalizedAny = false
         for (lane, index) in openUtteranceIndex {
@@ -174,8 +194,16 @@ final class TranscriptStore: ObservableObject {
                 continue
             }
             let utterance = utterances[index]
-            let sourceQuiet = now.timeIntervalSince(utterance.lastSourceActivity ?? utterance.date) > timeout
-            let translationQuiet = now.timeIntervalSince(utterance.lastTranslationActivity ?? utterance.date) > timeout
+            let quietNeeded: TimeInterval
+            if let fast = completedSentenceTimeout,
+               endsWithCompleteSentence(utterance.sourceText),
+               endsWithCompleteSentence(utterance.translatedText) {
+                quietNeeded = fast
+            } else {
+                quietNeeded = timeout
+            }
+            let sourceQuiet = now.timeIntervalSince(utterance.lastSourceActivity ?? utterance.date) > quietNeeded
+            let translationQuiet = now.timeIntervalSince(utterance.lastTranslationActivity ?? utterance.date) > quietNeeded
             let translationDrained = !utterance.translatedText.isEmpty
             let hardCap = now.timeIntervalSince(utterance.lastActivity) > timeout * 3
             if (sourceQuiet && translationQuiet && translationDrained) || hardCap {
@@ -184,7 +212,10 @@ final class TranscriptStore: ObservableObject {
                 finalizedTotal += 1
                 contentRevision += 1
                 finalizedAny = true
-                logFinalize(utterance, lane: lane, reason: sourceQuiet && translationQuiet && translationDrained ? "quiet" : "hard-cap")
+                let reason = sourceQuiet && translationQuiet && translationDrained
+                    ? (quietNeeded < timeout ? "sentence-quiet" : "quiet")
+                    : "hard-cap"
+                logFinalize(utterance, lane: lane, reason: reason)
             }
         }
         if finalizedAny { trim() }

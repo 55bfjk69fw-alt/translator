@@ -136,6 +136,10 @@ final class AppModel: ObservableObject {
     private var pendingPlaybackBuffers: [Int: Int] = [:]
 
     private var uiTimer: Timer?
+    /// Faster companion to uiTimer for transcript finalization only — at
+    /// 1 Hz, bubble closes were quantized to the tick on top of the quiet
+    /// timeout, adding up to a full second of visible linger.
+    private var finalizeTimer: Timer?
     private var stopping = false
 
     // Start-window bookkeeping (main thread): the chime playing under the
@@ -376,6 +380,8 @@ final class AppModel: ObservableObject {
         assist.conversationEnded()
         uiTimer?.invalidate()
         uiTimer = nil
+        finalizeTimer?.invalidate()
+        finalizeTimer = nil
         engineGraph.onInputChannels = nil
         engineGraph.stop()
         audioQueue.sync {
@@ -734,25 +740,44 @@ final class AppModel: ObservableObject {
 
     // MARK: - Timers & notifications
 
+    /// Quiet window before an open bubble finalizes. The short variant
+    /// applies when both streams already end on a sentence boundary —
+    /// dinner-table turn-taking needs closes to keep pace with the
+    /// conversation, and reopenRecentIfNeeded covers the rare late delta.
+    private static let finalizeTimeout: TimeInterval = 2.5
+    private static let finalizeSentenceTimeout: TimeInterval = 1.0
+
     private func startUITimer() {
         uiTimer?.invalidate()
         uiTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self else { return }
             self.refreshCost()
-            self.transcript.finalizeStale(timeout: 2.5)
-            // The prompter's ambient trigger keys off finalizations (plus
-            // the immediate sentence-boundary callback) — tick right after
-            // finalizeStale so a fresh utterance can fire a suggestion
-            // request the same second (docs/REPLY-FLOW.md §3). Both
-            // counters are monotonic, so the trigger survives the
-            // transcript's 400-utterance trim cap.
-            if self.mode == .conversation {
-                self.assist.transcriptTick(contentEvents: self.transcript.finalizedTotal + self.transcript.sentenceEventTotal)
-            }
             self.closeIdleSessions()
             self.watchdogEngineCheck()
             self.refreshPipelineStatuses()
         }
+        // Finalization runs on its own 4 Hz timer so bubble closes track the
+        // quiet timeout instead of the 1 Hz UI tick. Cheap when nothing is
+        // ready: Date math over at most 4 open lanes, no @Published churn.
+        finalizeTimer?.invalidate()
+        let timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.transcript.finalizeStale(
+                timeout: Self.finalizeTimeout,
+                completedSentenceTimeout: Self.finalizeSentenceTimeout
+            )
+            // The prompter's ambient trigger keys off finalizations (plus
+            // the immediate sentence-boundary callback) — tick right after
+            // finalizeStale so a fresh utterance can fire a suggestion
+            // request without waiting on the 1 Hz tick (docs/REPLY-FLOW.md
+            // §3). Both counters are monotonic, so the trigger survives the
+            // transcript's 400-utterance trim cap.
+            if self.mode == .conversation {
+                self.assist.transcriptTick(contentEvents: self.transcript.finalizedTotal + self.transcript.sentenceEventTotal)
+            }
+        }
+        timer.tolerance = 0.1
+        finalizeTimer = timer
     }
 
     /// Rebuild the Diagnostics pipeline rows from live client counters.

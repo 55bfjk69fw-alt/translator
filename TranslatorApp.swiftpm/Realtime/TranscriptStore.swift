@@ -104,13 +104,26 @@ final class TranscriptStore: ObservableObject {
         case source, translation
     }
 
+    /// The pinyin cache is filled at append time because the ICU
+    /// transliteration is too slow for render time — but it re-derives the
+    /// WHOLE accumulated string, and streaming deltas arrive many times per
+    /// second, all on the main thread. Bound that: at most one recompute
+    /// per stream per interval, with finalizeStale doing an unconditional
+    /// last pass so the displayed pinyin can trail the text only while the
+    /// bubble is visibly still streaming.
+    private static let pinyinRecomputeInterval: TimeInterval = 0.3
+    /// Last pinyin recompute per lane and stream. Cleared when a lane opens
+    /// a fresh bubble so its first delta always computes immediately —
+    /// pinyin must appear with the first characters, not 0.3 s later.
+    private var lastPinyinComputeAt: [Int: [Stream: Date]] = [:]
+
     func appendSourceDelta(lane: Int, text: String) {
         reopenRecentIfNeeded(lane: lane, stream: .source)
         withOpenUtterance(lane: lane, stream: .source) {
             $0.sourceText += text
-            $0.sourcePinyin = $0.sourceText.pinyin
             $0.lastSourceActivity = Date()
         }
+        recomputePinyinIfDue(lane: lane, stream: .source)
         noteSentenceBoundary(in: text)
     }
 
@@ -118,10 +131,24 @@ final class TranscriptStore: ObservableObject {
         reopenRecentIfNeeded(lane: lane, stream: .translation)
         withOpenUtterance(lane: lane, stream: .translation) {
             $0.translatedText += text
-            $0.translatedPinyin = $0.translatedText.pinyin
             $0.lastTranslationActivity = Date()
         }
+        recomputePinyinIfDue(lane: lane, stream: .translation)
         noteSentenceBoundary(in: text)
+    }
+
+    private func recomputePinyinIfDue(lane: Int, stream: Stream) {
+        guard let index = openUtteranceIndex[lane], utterances.indices.contains(index) else { return }
+        let now = Date()
+        if let last = lastPinyinComputeAt[lane]?[stream],
+           now.timeIntervalSince(last) < Self.pinyinRecomputeInterval { return }
+        lastPinyinComputeAt[lane, default: [:]][stream] = now
+        switch stream {
+        case .source:
+            utterances[index].sourcePinyin = utterances[index].sourceText.pinyin
+        case .translation:
+            utterances[index].translatedPinyin = utterances[index].translatedText.pinyin
+        }
     }
 
     /// Record something the user actually said aloud (a cue card confirmed
@@ -207,6 +234,12 @@ final class TranscriptStore: ObservableObject {
             let translationDrained = !utterance.translatedText.isEmpty
             let hardCap = now.timeIntervalSince(utterance.lastActivity) > timeout * 3
             if (sourceQuiet && translationQuiet && translationDrained) || hardCap {
+                // Streaming recomputes are throttled, so the cached pinyin
+                // can trail the text by a few deltas — the close is the
+                // last write, and a final bubble must never show stale
+                // pinyin.
+                utterances[index].sourcePinyin = utterances[index].sourceText.pinyin
+                utterances[index].translatedPinyin = utterances[index].translatedText.pinyin
                 utterances[index].isFinal = true
                 openUtteranceIndex[lane] = nil
                 finalizedTotal += 1
@@ -224,6 +257,7 @@ final class TranscriptStore: ObservableObject {
     func clear() {
         utterances.removeAll()
         openUtteranceIndex.removeAll()
+        lastPinyinComputeAt.removeAll()
         contentRevision += 1
     }
 
@@ -262,6 +296,7 @@ final class TranscriptStore: ObservableObject {
             ))
             index = utterances.count - 1
             openUtteranceIndex[lane] = index
+            lastPinyinComputeAt[lane] = nil
         }
         mutate(&utterances[index])
         utterances[index].lastActivity = Date()

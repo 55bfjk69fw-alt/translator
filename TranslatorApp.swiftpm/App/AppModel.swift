@@ -27,6 +27,24 @@ final class ChannelMeters: ObservableObject {
     }
 }
 
+/// 1 Hz pipeline snapshots for the Diagnostics panel. Deliberately its own
+/// ObservableObject (the ChannelMeters pattern): the snapshot array is
+/// rebuilt every tick and can never compare equal, so publishing it from
+/// AppModel re-rendered everything observing AppModel — the conversation
+/// screen included — once per second for the whole session. Main thread
+/// only.
+final class PipelineMonitor: ObservableObject {
+    @Published private(set) var statuses: [AppModel.LanePipelineStatus] = []
+
+    func update(_ statuses: [AppModel.LanePipelineStatus]) {
+        self.statuses = statuses
+    }
+
+    func clear() {
+        if !statuses.isEmpty { statuses = [] }
+    }
+}
+
 /// Central coordinator: audio session/engine, per-channel gating and
 /// resampling, one translation session per speaker, the reply prompter,
 /// and transcript/cost bookkeeping.
@@ -70,9 +88,12 @@ final class AppModel: ObservableObject {
         var session: RealtimeTranslationClient.Snapshot?
     }
 
-    @Published private(set) var pipelineStatuses: [LanePipelineStatus] = []
-
     let transcript: TranscriptStore
+
+    /// 1 Hz Diagnostics pipeline rows. Its own ObservableObject so snapshot
+    /// churn only re-renders the pipeline section (see the class comment
+    /// above).
+    let pipelineMonitor = PipelineMonitor()
 
     /// 10 Hz level/gate dots. Its own ObservableObject so meter churn only
     /// re-renders the status bar and Diagnostics meter rows (see the class
@@ -395,7 +416,7 @@ final class AppModel: ObservableObject {
         sessionStates.removeAll()
         reconnectAttempts.removeAll()
         sessionOpenedAt.removeAll()
-        pipelineStatuses = []
+        pipelineMonitor.clear()
         resetPlaybackState()
         refreshCost()
         metrics.endSession()
@@ -577,7 +598,12 @@ final class AppModel: ObservableObject {
                 default:
                     break
                 }
-                self.sessionStates[lane] = state
+                // @Published fires objectWillChange on same-value writes,
+                // and state events repeat (reconnect loops re-emit
+                // .connecting/.closed) — publish only real transitions.
+                if self.sessionStates[lane] != state {
+                    self.sessionStates[lane] = state
+                }
             }
         }
         client.onSourceTranscriptDelta = { [weak self] delta in
@@ -792,14 +818,14 @@ final class AppModel: ObservableObject {
     /// client's queue, and the clients dictionary is copied under audioQueue.
     private func refreshPipelineStatuses() {
         guard mode == .conversation else {
-            if !pipelineStatuses.isEmpty { pipelineStatuses = [] }
+            pipelineMonitor.clear()
             return
         }
         let (clientsCopy, voiceTimes) = audioQueue.sync { (clients, lastVoiceAt) }
         let sessionSnapshots = clientsCopy.mapValues { $0.snapshot() }
         let now = Date()
         let open = channelMeters.gateOpen
-        pipelineStatuses = lanes.map { lane in
+        pipelineMonitor.update(lanes.map { lane in
             LanePipelineStatus(
                 id: lane.id,
                 name: lane.name,
@@ -807,7 +833,7 @@ final class AppModel: ObservableObject {
                 secondsSinceSpeech: voiceTimes[lane.id].map { now.timeIntervalSince($0) },
                 session: sessionSnapshots[lane.id]
             )
-        }
+        })
         // The Metrics tab samples the same 1 Hz snapshots the pipeline
         // panel reads — no extra client-queue hops. Lane names ride along so
         // MetricsView never has to observe AppModel (whose meters churn at
@@ -860,7 +886,7 @@ final class AppModel: ObservableObject {
             }
         }
         for lane in closedLanes {
-            sessionStates[lane] = .idle
+            if sessionStates[lane] != .idle { sessionStates[lane] = .idle }
             sessionOpenedAt[lane] = nil
             reconnectAttempts[lane] = 0
             if disabledLanes.contains(lane) {

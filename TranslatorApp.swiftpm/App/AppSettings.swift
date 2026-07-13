@@ -16,6 +16,7 @@ enum AppSettings {
     static let vadOnProbabilityKey = "gateVadOnProbability"
     static let userNameKey = "userName"
     static let idleCloseSecondsKey = "idleCloseSeconds"
+    static let costAlertDollarsKey = "costAlertDollars"
     static let showPinyinKey = "showPinyin"
     static let outputGainKey = "outputGain"
     static let outputLanguageKey = "outputLanguage"
@@ -245,6 +246,12 @@ enum AppSettings {
     static var idleCloseSeconds: Double {
         if UserDefaults.standard.object(forKey: idleCloseSecondsKey) == nil { return 120 }
         return UserDefaults.standard.double(forKey: idleCloseSecondsKey)
+    }
+
+    /// Dollar threshold for the once-per-conversation cost banner (0 = off).
+    static var costAlertDollars: Double {
+        if UserDefaults.standard.object(forKey: costAlertDollarsKey) == nil { return 25 }
+        return max(0, UserDefaults.standard.double(forKey: costAlertDollarsKey))
     }
 
     /// Keep the iPad screen awake while the app is open (default on): a

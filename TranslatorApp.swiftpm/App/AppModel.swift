@@ -131,6 +131,10 @@ final class AppModel: ObservableObject {
     private var lastWatchdogRestart = Date.distantPast
     private var lastEngineDownWarn = Date.distantPast
 
+    /// The cost-alert banner fires at most once per conversation (main
+    /// thread; reset at Start alongside the cost meter).
+    private var costAlertFired = false
+
     /// Playback lanes on the engine: 0..3 = translated English per speaker.
     private let playbackLaneCount = 4
     private var pendingPlaybackBuffers: [Int: Int] = [:]
@@ -212,6 +216,7 @@ final class AppModel: ObservableObject {
         // The estimate next to the lane dots reads as "this conversation's
         // cost" — start it from zero.
         costMeter.reset()
+        costAlertFired = false
         refreshCost()
 
         // Grab the AirPods from the phone before the conversation session
@@ -867,8 +872,17 @@ final class AppModel: ObservableObject {
     private func refreshCost() {
         // @Published fires objectWillChange even on same-value writes, and
         // this runs at 1 Hz — only publish when the estimate actually moved.
-        let cost = costMeter.estimatedDollars
+        // Both reads are safe here: CostMeter is thread-safe, and this runs
+        // on the main thread (UI timer), where MetricsStore is confined.
+        let cost = costMeter.estimatedDollars + metrics.assistDollars
         if estimatedCost != cost { estimatedCost = cost }
+        // One notice per conversation when the estimate crosses the Settings
+        // threshold (0 = off). The banner is reused as a notice channel; it
+        // does not stop anything.
+        if AppSettings.costAlertDollars > 0, !costAlertFired, cost >= AppSettings.costAlertDollars {
+            costAlertFired = true
+            errorBanner = String(format: "Cost check: this conversation has passed the $%.0f alert threshold (set in Settings → Sessions).", AppSettings.costAlertDollars)
+        }
     }
 
     private func observeNotifications() {

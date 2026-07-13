@@ -3,8 +3,11 @@ import Foundation
 /// Accumulates billed audio seconds reported by the realtime clients and
 /// converts them to dollars.
 ///
-/// gpt-realtime-translate bills $0.034 per minute of "realtime audio
-/// duration". Each client measures that directly as the max of two signals:
+/// Each realtime session bills two lines on the same "realtime audio
+/// duration": gpt-realtime-translate at $0.034 per minute, plus
+/// gpt-realtime-whisper source transcription (which every session.update
+/// requests — see SessionConfig) at roughly half that. Each client measures
+/// the billed duration directly as the max of two signals:
 /// the server's own session clock (`elapsed_ms` on delta events, including
 /// the ~200 ms heartbeat frames) and the duration of input audio actually
 /// appended (bytes at 24 kHz PCM16 mono). This replaces the old
@@ -13,6 +16,16 @@ import Foundation
 /// and the post-close server drain.
 final class CostMeter {
     static let dollarsPerSessionMinute = 0.034
+    /// gpt-realtime-whisper source transcription, billed on the same session
+    /// minutes as translation. Derived from the owner's 2026-07-12 dashboard
+    /// ($8.40 whisper vs $17.00 translate on identical billed minutes);
+    /// OpenAI's published per-minute price for gpt-realtime-whisper inside
+    /// translation sessions was not verifiable from this codebase — update
+    /// when published, like the translate rate above.
+    static let transcriptionDollarsPerSessionMinute = 0.0168
+    static var combinedDollarsPerSessionMinute: Double {
+        dollarsPerSessionMinute + transcriptionDollarsPerSessionMinute
+    }
 
     private var billedSeconds: Double = 0
     private let lock = NSLock()
@@ -27,7 +40,7 @@ final class CostMeter {
     /// Total estimated dollars so far.
     var estimatedDollars: Double {
         lock.lock(); defer { lock.unlock() }
-        return billedSeconds / 60.0 * Self.dollarsPerSessionMinute
+        return billedSeconds / 60.0 * Self.combinedDollarsPerSessionMinute
     }
 
     func reset() {

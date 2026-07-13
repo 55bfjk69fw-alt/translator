@@ -32,6 +32,7 @@ struct SettingsView: View {
     @AppStorage(AppSettings.modelNameKey) private var modelName = ""
     @AppStorage(AppSettings.endpointTemplateKey) private var endpointTemplate = ""
     @AppStorage(AppSettings.idleCloseSecondsKey) private var idleCloseSeconds = 120.0
+    @AppStorage(AppSettings.costAlertDollarsKey) private var costAlertDollars = 25.0
     @AppStorage(AppSettings.showPinyinKey) private var showPinyin = true
     @AppStorage(AppSettings.outputGainKey) private var outputGain = 1.0
     @AppStorage(AppSettings.outputLanguageKey) private var outputLanguage = "en"
@@ -246,10 +247,16 @@ struct SettingsView: View {
                         Text("5 minutes").tag(300.0)
                         Text("Never").tag(0.0)
                     }
+                    Picker("Cost alert", selection: $costAlertDollars) {
+                        Text("Off").tag(0.0)
+                        Text("$10").tag(10.0)
+                        Text("$25").tag(25.0)
+                        Text("$50").tag(50.0)
+                    }
                 } header: {
                     Text("Sessions")
                 } footer: {
-                    Text("Translation sessions open when a mic first picks up speech and close after this much silence (they reopen instantly on the next speech). Disconnected or powered-off transmitters never open a session.")
+                    Text("Translation sessions open when a mic first picks up speech and close after this much silence (they reopen instantly on the next speech). Disconnected or powered-off transmitters never open a session. The cost alert shows a banner once per conversation when the live estimate (translation + transcription + prompter) crosses the threshold.")
                 }
 
                 Section {

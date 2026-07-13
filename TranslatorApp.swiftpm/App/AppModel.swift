@@ -125,6 +125,28 @@ final class AppModel: ObservableObject {
     /// looks exactly like "gate open, nothing captured".
     private var warnedMissingResampler: Set<Int> = []
 
+    // Gate-closed append pausing (audioQueue-confined). Sessions are no
+    // longer fed silence for the whole lull between utterances: after the
+    // gate's hangover closes, a short silence tail is appended (the server
+    // segments phrases on trailing quiet), then the stream pauses entirely.
+    // Server-verified safe: appended audio is treated as contiguous with
+    // what came before (no timestamps on append), which is also why a
+    // resume must splice in a quiet gap — otherwise the new phrase butts
+    // against the previous one in session time.
+    /// Buffers of trailing silence still owed to a lane's session.
+    private var silenceTailRemaining: [Int: Int] = [:]
+    /// Channels whose outbound stream is currently paused.
+    private var appendPaused: Set<Int> = []
+    /// Last 200 ms of real resampled audio per non-passing channel, sent on
+    /// resume so the word onset the gate's attack clipped isn't lost.
+    private var preRoll: [Int: Data] = [:]
+
+    /// ~1.2 s of silence after the hangover closes — long enough to be the
+    /// server's phrase-boundary cue, no longer billed past that.
+    private static let silenceTailBufferCount = 6
+    /// 300 ms splice inserted when a paused stream resumes.
+    private static let resumeSpliceSilence = Data(count: 14_400) // 24 kHz PCM16
+
     // Engine watchdog bookkeeping (main thread). The engine auto-stops on
     // configuration changes and interruptions; the watchdog brings it back.
     private var interruptedSince: Date?
@@ -388,6 +410,9 @@ final class AppModel: ObservableObject {
             pipelineActive = false
             sessionAPIKey = nil
             lastVoiceAt.removeAll()
+            silenceTailRemaining.removeAll()
+            appendPaused.removeAll()
+            preRoll.removeAll()
             for (_, client) in clients { client.close() }
             clients.removeAll()
             resamplers.removeAll()
@@ -419,6 +444,11 @@ final class AppModel: ObservableObject {
         audioQueue.sync {
             resamplers.removeAll()
             warnedMissingResampler.removeAll()
+            // Fresh converters mean a fresh append timeline: stale pause/tail
+            // state must not splice a pre-rebuild pre-roll into it.
+            silenceTailRemaining.removeAll()
+            appendPaused.removeAll()
+            preRoll.removeAll()
             for channel in 0..<channelCount {
                 resamplers[channel] = StreamResampler(inputSampleRate: rate)
             }
@@ -494,17 +524,40 @@ final class AppModel: ObservableObject {
                 }
                 continue
             }
-            guard let client = clients[channel] ?? lazyOpenSession(channel: channel, speech: speech) else { continue }
-            let outgoing: AVAudioPCMBuffer?
-            if decision.pass {
-                outgoing = buffers[channel]
-            } else {
-                // Replace suppressed audio with silence to keep the session's
-                // audio timeline continuous.
-                outgoing = EngineGraph.silentBuffer(frames: frames, sampleRate: sampleRate)
+            // The real audio is resampled on every buffer — sent or not — so
+            // the converter's filter state stays gapless and the freshest
+            // 200 ms is always available as pre-roll.
+            guard let data = resampler.convert(buffers[channel]) else { continue }
+            if !decision.pass { preRoll[channel] = data }
+            let existingClient = clients[channel]
+            guard let client = existingClient ?? lazyOpenSession(channel: channel, speech: speech) else {
+                // No session: nothing owes a tail and there is nothing to pause.
+                silenceTailRemaining[channel] = nil
+                appendPaused.remove(channel)
+                continue
             }
-            if let outgoing, let data = resampler.convert(outgoing) {
-                client.sendAudio(data, containsSpeech: speech)
+            if decision.pass {
+                let resumed = appendPaused.remove(channel) != nil
+                if resumed || existingClient == nil {
+                    // A fresh session's first append and a resumed stream both
+                    // lead with the pre-roll; only a resume needs the quiet
+                    // splice (a new session has no previous phrase to butt
+                    // against). Oversized appends are fine — the server
+                    // splits them into 200 ms frames itself.
+                    var spliced = Data()
+                    if resumed { spliced.append(Self.resumeSpliceSilence) }
+                    if let pre = preRoll.removeValue(forKey: channel) { spliced.append(pre) }
+                    spliced.append(data)
+                    client.sendAudio(spliced, containsSpeech: speech)
+                } else {
+                    client.sendAudio(data, containsSpeech: speech)
+                }
+                silenceTailRemaining[channel] = Self.silenceTailBufferCount
+            } else if let tail = silenceTailRemaining[channel], tail > 0 {
+                silenceTailRemaining[channel] = tail - 1
+                client.sendAudio(Data(count: data.count), containsSpeech: false)
+            } else {
+                appendPaused.insert(channel)
             }
         }
         pushMeters(decisions)

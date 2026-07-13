@@ -54,11 +54,11 @@ final class RealtimeTranslationClient: NSObject {
     private struct Stats {
         var audioChunksSent = 0
         var audioBytesSent = 0
-        /// Bytes that actually carried signal. Gate-suppressed audio arrives
-        /// here as exact digital silence (the gate substitutes zero buffers),
-        /// so this split distinguishes "we streamed 60 s of audio" from "the
-        /// server heard 8 s of speech" — the difference is what makes a quiet
-        /// lane's empty transcript expected rather than a bug.
+        /// Bytes that actually carried signal. Deliberate silence arrives
+        /// here as exact digital zeros (post-speech tails, resume splices,
+        /// keepalives), so this split distinguishes "we streamed 60 s of
+        /// audio" from "the server heard 8 s of speech" — the difference is
+        /// what makes a quiet lane's empty transcript expected, not a bug.
         var speechBytesSent = 0
         var chunksQueuedPreOpen = 0
         var sendFailures = 0
@@ -69,9 +69,16 @@ final class RealtimeTranslationClient: NSObject {
         var audioFrames = 0
         var audioBytes = 0
         var heartbeatsDropped = 0
+        var keepalivesSent = 0
     }
     private var stats = Stats()
     private var lastServerEventAt = Date()
+    /// When audio was last appended (queue-confined). With gate-closed
+    /// pauses upstream, a quiet lane appends nothing for minutes; the ping
+    /// tick sends one silent chunk past this age so intermediaries can't
+    /// idle out the upstream half of the socket.
+    private var lastAppendAt = Date()
+    private static let keepaliveSilence = Data(count: 9_600) // 200 ms @ 24 kHz PCM16
     private var connectStartedAt: Date?
     private var openedAt: Date?
     private var pingTicks = 0
@@ -394,6 +401,7 @@ final class RealtimeTranslationClient: NSObject {
     private func sendAppendEvent(_ pcm16: Data) {
         stats.audioChunksSent += 1
         stats.audioBytesSent += pcm16.count
+        lastAppendAt = Date()
         // Gate-suppressed audio is exact zeros, so the scan cleanly splits
         // "keeping the timeline alive" from "sending the server speech".
         if !Self.isPureSilence(pcm16) {
@@ -653,6 +661,10 @@ final class RealtimeTranslationClient: NSObject {
         }
         pingTicks += 1
         checkStreamSymptoms()
+        if Date().timeIntervalSince(lastAppendAt) > 20 {
+            stats.keepalivesSent += 1
+            sendAppendEvent(Self.keepaliveSilence)
+        }
         if pingTicks % 3 == 0 { logSummary(context: "periodic") }
         guard let task else { return }
         task.sendPing { [weak self] error in
@@ -675,6 +687,7 @@ final class RealtimeTranslationClient: NSObject {
         line += ", translation \(s.translationDeltas)Δ/\(s.translationChars)ch"
         line += ", audio \(s.audioFrames) frames/\(s.audioBytes / 1024)KB"
         line += ", \(s.heartbeatsDropped) heartbeats dropped"
+        if s.keepalivesSent > 0 { line += ", \(s.keepalivesSent) keepalives" }
         line += String(format: "; speech sent %.0fs of %.0fs total",
                        Double(s.speechBytesSent) / Self.billedBytesPerSecond,
                        Double(s.audioBytesSent) / Self.billedBytesPerSecond)
@@ -735,6 +748,7 @@ extension RealtimeTranslationClient: URLSessionWebSocketDelegate {
         Log.info("[\(label)] WS open\(latency)")
         lastServerEventAt = Date()
         openedAt = Date()
+        lastAppendAt = Date()
         // Marking open and flushing the pre-open queue is one queue block,
         // so concurrent sendAudio calls order strictly before or after it —
         // no chunk can overtake the queued speech or strand in the buffer.

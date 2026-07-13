@@ -878,8 +878,11 @@ final class AppModel: ObservableObject {
         if estimatedCost != cost { estimatedCost = cost }
         // One notice per conversation when the estimate crosses the Settings
         // threshold (0 = off). The banner is reused as a notice channel; it
-        // does not stop anything.
-        if AppSettings.costAlertDollars > 0, !costAlertFired, cost >= AppSettings.costAlertDollars {
+        // does not stop anything. Armed only in .conversation: during Start
+        // the previous conversation's prompter ledger is still live
+        // (metrics.startSession runs later in beginConversation), and a
+        // stale total must not consume this conversation's one banner.
+        if mode == .conversation, AppSettings.costAlertDollars > 0, !costAlertFired, cost >= AppSettings.costAlertDollars {
             costAlertFired = true
             errorBanner = String(format: "Cost check: this conversation has passed the $%.0f alert threshold (set in Settings → Sessions).", AppSettings.costAlertDollars)
         }

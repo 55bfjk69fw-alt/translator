@@ -613,11 +613,18 @@ final class AppModel: ObservableObject {
             guard self.audioQueue.sync(execute: { self.clients[lane] != nil }) else { return }
             let attempts = (self.reconnectAttempts[lane] ?? 0) + 1
             self.reconnectAttempts[lane] = attempts
-            guard attempts <= 5 else {
-                self.errorBanner = "Session for \(self.laneName(lane)) keeps failing — check the API key and event log."
-                return
+            // Retry for as long as the conversation runs — never give up.
+            // Giving up used to leave the dead client registered in the
+            // lane's slot, and the lazy-open path only fills EMPTY slots,
+            // so a 1-2 min network outage killed the lane for the rest of
+            // the conversation (idle-close never evicts a lane whose
+            // speaker keeps talking). The guards above — stop flag, mode,
+            // client still registered — are what bound the retry chain:
+            // Stop and idle-close both end it.
+            if attempts == 5 {
+                self.errorBanner = "Session for \(self.laneName(lane)) keeps failing — still retrying every 30 s. Check the network; if the network is fine, check the API key and event log."
             }
-            let delay = min(10, pow(2, Double(attempts)))
+            let delay = min(30, pow(2, Double(min(attempts, 5))))
             Log.warn("Reconnecting \(self.laneName(lane)) in \(Int(delay))s (attempt \(attempts))")
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                 guard !self.stopping, self.mode != .idle else { return }

@@ -70,9 +70,24 @@ final class RealtimeTranslationClient: NSObject {
         var audioBytes = 0
         var heartbeatsDropped = 0
         var keepalivesSent = 0
+        /// Chunks dropped instead of sent because the uplink ran behind.
+        var chunksShed = 0
     }
     private var stats = Stats()
     private var lastServerEventAt = Date()
+    /// Audio bytes handed to URLSession whose send completion hasn't fired
+    /// yet (queue-confined) — the outbound backlog. URLSession buffers
+    /// unsent WebSocket messages in process memory with no cap of its own,
+    /// so on a weak uplink this is the number that decides between shedding
+    /// load and unbounded latency+memory growth.
+    private var inflightAudioBytes = 0
+    private var warnedBacklog = false
+    /// Backlog (in audio seconds) past which silence is shed, and past
+    /// which the connection is reset: ~2.5 s is where added delay stops
+    /// being conversational; ~8 s is past saving — a reset plus the
+    /// fresh-speech reconnect queue recovers faster than draining would.
+    private static let backlogSoftLimitSeconds = 2.5
+    private static let backlogHardLimitSeconds = 8.0
     /// When audio was last appended (queue-confined). With gate-closed
     /// pauses upstream, a quiet lane appends nothing for minutes; the ping
     /// tick sends one silent chunk past this age so intermediaries can't
@@ -212,6 +227,9 @@ final class RealtimeTranslationClient: NSObject {
         var speechSecondsSent: Double
         var chunksQueuedPreOpen: Int
         var sendFailures: Int
+        /// Audio seconds handed to URLSession but not yet on the wire.
+        var sendBacklogSeconds: Double
+        var chunksShed: Int
         var sourceDeltas: Int
         var sourceChars: Int
         var translationDeltas: Int
@@ -239,6 +257,8 @@ final class RealtimeTranslationClient: NSObject {
                 speechSecondsSent: Double(stats.speechBytesSent) / Self.billedBytesPerSecond,
                 chunksQueuedPreOpen: stats.chunksQueuedPreOpen,
                 sendFailures: stats.sendFailures,
+                sendBacklogSeconds: Double(inflightAudioBytes) / Self.billedBytesPerSecond,
+                chunksShed: stats.chunksShed,
                 sourceDeltas: stats.sourceDeltas,
                 sourceChars: stats.sourceChars,
                 translationDeltas: stats.translationDeltas,
@@ -307,6 +327,10 @@ final class RealtimeTranslationClient: NSObject {
         intentionallyClosed = false
         seenEventTypes.removeAll()
         stats = Stats()
+        // Late completions from the old task are identity-rejected, so the
+        // backlog counter restarts with the connection.
+        inflightAudioBytes = 0
+        warnedBacklog = false
         connectionID = UUID()
         // Each connection is a fresh billed session server-side: elapsed_ms
         // restarts at zero, so the billed-progress baseline must too.
@@ -421,18 +445,53 @@ final class RealtimeTranslationClient: NSObject {
     }
 
     private func sendAppendEvent(_ pcm16: Data) {
+        // Real-time translation must shed load rather than queue it: late
+        // audio is worthless to a listener. Once the uplink runs behind,
+        // silence is dropped first; a hopeless backlog resets the
+        // connection, and the reconnect queue carries only fresh speech.
+        let silent = Self.isPureSilence(pcm16)
+        let backlog = Double(inflightAudioBytes) / Self.billedBytesPerSecond
+        if backlog > Self.backlogSoftLimitSeconds {
+            if !warnedBacklog {
+                warnedBacklog = true
+                Log.warn("[\(label)] uplink running \(String(format: "%.1f", backlog))s behind — shedding silence until it drains")
+            }
+            if silent {
+                stats.chunksShed += 1
+                return
+            }
+            if backlog > Self.backlogHardLimitSeconds {
+                failConnection("outbound backlog \(Int(backlog))s — uplink can't keep up; resetting for fresh audio")
+                return
+            }
+        }
         stats.audioChunksSent += 1
         stats.audioBytesSent += pcm16.count
         lastAppendAt = Date()
-        // Gate-suppressed audio is exact zeros, so the scan cleanly splits
-        // "keeping the timeline alive" from "sending the server speech".
-        if !Self.isPureSilence(pcm16) {
+        // Deliberate silence is exact zeros, so the scan cleanly splits
+        // "keeping the stream alive" from "sending the server speech".
+        if !silent {
             stats.speechBytesSent += pcm16.count
         }
-        sendJSON([
-            "type": "session.input_audio_buffer.append",
-            "audio": pcm16.base64EncodedString()
-        ])
+        guard let task,
+              let data = try? JSONSerialization.data(withJSONObject: [
+                  "type": "session.input_audio_buffer.append",
+                  "audio": pcm16.base64EncodedString()
+              ]),
+              let text = String(data: data, encoding: .utf8) else { return }
+        inflightAudioBytes += pcm16.count
+        task.send(.string(text)) { [weak self] error in
+            // Completion runs on the delegate queue (= self.queue) once the
+            // message left the local buffer (or failed). A late completion
+            // from a replaced connection must not touch the new counter —
+            // connectOnQueue resets it instead.
+            guard let self, task === self.task else { return }
+            self.inflightAudioBytes -= pcm16.count
+            if let error, !self.intentionallyClosed {
+                self.stats.sendFailures += 1
+                self.failConnection("WS send failed: \(error.localizedDescription)")
+            }
+        }
         reportBilledProgress()
     }
 
@@ -695,7 +754,7 @@ final class RealtimeTranslationClient: NSObject {
         }
         pingTicks += 1
         checkStreamSymptoms()
-        if Date().timeIntervalSince(lastAppendAt) > 20 {
+        if inflightAudioBytes == 0, Date().timeIntervalSince(lastAppendAt) > 20 {
             stats.keepalivesSent += 1
             sendAppendEvent(Self.keepaliveSilence)
         }
@@ -722,6 +781,7 @@ final class RealtimeTranslationClient: NSObject {
         line += ", audio \(s.audioFrames) frames/\(s.audioBytes / 1024)KB"
         line += ", \(s.heartbeatsDropped) heartbeats dropped"
         if s.keepalivesSent > 0 { line += ", \(s.keepalivesSent) keepalives" }
+        if s.chunksShed > 0 { line += ", \(s.chunksShed) chunks SHED (uplink backlog)" }
         line += String(format: "; speech sent %.0fs of %.0fs total",
                        Double(s.speechBytesSent) / Self.billedBytesPerSecond,
                        Double(s.audioBytesSent) / Self.billedBytesPerSecond)

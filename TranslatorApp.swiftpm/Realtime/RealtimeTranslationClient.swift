@@ -150,9 +150,18 @@ final class RealtimeTranslationClient: NSObject {
 
     // Audio arriving while the socket is still connecting is queued and
     // flushed on open, so lazily-opened sessions don't drop the words that
-    // triggered them. Bounded to ~30 s of 24 kHz PCM16.
-    private var pendingAudio: [Data] = []
+    // triggered them. Speech only — silence carries nothing worth replaying
+    // after a gap — and bounded by freshness: a reconnect must pick up near
+    // live speech, not replay tens of seconds of backlog through a link
+    // that just proved weak. The byte cap stays as the hard backstop.
+    private struct PendingChunk {
+        let data: Data
+        let queuedAt: Date
+    }
+    private var pendingAudio: [PendingChunk] = []
     private var pendingBytes = 0
+    private var pendingDropped = 0
+    private let maxPendingAge: TimeInterval = 10
     private let maxPendingBytes = 1_500_000
     private(set) var state: State = .idle {
         didSet {
@@ -389,12 +398,25 @@ final class RealtimeTranslationClient: NSObject {
         if state == .open {
             sendAppendEvent(pcm16)
         } else {
-            pendingAudio.append(pcm16)
+            // Tails, splices, and keepalives are regenerated live; only
+            // speech is worth carrying across the gap.
+            guard containsSpeech else { return }
+            pendingAudio.append(PendingChunk(data: pcm16, queuedAt: Date()))
             pendingBytes += pcm16.count
-            while pendingBytes > maxPendingBytes, !pendingAudio.isEmpty {
-                pendingBytes -= pendingAudio.removeFirst().count
-            }
             stats.chunksQueuedPreOpen += 1
+            dropStalePending()
+        }
+    }
+
+    /// Queue-confined. Evict queued chunks too old to be worth replaying
+    /// (or beyond the byte backstop), oldest first.
+    private func dropStalePending() {
+        let cutoff = Date().addingTimeInterval(-maxPendingAge)
+        while let first = pendingAudio.first,
+              first.queuedAt < cutoff || pendingBytes > maxPendingBytes {
+            pendingBytes -= first.data.count
+            pendingAudio.removeFirst()
+            pendingDropped += 1
         }
     }
 
@@ -464,14 +486,26 @@ final class RealtimeTranslationClient: NSObject {
     }
 
     private func flushPendingAudio() {
+        dropStalePending()
         let queued = pendingAudio
+        let dropped = pendingDropped
         pendingAudio.removeAll()
         pendingBytes = 0
-        if !queued.isEmpty {
-            let bytes = queued.reduce(0) { $0 + $1.count }
-            Log.info("[\(label)] flushing \(queued.count) chunks (\(bytes / 1024)KB) queued while connecting")
+        pendingDropped = 0
+        guard !queued.isEmpty else {
+            if dropped > 0 {
+                Log.info("[\(label)] dropped all \(dropped) queued chunks as stale (>\(Int(maxPendingAge))s)")
+            }
+            return
         }
-        for chunk in queued { sendAppendEvent(chunk) }
+        let bytes = queued.reduce(0) { $0 + $1.data.count }
+        let droppedNote = dropped > 0 ? ", \(dropped) dropped stale" : ""
+        Log.info("[\(label)] flushing \(queued.count) speech chunks (\(bytes / 1024)KB\(droppedNote)) queued while connecting")
+        // The queued speech may follow an unsent gap; lead with a quiet
+        // splice so it doesn't butt against pre-drop audio in session time
+        // (same job as AppModel's resume splice).
+        sendAppendEvent(Data(count: 14_400)) // 300 ms @ 24 kHz PCM16
+        for chunk in queued { sendAppendEvent(chunk.data) }
     }
 
     private func sendJSON(_ object: [String: Any]) {

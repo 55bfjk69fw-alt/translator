@@ -1,6 +1,9 @@
 # Cascade pipeline: modular STT → translation → TTS (design)
 
-Status: **design for review** — nothing here is implemented yet.
+Status: **design, reviewed** — LGTM after three adversarial review
+rounds (research claims independently re-verified against primary
+sources; design checked against the actual codebase). Nothing here is
+implemented yet; implementation starts at CP0 (§10/§11).
 Research date: 2026-07-14. Companion to `docs/RESEARCH.md` (the realtime
 pipeline's feasibility research); this document covers the alternative
 *cascade* pipeline and the provider abstraction behind it.

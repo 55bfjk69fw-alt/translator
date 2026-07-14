@@ -88,7 +88,36 @@ enum LaneMetric {
 /// Diagnostics snapshot, rendered per-kind by the pipeline panel.
 enum LaneEngineSnapshot {
     case realtime(RealtimeTranslationClient.Snapshot)
-    // case cascade(CascadeSnapshot) — CP2
+    case cascade(CascadeSnapshot)
+}
+
+/// Cascade per-lane counters for the Diagnostics pipeline panel
+/// (docs/CASCADE-PIPELINE.md §9). CP2 renders the essentials; CP3 grows
+/// the symptom lines.
+struct CascadeSnapshot {
+    var state: LaneEngineState
+    /// Utterances opened / finalized / translated / spoken this
+    /// conversation — the four stages' progress at a glance.
+    var utterancesOpened: Int
+    var utterancesFinalized: Int
+    var utterancesTranslated: Int
+    var utterancesSpoken: Int
+    var volatileChars: Int
+    var finalChars: Int
+    /// Pool contention evidence.
+    var slotWaits: Int
+    var lastSlotWaitSeconds: Double?
+    var holdsSlot: Bool
+    /// Seconds of audio buffered lane-side while waiting for a slot.
+    var bufferedAudioSeconds: Double
+    /// Audio jobs skipped by backpressure (transcript kept, speech
+    /// dropped).
+    var audioSkips: Int
+    /// Last measured stage latencies (nil until first measurement).
+    var lastFinalizeSeconds: Double?
+    var lastTranslateSeconds: Double?
+    var lastTTSFirstAudioSeconds: Double?
+    var lastError: String?
 }
 
 /// One instance per lane per conversation. Lifecycle is pipeline-dependent

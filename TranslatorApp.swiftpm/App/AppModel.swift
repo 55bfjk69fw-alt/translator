@@ -150,6 +150,13 @@ final class AppModel: ObservableObject {
     // never opens one) and are closed again after idle timeout.
     private var pipelineActive = false
     private var sessionAPIKey: String?
+    /// The pipeline this conversation was started with (audioQueue-
+    /// confined like the other session state; the Settings toggle applies
+    /// at the NEXT Start).
+    private var activePipeline: AppSettings.Pipeline = .realtime
+    /// Cascade cross-lane pieces (pool, shared translator); nil while the
+    /// realtime pipeline runs. Main-thread lifecycle; engines capture it.
+    private var cascadeContext: CascadeContext?
     private var lastVoiceAt: [Int: Date] = [:]
     /// Last logged voiced state per channel (audioQueue-confined) so
     /// speech start/end transitions land in the diagnostics log.
@@ -237,7 +244,10 @@ final class AppModel: ObservableObject {
 
     func startConversation() {
         guard mode == .idle else { return }
-        guard let apiKey = KeychainStore.loadAPIKey(), !apiKey.isEmpty else {
+        // The on-device cascade needs no API key (the reply prompter
+        // still does, and degrades with its own messaging without one).
+        let apiKey = KeychainStore.loadAPIKey() ?? ""
+        if AppSettings.pipeline == .realtime, apiKey.isEmpty {
             errorBanner = "Add your OpenAI API key in Settings first."
             return
         }
@@ -377,17 +387,37 @@ final class AppModel: ObservableObject {
         lanes = (0..<channelCount).map { SpeakerLane.djiLane(channel: $0, name: AppSettings.speakerName($0)) }
         channelMeters.reset(channelCount: channelCount)
 
+        let pipeline = AppSettings.pipeline
+        if pipeline == .cascade {
+            cascadeContext = CascadeContext(
+                sourceLanguage: AppSettings.cascadeSourceLanguage,
+                targetLanguage: AppSettings.outputLanguage,
+                laneCap: channelCount
+            )
+        }
         audioQueue.sync {
             applyGateTuningLocked()
             gate.reset()
             pipelineActive = true
             sessionAPIKey = apiKey
+            activePipeline = pipeline
             lastVoiceAt.removeAll()
             voicedState.removeAll()
         }
-        // Sessions are opened lazily on first speech per channel, not here —
-        // a disconnected/powered-off TX never opens a billed session.
         sessionStates = Dictionary(uniqueKeysWithValues: (0..<channelCount).map { ($0, LaneEngineState.idle) })
+        if pipeline == .cascade {
+            // Cascade engines open EAGERLY (docs/CASCADE-PIPELINE.md §6.1):
+            // they're free, warm-up is front-loaded, and pool sizing fails
+            // deterministically at Start instead of mid-conversation.
+            // Realtime keeps lazy-open (billing).
+            audioQueue.sync {
+                for channel in 0..<channelCount where AppSettings.speakerEnabled(channel) {
+                    let engine = makeEngine(lane: channel, apiKey: apiKey)
+                    engines[channel] = engine
+                    engine.start()
+                }
+            }
+        }
 
         signalAnalyzer.startSession()
         // Reset only after every fallible setup step: a Start that dies on
@@ -432,6 +462,10 @@ final class AppModel: ObservableObject {
         }
         sessionStates.removeAll()
         noticeTexts.removeAll()
+        // Engines are closed above; only now may the pool's analyzers be
+        // finished (terminal) — the one place that ever happens (§7).
+        cascadeContext?.teardown()
+        cascadeContext = nil
         pipelineMonitor.clear()
         resetPlaybackState()
         refreshCost()
@@ -534,6 +568,10 @@ final class AppModel: ObservableObject {
     /// translated too.
     private func lazyOpenEngine(channel: Int, speech: Bool) -> (any LaneEngine)? {
         guard speech, pipelineActive, let apiKey = sessionAPIKey else { return nil }
+        // Cascade lanes normally open eagerly at Start; this path serves
+        // them only for a mid-conversation re-enable (§6.1's single
+        // exception). Realtime requires the key; cascade doesn't.
+        guard activePipeline == .cascade || !apiKey.isEmpty else { return nil }
         Log.info("Speech on channel \(channel) — opening translation session")
         let engine = makeEngine(lane: channel, apiKey: apiKey)
         engines[channel] = engine
@@ -561,17 +599,32 @@ final class AppModel: ObservableObject {
     /// CP1: always the realtime adapter; the pipeline setting switches in
     /// the cascade here (docs/CASCADE-PIPELINE.md §5.1) once CP2 lands.
     private func makeEngine(lane: Int, apiKey: String) -> any LaneEngine {
-        let engine = RealtimeLaneEngine(
-            lane: lane,
-            outputLanguage: AppSettings.outputLanguage,
-            model: AppSettings.modelName,
-            noiseReduction: AppSettings.noiseReduction,
-            apiKey: apiKey,
-            endpointTemplate: AppSettings.endpointTemplate,
-            // UserDefaults is thread-safe, so the engine can read the
-            // current speaker name at banner time from its own queue.
-            laneName: { AppSettings.speakerName(lane) }
-        )
+        let engine: any LaneEngine
+        if activePipeline == .cascade, let context = cascadeContext {
+            let language = AppSettings.outputLanguage
+            let voice = AppleTTSProvider.voice(for: lane, language: language)
+            if voice == nil {
+                Log.warn("No usable \(language) voice for lane \(lane) — TTS will fall back to the system default voice")
+            }
+            engine = CascadeLaneEngine(
+                lane: lane,
+                context: context,
+                voiceIdentifier: voice?.identifier ?? "",
+                speechRate: AppSettings.cascadeSpeechRate
+            )
+        } else {
+            engine = RealtimeLaneEngine(
+                lane: lane,
+                outputLanguage: AppSettings.outputLanguage,
+                model: AppSettings.modelName,
+                noiseReduction: AppSettings.noiseReduction,
+                apiKey: apiKey,
+                endpointTemplate: AppSettings.endpointTemplate,
+                // UserDefaults is thread-safe, so the engine can read the
+                // current speaker name at banner time from its own queue.
+                laneName: { AppSettings.speakerName(lane) }
+            )
+        }
         wireEngine(engine, lane: lane)
         return engine
     }
@@ -604,10 +657,10 @@ final class AppModel: ObservableObject {
                     self.transcript.appendSourceDelta(lane: lane, text: text)
                 case .translationDelta(let text):
                     self.transcript.appendTranslationDelta(lane: lane, text: text)
-                case .sourceText, .translationText:
-                    // Cascade replace-path — lands with CP2 alongside the
-                    // TranscriptStore changes (docs/CASCADE-PIPELINE.md §7.1).
-                    break
+                case .sourceText(let utterance, let text, let isFinal):
+                    self.transcript.setCascadeSource(lane: lane, utterance: utterance, text: text, isFinal: isFinal)
+                case .translationText(let utterance, let text, let isFinal):
+                    self.transcript.setCascadeTranslation(lane: lane, utterance: utterance, text: text, isFinal: isFinal)
                 }
             }
         }
@@ -885,15 +938,16 @@ final class AppModel: ObservableObject {
         var closedLanes: [Int] = []
         var disabledLanes: Set<Int> = []
         // Idle-close is a realtime-pipeline behavior (it bounds billing);
-        // CP2's cascade engines are exempt (docs/CASCADE-PIPELINE.md §5.1)
-        // — the pipeline check joins the guard when they exist. Disabled
+        // cascade engines are exempt (docs/CASCADE-PIPELINE.md §5.1) —
+        // closing would terminally finish warm state to save $0. Disabled
         // mics close regardless of engine kind.
         audioQueue.sync {
             for (lane, engine) in engines {
                 if !AppSettings.speakerEnabled(lane) {
                     disabledLanes.insert(lane)
                 } else {
-                    guard timeout > 0, let last = lastVoiceAt[lane],
+                    guard !(engine is CascadeLaneEngine),
+                          timeout > 0, let last = lastVoiceAt[lane],
                           now.timeIntervalSince(last) > timeout else { continue }
                 }
                 engines[lane] = nil

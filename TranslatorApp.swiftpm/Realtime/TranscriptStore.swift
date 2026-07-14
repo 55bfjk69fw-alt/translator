@@ -30,9 +30,20 @@ struct SpeakerLane: Identifiable {
 /// Must only be touched on the main thread (all callers hop there first).
 final class TranscriptStore: ObservableObject {
 
+    /// How an utterance gets finalized. `.quietTimeout` is the realtime
+    /// path (append-only deltas, finalizeStale/reopenRecentIfNeeded);
+    /// `.explicit` is the cascade path (UUID-keyed replaces, closed by a
+    /// final translation event) — the two regimes must never touch each
+    /// other's utterances (docs/CASCADE-PIPELINE.md §7.1).
+    enum Segmentation {
+        case quietTimeout
+        case explicit
+    }
+
     struct Utterance: Identifiable {
-        let id = UUID()
+        var id = UUID()
         let laneID: Int
+        let segmentation: Segmentation
         let date: Date
         var sourceText: String
         var translatedText: String
@@ -97,8 +108,113 @@ final class TranscriptStore: ObservableObject {
 
     private let maxUtterances = 400
 
-    /// Index of the open (partial) utterance per lane.
+    /// Index of the open (partial) utterance per lane — the QUIET-TIMEOUT
+    /// (realtime) regime only: one open bubble per lane, delta-append.
     private var openUtteranceIndex: [Int: Int] = [:]
+
+    // MARK: - Cascade (explicit) utterances — docs/CASCADE-PIPELINE.md §7.1
+    //
+    // The cascade pipelines utterances (N's translation lands after N+1's
+    // bubble opened), so multiple bubbles per lane can be open at once,
+    // keyed by the engine's utterance UUID. Text arrives as wholesale
+    // REPLACEMENTS (volatile STT revisions), and finalization is explicit
+    // (the final translation event), never quiet-timeout.
+
+    /// Engine utterance UUID → array index for open cascade bubbles.
+    private var openCascade: [UUID: Int] = [:]
+    /// Sentence enders already counted per open cascade utterance —
+    /// replaces re-scan the same 。 on every revision, and the prompter's
+    /// sentence trigger must count each boundary exactly once.
+    private var cascadeEnders: [UUID: Int] = [:]
+    /// Pinyin recompute throttle per cascade utterance (same 0.3 s rule
+    /// as the delta path).
+    private var cascadePinyinAt: [UUID: Date] = [:]
+    /// Safety net: an explicit bubble with no pipeline activity for this
+    /// long finalizes with whatever it has (a lane engine death must not
+    /// leave a bubble open forever).
+    private static let cascadeSafetyNetSeconds: TimeInterval = 30
+
+    /// Cascade source text (wholesale replacement). Opens the bubble on
+    /// the first non-empty text; empty text for an unknown utterance is
+    /// ignored (nothing was ever shown, nothing to close).
+    func setCascadeSource(lane: Int, utterance: UUID, text: String, isFinal: Bool) {
+        guard let index = cascadeIndex(lane: lane, utterance: utterance, allowCreate: !text.isEmpty) else { return }
+        utterances[index].sourceText = text
+        utterances[index].lastSourceActivity = Date()
+        utterances[index].lastActivity = Date()
+        noteCascadeEnders(utterance: utterance, text: text)
+        let now = Date()
+        if isFinal || cascadePinyinAt[utterance].map({ now.timeIntervalSince($0) >= Self.pinyinRecomputeInterval }) ?? true {
+            cascadePinyinAt[utterance] = now
+            utterances[index].sourcePinyin = text.pinyin
+        }
+        contentRevision += 1
+    }
+
+    /// Cascade translation. `isFinal: true` CLOSES the bubble — the one
+    /// finalization mechanism for explicit utterances (empty final text =
+    /// translation failed/absent; the bubble keeps its 中文 and shows no
+    /// translation).
+    func setCascadeTranslation(lane: Int, utterance: UUID, text: String, isFinal: Bool) {
+        guard let index = cascadeIndex(lane: lane, utterance: utterance, allowCreate: !text.isEmpty) else { return }
+        utterances[index].translatedText = text
+        utterances[index].lastTranslationActivity = Date()
+        utterances[index].lastActivity = Date()
+        if isFinal {
+            utterances[index].sourcePinyin = utterances[index].sourceText.pinyin
+            utterances[index].translatedPinyin = text.isEmpty ? nil : text.pinyin
+            utterances[index].isFinal = true
+            openCascade[utterance] = nil
+            cascadeEnders[utterance] = nil
+            cascadePinyinAt[utterance] = nil
+            finalizedTotal += 1
+            contentRevision += 1
+            trim()
+        } else {
+            utterances[index].translatedPinyin = text.pinyin
+            contentRevision += 1
+        }
+    }
+
+    private func cascadeIndex(lane: Int, utterance: UUID, allowCreate: Bool) -> Int? {
+        if let index = openCascade[utterance], utterances.indices.contains(index) {
+            return index
+        }
+        guard allowCreate else { return nil }
+        var bubble = Utterance(
+            laneID: lane,
+            segmentation: .explicit,
+            date: Date(),
+            sourceText: "",
+            translatedText: "",
+            sourcePinyin: nil,
+            translatedPinyin: nil,
+            isFinal: false,
+            lastActivity: Date(),
+            lastSourceActivity: nil,
+            lastTranslationActivity: nil
+        )
+        bubble.id = utterance
+        utterances.append(bubble)
+        let index = utterances.count - 1
+        openCascade[utterance] = index
+        contentRevision += 1
+        return index
+    }
+
+    /// Replace-aware sentence counting: bump by the POSITIVE delta of
+    /// enders in the new text vs what this utterance already contributed
+    /// (a volatile revision re-containing the same 。 must not re-fire
+    /// the prompter trigger).
+    private func noteCascadeEnders(utterance: UUID, text: String) {
+        let count = text.filter { Self.sentenceEnders.contains($0) }.count
+        let counted = cascadeEnders[utterance] ?? 0
+        if count > counted {
+            cascadeEnders[utterance] = count
+            sentenceEventTotal += count - counted
+            onSentenceBoundary?()
+        }
+    }
 
     private enum Stream: String {
         case source, translation
@@ -158,6 +274,7 @@ final class TranscriptStore: ObservableObject {
         let now = Date()
         utterances.append(Utterance(
             laneID: SpeakerLane.userLaneID,
+            segmentation: .quietTimeout,
             date: now,
             sourceText: source,
             translatedText: gloss,
@@ -252,12 +369,34 @@ final class TranscriptStore: ObservableObject {
             }
         }
         if finalizedAny { trim() }
+        // Cascade safety net: explicit bubbles are closed by their final
+        // translation event, never by quiet-timeout — but a lane engine
+        // dying mid-utterance must not leave one open forever.
+        for (uuid, index) in openCascade {
+            guard utterances.indices.contains(index) else {
+                openCascade[uuid] = nil
+                continue
+            }
+            if now.timeIntervalSince(utterances[index].lastActivity) > Self.cascadeSafetyNetSeconds {
+                Log.warn("[transcript] cascade bubble abandoned \(Int(Self.cascadeSafetyNetSeconds))s — finalizing with what it has")
+                utterances[index].sourcePinyin = utterances[index].sourceText.pinyin
+                utterances[index].isFinal = true
+                openCascade[uuid] = nil
+                cascadeEnders[uuid] = nil
+                cascadePinyinAt[uuid] = nil
+                finalizedTotal += 1
+                contentRevision += 1
+            }
+        }
     }
 
     func clear() {
         utterances.removeAll()
         openUtteranceIndex.removeAll()
         lastPinyinComputeAt.removeAll()
+        openCascade.removeAll()
+        cascadeEnders.removeAll()
+        cascadePinyinAt.removeAll()
         contentRevision += 1
     }
 
@@ -296,6 +435,7 @@ final class TranscriptStore: ObservableObject {
             Log.info("[transcript] lane \(lane): new bubble opened by \(stream.rawValue) stream")
             utterances.append(Utterance(
                 laneID: lane,
+                segmentation: .quietTimeout,
                 date: Date(),
                 sourceText: "",
                 translatedText: "",
@@ -324,6 +464,19 @@ final class TranscriptStore: ObservableObject {
                 let shifted = index - overflow
                 return shifted >= 0 ? shifted : nil
             }
+            // Shift the cascade map the same way; a still-open bubble
+            // trimmed off the front takes its side tables with it.
+            var shiftedCascade: [UUID: Int] = [:]
+            for (uuid, index) in openCascade {
+                let shifted = index - overflow
+                if shifted >= 0 {
+                    shiftedCascade[uuid] = shifted
+                } else {
+                    cascadeEnders[uuid] = nil
+                    cascadePinyinAt[uuid] = nil
+                }
+            }
+            openCascade = shiftedCascade
         }
     }
 }

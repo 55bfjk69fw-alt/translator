@@ -30,6 +30,62 @@ enum AppSettings {
     /// Last-selected pane of the Monitor tab (Signal/Metrics/Diagnostics).
     static let monitorPaneKey = "monitorPane"
 
+    // Cascade pipeline (docs/CASCADE-PIPELINE.md §8.1)
+    static let pipelineKey = "pipeline"
+    static let cascadeSourceLanguageKey = "cascadeSourceLanguage"
+    static let cascadeSpeechRateKey = "cascadeSpeechRate"
+
+    /// Which per-lane translation engine a conversation uses. Read once at
+    /// Start; toggling mid-conversation applies to the next one.
+    enum Pipeline: String, CaseIterable, Identifiable {
+        case realtime      // OpenAI gpt-realtime-translate (default)
+        case cascade       // on-device STT → translation → TTS
+        var id: String { rawValue }
+        var displayName: String {
+            switch self {
+            case .realtime: return "Realtime (OpenAI)"
+            case .cascade: return "On-device cascade"
+            }
+        }
+    }
+
+    static var pipeline: Pipeline {
+        Pipeline(rawValue: UserDefaults.standard.string(forKey: pipelineKey) ?? "") ?? .realtime
+    }
+
+    /// Cascade source language (BCP-47). The cascade needs an EXPLICIT
+    /// source (SpeechTranscriber locale + translation source) where the
+    /// realtime pipeline auto-detects. Fixed at Start in CascadeContext.
+    static var cascadeSourceLanguage: String {
+        let value = UserDefaults.standard.string(forKey: cascadeSourceLanguageKey) ?? ""
+        return value.isEmpty ? "zh-Hans" : value
+    }
+
+    /// Global TTS rate multiplier for cascade playback voices
+    /// (AVSpeechUtteranceDefaultSpeechRate × this; 1.0 = normal).
+    static var cascadeSpeechRate: Double {
+        let value = UserDefaults.standard.double(forKey: cascadeSpeechRateKey)
+        return value > 0 ? min(max(value, 0.7), 1.5) : 1.0
+    }
+
+    /// Per-lane TTS voice identifier, scoped by provider AND target
+    /// language: an en-US voice validates fine while mispronouncing
+    /// French, so switching output language switches to that language's
+    /// assignments instead of reusing the wrong ones
+    /// (docs/CASCADE-PIPELINE.md §6.4).
+    static func laneVoiceKey(provider: String, language: String, channel: Int) -> String {
+        "laneVoice.\(provider).\(language).\(channel)"
+    }
+
+    static func laneVoice(provider: String, language: String, channel: Int) -> String? {
+        let value = UserDefaults.standard.string(forKey: laneVoiceKey(provider: provider, language: language, channel: channel)) ?? ""
+        return value.isEmpty ? nil : value
+    }
+
+    static func setLaneVoice(_ identifier: String, provider: String, language: String, channel: Int) {
+        UserDefaults.standard.set(identifier, forKey: laneVoiceKey(provider: provider, language: language, channel: channel))
+    }
+
     // Reply prompter (docs/REPLY-FLOW.md)
     static let prompterEnabledKey = "prompterEnabled"
     static let autoSuggestKey = "prompterAutoSuggest"

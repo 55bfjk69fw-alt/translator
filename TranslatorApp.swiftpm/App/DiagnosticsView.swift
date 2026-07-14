@@ -383,6 +383,21 @@ private struct LanePipelineRow: View {
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
+            } else if let cascade = cascadeSession {
+                Text("Utterances: \(cascade.utterancesOpened) opened · \(cascade.utterancesFinalized) finalized · \(cascade.utterancesTranslated) translated · \(cascade.utterancesSpoken) spoken\(cascade.audioSkips > 0 ? " · \(cascade.audioSkips) audio skipped" : "")")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("STT: \(cascade.volatileChars) volatile / \(cascade.finalChars) final ch · slot \(cascade.holdsSlot ? "held" : "free") · \(cascade.slotWaits) waits\(cascade.bufferedAudioSeconds > 0.5 ? String(format: " · %.1fs buffered", cascade.bufferedAudioSeconds) : "")")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Latency: finalize \(latency(cascade.lastFinalizeSeconds)) · translate \(latency(cascade.lastTranslateSeconds)) · TTS \(latency(cascade.lastTTSFirstAudioSeconds))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let error = cascade.lastError {
+                    Label(error, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
             } else {
                 Text("No session — one opens on this lane's first detected speech.")
                     .font(.caption)
@@ -392,16 +407,37 @@ private struct LanePipelineRow: View {
         .padding(.vertical, 2)
     }
 
+    private func latency(_ seconds: Double?) -> String {
+        seconds.map { String(format: "%.0f ms", $0 * 1000) } ?? "—"
+    }
+
     /// The realtime client counters, when this lane runs the realtime
-    /// pipeline (always, until CP2 adds the cascade case and its own rows).
+    /// pipeline.
     private var realtimeSession: RealtimeTranslationClient.Snapshot? {
         switch status.session {
         case .realtime(let session): return session
-        case nil: return nil
+        case .cascade, nil: return nil
+        }
+    }
+
+    private var cascadeSession: CascadeSnapshot? {
+        switch status.session {
+        case .cascade(let snapshot): return snapshot
+        case .realtime, nil: return nil
         }
     }
 
     private var sessionStateText: String {
+        if let cascade = cascadeSession {
+            switch cascade.state {
+            case .idle: return "idle"
+            case .starting: return "starting"
+            case .running: return "running"
+            case .degraded: return "degraded"
+            case .reconnecting: return "reconnecting"
+            case .failed: return "failed"
+            }
+        }
         switch realtimeSession?.state {
         case .open:
             if let openFor = realtimeSession?.openForSeconds {
@@ -416,6 +452,15 @@ private struct LanePipelineRow: View {
     }
 
     private var sessionStateColor: Color {
+        if let cascade = cascadeSession {
+            switch cascade.state {
+            case .running: return .green
+            case .starting, .reconnecting: return .yellow
+            case .degraded: return .orange
+            case .failed: return .red
+            case .idle: return .secondary
+            }
+        }
         switch realtimeSession?.state {
         case .open: return .green
         case .connecting: return .yellow

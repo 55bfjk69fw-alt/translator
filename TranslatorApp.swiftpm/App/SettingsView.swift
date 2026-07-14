@@ -133,8 +133,10 @@ struct SettingsView: View {
                 } header: {
                     Text("Languages")
                 } footer: {
-                    Text("What anyone says is auto-detected (70+ languages) — this chooses the translated output for the table mics. Changes apply when a lane's next session opens (after an idle close, or on the next Start).")
+                    Text("What anyone says is auto-detected by the realtime pipeline (70+ languages); the on-device cascade uses the explicit source language from the Translation pipeline section. This chooses the translated output either way. Realtime: applies when a lane's next session opens. Cascade: applies at the next Start.")
                 }
+
+                CascadePipelineSection()
 
                 Section {
                     Toggle("Enable prompter", isOn: $prompterEnabled)

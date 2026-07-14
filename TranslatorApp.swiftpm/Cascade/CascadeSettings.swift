@@ -130,20 +130,28 @@ final class CascadeSetupModel: ObservableObject {
 /// convert → player node — so the preview doubles as a smoke test of the
 /// exact pipeline a conversation uses (§6.4).
 final class VoicePreviewPlayer {
-    private let engine = AVAudioEngine()
-    private let player = AVAudioPlayerNode()
+    // EVERYTHING here is lazy: this object is an @State initial value, so
+    // SwiftUI constructs (and discards) instances on Settings re-renders —
+    // an AVAudioEngine built in init would churn audio-system plumbing at
+    // render frequency for a player that usually never plays.
+    private var engine: AVAudioEngine?
+    private var player: AVAudioPlayerNode?
     private var synth: AppleSpeechSynth?
     private let format = AVAudioFormat(
         commonFormat: .pcmFormatFloat32, sampleRate: 24_000, channels: 1, interleaved: false
     )!
 
-    init() {
-        engine.attach(player)
-        engine.connect(player, to: engine.mainMixerNode, format: format)
-    }
-
     func play(voiceIdentifier: String, language: String, rate: Double) {
         stop()
+        if engine == nil {
+            let engine = AVAudioEngine()
+            let player = AVAudioPlayerNode()
+            engine.attach(player)
+            engine.connect(player, to: engine.mainMixerNode, format: format)
+            self.engine = engine
+            self.player = player
+        }
+        guard let engine, let player = self.player else { return }
         if !engine.isRunning {
             engine.prepare()
             try? engine.start()
@@ -156,13 +164,14 @@ final class VoicePreviewPlayer {
             return
         }
         player.play()
+        let boundPlayer = player
         let synth = AppleSpeechSynth(lane: 99, voiceIdentifier: voiceIdentifier, rate: rate, languageHint: language)
         self.synth = synth
         synth.onAudio = { [weak self] _, data in
             DispatchQueue.main.async {
                 guard let self,
                       let buffer = EngineGraph.pcm16ToFloatBuffer(data, format: self.format) else { return }
-                self.player.scheduleBuffer(buffer, completionHandler: nil)
+                boundPlayer.scheduleBuffer(buffer, completionHandler: nil)
             }
         }
         let sample = language.hasPrefix("en")
@@ -174,10 +183,10 @@ final class VoicePreviewPlayer {
     func stop() {
         synth?.cancelAll()
         synth = nil
-        player.stop()
+        player?.stop()
         // Don't leave hardware IO running for the life of the Settings
         // view once the sample ends.
-        if engine.isRunning { engine.stop() }
+        if engine?.isRunning == true { engine?.stop() }
     }
 }
 

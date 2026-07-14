@@ -203,10 +203,12 @@ final class CascadeProbe: ObservableObject {
 
     /// Long-lived synthesizers (a function-local one can be deallocated
     /// mid-render and its callback silently never fires — the iOS 16 bug
-    /// class the research flagged).
-    private let renderSynth = AVSpeechSynthesizer()
-    private let concurrencySynthA = AVSpeechSynthesizer()
-    private let concurrencySynthB = AVSpeechSynthesizer()
+    /// class the research flagged). LAZY: this object is constructed with
+    /// the Diagnostics tab, and idle synthesizers must not touch the
+    /// audio system at app launch — they exist only once a probe runs.
+    private lazy var renderSynth = AVSpeechSynthesizer()
+    private lazy var concurrencySynthA = AVSpeechSynthesizer()
+    private lazy var concurrencySynthB = AVSpeechSynthesizer()
 
     private func step2RenderMandarin() async -> RenderedAudio? {
         setStage("2/7 synthesizing Mandarin test audio")

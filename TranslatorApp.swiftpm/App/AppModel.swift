@@ -1044,11 +1044,27 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private var lastRouteChangeLogAt = Date.distantPast
+    private var routeChangeBurstCount = 0
+
     private func handleRouteChange(_ notification: Notification) {
         refreshRoute()
-        guard mode == .conversation || mode == .bench else { return }
         guard let raw = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
               let reason = AVAudioSession.RouteChangeReason(rawValue: raw) else { return }
+        // Log EVERY reason (throttled): a route that flaps without ever
+        // hitting the rebuild cases below (e.g. repeated category or
+        // configuration changes) was previously invisible in the log —
+        // exactly the evidence needed to tell a power-cycling USB device
+        // from in-app session churn.
+        routeChangeBurstCount += 1
+        let now = Date()
+        if now.timeIntervalSince(lastRouteChangeLogAt) > 2 {
+            lastRouteChangeLogAt = now
+            let burst = routeChangeBurstCount > 1 ? " (×\(routeChangeBurstCount) in the last 2 s)" : ""
+            Log.info("Route change: \(routeChangeReasonName(reason))\(burst) — input now \(audioSession.snapshot().inputName)")
+            routeChangeBurstCount = 0
+        }
+        guard mode == .conversation || mode == .bench else { return }
         switch reason {
         case .oldDeviceUnavailable, .newDeviceAvailable:
             Log.warn("Route change (\(reason == .oldDeviceUnavailable ? "device removed" : "device added")) — rebuilding engine")
@@ -1058,13 +1074,45 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func routeChangeReasonName(_ reason: AVAudioSession.RouteChangeReason) -> String {
+        switch reason {
+        case .unknown: return "unknown"
+        case .newDeviceAvailable: return "device added"
+        case .oldDeviceUnavailable: return "device removed"
+        case .categoryChange: return "category change"
+        case .override: return "override"
+        case .wakeFromSleep: return "wake from sleep"
+        case .noSuitableRouteForCategory: return "no suitable route for category"
+        case .routeConfigurationChange: return "route configuration change"
+        @unknown default: return "raw=\(reason.rawValue)"
+        }
+    }
+
+    /// Interruption log throttling (main thread): a wedged audio daemon
+    /// or flapping USB device fires .began several times a second, and a
+    /// wall of identical lines hides everything else. Coalesce to one
+    /// line per 2 s with a counter, and include the system's REASON —
+    /// routeDisconnected vs default is the difference between "the RX is
+    /// power-cycling" and "something else keeps taking the session".
+    private var interruptionBurstCount = 0
+    private var lastInterruptionLogAt = Date.distantPast
+
     private func handleInterruption(_ notification: Notification) {
         guard let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
               let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
         switch type {
         case .began:
             interruptedSince = Date()
-            Log.warn("Audio interruption began")
+            interruptionBurstCount += 1
+            let now = Date()
+            if now.timeIntervalSince(lastInterruptionLogAt) > 2 {
+                lastInterruptionLogAt = now
+                let reason = (notification.userInfo?[AVAudioSessionInterruptionReasonKey] as? UInt)
+                    .map { interruptionReasonName($0) } ?? "no reason given"
+                let burst = interruptionBurstCount > 1 ? " (×\(interruptionBurstCount) in the last 2 s)" : ""
+                Log.warn("Audio interruption began — \(reason)\(burst)")
+                interruptionBurstCount = 0
+            }
         case .ended:
             interruptedSince = nil
             guard mode != .idle else { return }
@@ -1072,6 +1120,15 @@ final class AppModel: ObservableObject {
             restartEngineForCurrentRoute()
         @unknown default:
             break
+        }
+    }
+
+    private func interruptionReasonName(_ raw: UInt) -> String {
+        switch AVAudioSession.InterruptionReason(rawValue: raw) {
+        case .builtInMicMuted: return "built-in mic muted"
+        case .routeDisconnected: return "route disconnected (the input device dropped off the bus)"
+        case .default: return "another session took the audio (reason: default)"
+        default: return "reason raw=\(raw)"
         }
     }
 

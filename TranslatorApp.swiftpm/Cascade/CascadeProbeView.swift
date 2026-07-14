@@ -43,10 +43,18 @@ struct CascadeProbeSection: View {
             }
             Button("Download translation pack (中文→English, system sheet)") {
                 downloadStatus = "requesting…"
-                downloadConfig = TranslationSession.Configuration(
-                    source: Locale.Language(identifier: "zh-Hans"),
-                    target: Locale.Language(identifier: "en")
-                )
+                // translationTask re-fires only on a CHANGED configuration;
+                // after a dismissed/failed sheet, retry via invalidate() —
+                // assigning a fresh-but-equal value would do nothing (the
+                // documented retry idiom).
+                if downloadConfig == nil {
+                    downloadConfig = TranslationSession.Configuration(
+                        source: Locale.Language(identifier: "zh-Hans"),
+                        target: Locale.Language(identifier: "en")
+                    )
+                } else {
+                    downloadConfig?.invalidate()
+                }
             }
             .disabled(probe.running)
             .translationTask(downloadConfig) { session in

@@ -649,6 +649,12 @@ final class AppModel: ObservableObject {
     private func handleNotice(_ notice: LaneNotice) {
         switch notice {
         case .raised(let id, let text):
+            // A raise racing Stop — a .closed event landing on the engine
+            // queue in the window before close() does — must not plant a
+            // banner on the idle screen that nothing will ever clear.
+            // Clears are deliberately NOT mode-scoped (a stale entry must
+            // always be removable).
+            guard mode != .idle else { return }
             noticeTexts[id] = text
             errorBanner = text
         case .cleared(let id):

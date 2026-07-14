@@ -63,7 +63,10 @@ final class CascadeProbe: ObservableObject {
     // MARK: - Control
 
     func runAll() {
-        guard !running else { return }
+        // Keyed on probeTask, not `running`: a cancelled run keeps
+        // executing until its next checkpoint, and starting a second run
+        // over it would interleave logs and share the render synths.
+        guard probeTask == nil else { return }
         running = true
         lines.removeAll()
         probeTask = Task { [weak self] in
@@ -71,28 +74,30 @@ final class CascadeProbe: ObservableObject {
             await MainActor.run {
                 self?.running = false
                 self?.stage = nil
+                self?.probeTask = nil
             }
         }
     }
 
     func runSustained() {
-        guard !running else { return }
+        guard probeTask == nil else { return }
         running = true
         probeTask = Task { [weak self] in
             await self?.sustainedLoad()
             await MainActor.run {
                 self?.running = false
                 self?.stage = nil
+                self?.probeTask = nil
             }
         }
     }
 
+    /// Requests cancellation; `running` stays true until the task reaches
+    /// its next checkpoint and unwinds (the completion above resets it) —
+    /// so a new run can't start while the old one is still winding down.
     func cancel() {
         probeTask?.cancel()
-        probeTask = nil
-        running = false
-        stage = nil
-        log("Probe cancelled")
+        log("Probe cancel requested — stopping at the next checkpoint")
     }
 
     func exportText() -> String {
@@ -308,24 +313,36 @@ final class CascadeProbe: ObservableObject {
             }
             return finals
         }
-        try await analyzer.start(inputSequence: stream)
-        guard let converter = AVAudioConverter(from: rendered.format, to: analyzerFormat) else {
+        // Any throw below must cancel the harvest task: it iterates a
+        // results sequence that only ends when the analyzer finishes, so a
+        // leaked harvest keeps its transcriber alive — which in step 3
+        // would contaminate the admission-limit measurement of the NEXT
+        // run with lanes leaked from this one.
+        do {
+            try await analyzer.start(inputSequence: stream)
+            guard let converter = AVAudioConverter(from: rendered.format, to: analyzerFormat) else {
+                throw NSError(domain: "CascadeProbe", code: 1, userInfo: [
+                    NSLocalizedDescriptionKey: "No converter \(rendered.format.sampleRate) Hz → \(analyzerFormat.sampleRate) Hz"
+                ])
+            }
+            // Deliberately unpaced (a burst): step 3 measures admission
+            // and throughput. The finalize-latency measurement uses the
+            // paced feed in step 6 instead.
+            for buffer in rendered.buffers {
+                if let converted = Self.convert(buffer, with: converter, to: analyzerFormat) {
+                    continuation.yield(AnalyzerInput(buffer: converted))
+                }
+            }
+            continuation.finish()
+            // Terminating the input sequence does NOT finish the session —
+            // the doc-verbatim gotcha. Finish explicitly and wait for the
+            // results sequence to drain.
+            try await analyzer.finalizeAndFinishThroughEndOfInput()
+        } catch {
             continuation.finish()
             harvest.cancel()
-            throw NSError(domain: "CascadeProbe", code: 1, userInfo: [
-                NSLocalizedDescriptionKey: "No converter \(rendered.format.sampleRate) Hz → \(analyzerFormat.sampleRate) Hz"
-            ])
+            throw error
         }
-        for buffer in rendered.buffers {
-            if let converted = Self.convert(buffer, with: converter, to: analyzerFormat) {
-                continuation.yield(AnalyzerInput(buffer: converted))
-            }
-        }
-        continuation.finish()
-        // Terminating the input sequence does NOT finish the session — the
-        // doc-verbatim gotcha. Finish explicitly and wait for the results
-        // sequence to drain.
-        try await analyzer.finalizeAndFinishThroughEndOfInput()
         return try await harvest.value
     }
 
@@ -356,9 +373,14 @@ final class CascadeProbe: ObservableObject {
 
     private func step3bConcurrentWrite() async {
         setStage("3b/7 concurrent write() renders")
+        // The fallback must exclude voiceA: a bare "en" prefix matches
+        // en-US too and would typically re-select the same voice — and two
+        // synths sharing one voice could serialize on shared voice
+        // resources and mislabel the device as "renders SERIALIZED".
         guard let voiceA = bestVoice(languagePrefix: "en-US"),
-              let voiceB = bestVoice(languagePrefix: "en-GB") ?? bestVoice(languagePrefix: "en") else {
-            log("[3b] Need two English voices — skipped")
+              let voiceB = bestVoice(languagePrefix: "en-GB")
+                ?? bestVoice(languagePrefix: "en", excluding: voiceA.identifier) else {
+            log("[3b] Need two distinct English voices — skipped")
             return
         }
         let text = "The quick brown fox jumps over the lazy dog, then pauses to admire the view across the valley."
@@ -473,28 +495,12 @@ final class CascadeProbe: ObservableObject {
                         format: rendered.format,
                         sentenceRanges: [0..<range.count]
                     )
-                    // Measure from "all audio delivered" to "final text
-                    // available" — the finalize term of the §7 table.
-                    let harvest = Task<[String], Error> {
-                        var finals: [String] = []
-                        for try await result in transcriber.results where result.isFinal {
-                            finals.append(String(result.text.characters))
-                        }
-                        return finals
-                    }
-                    let (stream, continuation) = AsyncStream.makeStream(of: AnalyzerInput.self)
-                    try await analyzer.start(inputSequence: stream)
-                    guard let converter = AVAudioConverter(from: sentence.format, to: format) else { return }
-                    for buffer in sentence.buffers {
-                        if let converted = Self.convert(buffer, with: converter, to: format) {
-                            continuation.yield(AnalyzerInput(buffer: converted))
-                        }
-                    }
-                    let audioDone = Date()
-                    continuation.finish()
-                    try await analyzer.finalizeAndFinishThroughEndOfInput()
-                    _ = try await harvest.value
-                    timings.append(Date().timeIntervalSince(audioDone))
+                    timings.append(try await Self.pacedFinalizeSeconds(
+                        sentence: sentence,
+                        transcriber: transcriber,
+                        analyzer: analyzer,
+                        analyzerFormat: format
+                    ))
                 }
                 let sorted = timings.sorted()
                 let p50 = sorted[sorted.count / 2]
@@ -503,6 +509,54 @@ final class CascadeProbe: ObservableObject {
                 log("[6] FAILED (\(prewarm ? "with" : "without") pre-warm): \(describe(error))")
             }
         }
+    }
+
+    /// One paced finalize-latency measurement: feed the sentence at REAL
+    /// TIME (sleeping each buffer's duration) so the model keeps up during
+    /// "speech" exactly as it would live, then measure last-audio →
+    /// final-text. An unpaced burst would measure "process the whole
+    /// backlogged utterance + finalize" — a different, larger number that
+    /// would mis-tune the design's debounce constants — and would hide the
+    /// cold-start model load inside the no-pre-warm case.
+    private nonisolated static func pacedFinalizeSeconds(
+        sentence: RenderedAudio,
+        transcriber: SpeechTranscriber,
+        analyzer: SpeechAnalyzer,
+        analyzerFormat: AVAudioFormat
+    ) async throws -> Double {
+        let harvest = Task<[String], Error> {
+            var finals: [String] = []
+            for try await result in transcriber.results where result.isFinal {
+                finals.append(String(result.text.characters))
+            }
+            return finals
+        }
+        let (stream, continuation) = AsyncStream.makeStream(of: AnalyzerInput.self)
+        let audioDone: Date
+        do {
+            try await analyzer.start(inputSequence: stream)
+            guard let converter = AVAudioConverter(from: sentence.format, to: analyzerFormat) else {
+                throw NSError(domain: "CascadeProbe", code: 2, userInfo: [
+                    NSLocalizedDescriptionKey: "No converter for finalize measurement"
+                ])
+            }
+            for buffer in sentence.buffers {
+                if let converted = Self.convert(buffer, with: converter, to: analyzerFormat) {
+                    continuation.yield(AnalyzerInput(buffer: converted))
+                }
+                let seconds = Double(buffer.frameLength) / sentence.format.sampleRate
+                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            }
+            audioDone = Date()
+            continuation.finish()
+            try await analyzer.finalizeAndFinishThroughEndOfInput()
+        } catch {
+            continuation.finish()
+            harvest.cancel()
+            throw error
+        }
+        _ = try await harvest.value
+        return Date().timeIntervalSince(audioDone)
     }
 
     // MARK: - Step 7: voice inventory
@@ -529,9 +583,10 @@ final class CascadeProbe: ObservableObject {
     private func sustainedLoad() async {
         setStage("sustained load (\(sustainedMinutes) min)")
         UIDevice.current.isBatteryMonitoringEnabled = true
-        let startBattery = UIDevice.current.batteryLevel
+        defer { UIDevice.current.isBatteryMonitoringEnabled = false }
+        let startBattery = batteryText()
         let deadline = Date().addingTimeInterval(Double(sustainedMinutes) * 60)
-        log("[8] Sustained run: TTS→STT→MT loop ×2 lanes until \(deadline.formatted(date: .omitted, time: .standard)); battery \(Int(startBattery * 100))%")
+        log("[8] Sustained run: TTS→STT→MT loop ×2 lanes until \(deadline.formatted(date: .omitted, time: .standard)); battery \(startBattery)")
         guard let rendered = await step2RenderMandarin() else { return }
         guard let locale = await SpeechTranscriber.supportedLocale(equivalentTo: sourceLocale) else { return }
         var cycles = 0
@@ -562,12 +617,17 @@ final class CascadeProbe: ObservableObject {
             }
             if Date().timeIntervalSince(lastReport) > 30 {
                 lastReport = Date()
-                log("[8] \(cycles) cycles; thermal \(thermalName(ProcessInfo.processInfo.thermalState)); battery \(Int(UIDevice.current.batteryLevel * 100))%")
+                log("[8] \(cycles) cycles; thermal \(thermalName(ProcessInfo.processInfo.thermalState)); battery \(batteryText())")
             }
         }
-        let endBattery = UIDevice.current.batteryLevel
-        log("[8] Done: \(cycles) cycles; battery \(Int(startBattery * 100))% → \(Int(endBattery * 100))%; final thermal \(thermalName(ProcessInfo.processInfo.thermalState))")
-        UIDevice.current.isBatteryMonitoringEnabled = false
+        log("[8] Done: \(cycles) cycles; battery \(startBattery) → \(batteryText()); final thermal \(thermalName(ProcessInfo.processInfo.thermalState))")
+    }
+
+    /// Battery level as text; UIDevice reports -1.0 when unknown (e.g.
+    /// monitoring races), which must not render as "-100%".
+    private func batteryText() -> String {
+        let level = UIDevice.current.batteryLevel
+        return level < 0 ? "unknown" : "\(Int(level * 100))%"
     }
 
     // MARK: - write() rendering (polling, not continuation: a callback that
@@ -627,6 +687,9 @@ final class CascadeProbe: ObservableObject {
             if state.done {
                 return .finished(buffers: state.buffers, format: state.format)
             }
+            // Cancelled sleeps return immediately — break instead of
+            // busy-spinning out the rest of the timeout.
+            if Task.isCancelled { break }
             try? await Task.sleep(nanoseconds: 100_000_000)
         }
         let state = box.snapshot()
@@ -635,10 +698,11 @@ final class CascadeProbe: ObservableObject {
 
     // MARK: - Helpers
 
-    private func bestVoice(languagePrefix: String) -> AVSpeechSynthesisVoice? {
+    private func bestVoice(languagePrefix: String, excluding: String? = nil) -> AVSpeechSynthesisVoice? {
         AVSpeechSynthesisVoice.speechVoices()
             .filter {
                 $0.language.hasPrefix(languagePrefix)
+                    && $0.identifier != excluding
                     && !$0.voiceTraits.contains(.isNoveltyVoice)
                     && !$0.voiceTraits.contains(.isPersonalVoice)
             }

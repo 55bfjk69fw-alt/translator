@@ -72,7 +72,6 @@ final class RealtimeLaneEngine: LaneEngine {
     private var reconnectAttempts = 0
     /// When the current connection reached .open; nil while not open.
     private var openedAt: Date?
-    private var bannerRaised = false
     private var state: LaneEngineState = .idle {
         didSet {
             if state != oldValue { onState?(state) }
@@ -119,10 +118,17 @@ final class RealtimeLaneEngine: LaneEngine {
         queue.async {
             guard !self.closed else { return }
             self.closed = true
-            // The client's close drain keeps reporting billed seconds;
-            // onCostDelta stays wired (contract item 5).
             self.client.close()
             self.state = .idle
+            // AppModel drops its strong reference at eviction and every
+            // other hop to this engine is weak — but the client keeps
+            // draining (and billing, and delivering final transcript
+            // deltas) for up to 3 s after session.close, and those
+            // callbacks route THROUGH this engine. Hold self past the
+            // drain cap so the chain's middle link can't deallocate out
+            // from under the "deliberately not identity-guarded" cost
+            // contract (§5.1.1 item 5).
+            self.queue.asyncAfter(deadline: .now() + 4) { _ = self }
         }
     }
 
@@ -143,7 +149,11 @@ final class RealtimeLaneEngine: LaneEngine {
             guard let resampler = self.resampler else {
                 // A silent-drop path that otherwise looks exactly like
                 // "gate open, nothing captured" — same one-shot warning the
-                // pre-seam pipeline logged.
+                // pre-seam pipeline logged. (Ordering flip vs pre-seam: the
+                // old code checked the resampler BEFORE lazy-open, so an
+                // unconvertible lane never opened a billed session; now the
+                // engine — and its socket — exists first. Pathological
+                // case, and the warning is the evidence either way.)
                 if verdict.speech, !self.warnedMissingResampler {
                     self.warnedMissingResampler = true
                     Log.error("[\(self.label)] gate passed speech but no resampler could be built for \(Int(rate)) Hz — audio is being dropped before the session")
@@ -215,17 +225,20 @@ final class RealtimeLaneEngine: LaneEngine {
             let opened = Date()
             openedAt = opened
             state = .running
-            // A recovered session must retract its own scare banner
+            // A recovered lane must retract the lane's scare banner
             // promptly. 5 s of survival is the proof bar; the openedAt
-            // identity check pins the timer to THIS open episode so a
-            // bounce-and-reopen can't clear on the strength of the wrong
-            // connection.
+            // identity check pins the timer to THIS open episode — note
+            // this is deliberately stricter than the pre-seam code, which
+            // could clear on the strength of a <5 s bounce-and-reopen.
+            // The clear is emitted UNCONDITIONALLY (not only when this
+            // instance raised a banner): the banner is lane-keyed, and a
+            // failing engine can be evicted (idle-close during an outage,
+            // mic toggled) taking its raised-flag with it — the
+            // replacement engine must still retract the lane's stale
+            // banner. AppModel no-ops a clear when nothing is raised.
             queue.asyncAfter(deadline: .now() + 5) { [weak self] in
                 guard let self, !self.closed, self.openedAt == opened else { return }
-                if self.bannerRaised {
-                    self.bannerRaised = false
-                    self.onNotice?(.cleared(id: self.noticeID))
-                }
+                self.onNotice?(.cleared(id: self.noticeID))
             }
         case .closed:
             // Only a session that survived a while proves the config
@@ -248,7 +261,6 @@ final class RealtimeLaneEngine: LaneEngine {
         reconnectAttempts += 1
         let attempts = reconnectAttempts
         if attempts == 5 {
-            bannerRaised = true
             onNotice?(.raised(
                 id: noticeID,
                 text: "Session for \(laneName()) keeps failing — still retrying every 30 s. Check the network; if the network is fine, check the API key and event log."

@@ -57,9 +57,10 @@ URLs inline. Anything marked **UNVERIFIED** lands in the hardware probe
 
 - **Headless use is now supported.** iOS 26 added
   `TranslationSession(installedSource:target:)` — a public, programmatic
-  initializer that needs no SwiftUI view. It throws if the language packs
-  aren't installed (`TranslationError.notInstalled`), and such sessions
-  can never trigger downloads (`canRequestDownloads == false`). Apple's
+  initializer that needs no SwiftUI view. The initializer itself is
+  non-throwing; if the packs aren't installed, *translation calls* throw
+  `TranslationError.notInstalled`, and directly-created sessions can
+  never trigger downloads (`canRequestDownloads == false`). Apple's
   docs describe it exactly for "contexts where there's no UI".
   ([docs](https://developer.apple.com/documentation/translation/translationsession/init(installedsource:target:)))
   Confidence: high (Apple doc JSON). Field reports of the iOS 26 init in
@@ -120,17 +121,22 @@ URLs inline. Anything marked **UNVERIFIED** lands in the hardware probe
   deliberately undocumented and device-dependent — read at runtime; we
   need only zh. Asset sizes unpublished. Confidence: high (mechanics),
   low (numbers).
-- **Concurrency is the top risk and is explicitly designed-for.** Apple:
-  the system "limits simultaneous analyses to a conservative number" and
-  throws `insufficientResources` beyond it — but "several simultaneous
-  transcription sessions may use the same language and settings, or only
-  receive audio in an interleaved schedule" can exceed the naive limit,
-  and identically-configured transcribers "share the same backing engine
-  instances and models". The `ignoresResourceLimits` override is iOS 27+
-  only. **No public data on how many concurrent zh_CN streams a given
-  iPad sustains — UNVERIFIED, probe item 2.** Our gate helps: only
-  gate-passed speech is fed, so 4 open lanes rarely analyze simultaneously.
-  Confidence: high (limits exist & mitigations), unverified (the number).
+- **Concurrency is the top risk.** Apple: the system "limits simultaneous
+  analyses to a conservative number" and throws `insufficientResources`
+  beyond it. Apple's docs name same-config sessions and interleaved audio
+  schedules as cases where the *hardware* may accommodate more — but the
+  sanctioned way to exceed the admission limit is the
+  `ignoresResourceLimits` override, which is **iOS 27+ only**. On iOS 26,
+  identically-configured transcribers "share the same backing engine
+  instances and models" (real SpeechTranscriber doc text), which reduces
+  memory/ANE load but may NOT raise the admission limit — so the design
+  treats the pooled degraded mode (§6.1) as a likely primary outcome, not
+  a corner case, until the probe says otherwise. **No public data on how
+  many concurrent zh_CN streams a given iPad admits — UNVERIFIED, probe
+  item 2 (gating).** Feeding only gate-passed speech keeps simultaneous
+  *active* analyses rare either way.
+  Confidence: high (limits + sharing text), unverified (the number and
+  whether sharing affects admission).
 - Streaming behavior: ~0.3–0.5 s to first volatile result (field report);
   **~1.4–2.1 s from end-of-speech to finalized text** (Apple-forum
   measurements; `prepareToAnalyze(in:)` pre-warming cuts it to ~1.45 s
@@ -283,9 +289,46 @@ model at the boundary.
 
 ```swift
 enum LaneEngineState: Equatable {
-    case idle, starting, running
-    case degraded(String)      // running but impaired (e.g. STT pool contention)
+    case idle
+    case starting                       // connecting / warming up
+    case running
+    case degraded(String)               // running but impaired (e.g. STT pool contention)
+    case reconnecting(attempt: Int)     // realtime: closed, backoff timer armed
     case failed(String)
+}
+
+/// Per-buffer gate outcome carried across the seam.
+struct GateVerdict {
+    /// Hangover-smoothed "this lane is speaking" — today's `speech`
+    /// conjunction (pass && voiced). Opens lanes lazily, feeds the
+    /// realtime first-response clock, defeats idle-close.
+    let speech: Bool
+    /// Instantaneous genuine voicing for THIS buffer — the raw VAD
+    /// verdict minus bleed, before the hangover is applied. The cascade
+    /// closes utterances on a short debounce of this flag (§6.1) so the
+    /// worn profile's 1.5 s hangover is NOT added to cascade latency;
+    /// the hangover tail still flows to STT as trailing context because
+    /// `pass` stays true through it.
+    ///
+    /// Requires a one-line gate change: ChannelGate already computes
+    /// this internally (`genuine = voicedNow[i] && !bleed[i]`,
+    /// ChannelGate.evaluate step 3) but Decision only exposes the
+    /// hangover-smoothed `voiced` — Decision gains a `genuineNow` field
+    /// carrying the existing value. No gate behavior changes.
+    let voicedNow: Bool
+    /// Gate pass (bleed-suppressed ⇒ false). Realtime substitutes
+    /// silence when false; cascade sends nothing.
+    let pass: Bool
+}
+
+/// One notice channel per lane so engines own their banner lifecycles
+/// (raise AND retract) without clobbering unrelated errors: AppModel
+/// clears a displayed banner only when the clearing id matches the one
+/// that raised it — the same text-equality discipline reconnectBanner
+/// implements today, made explicit.
+enum LaneNotice {
+    case raised(id: String, text: String)
+    case cleared(id: String)
 }
 
 /// Everything between "gated audio for one lane" and "transcript +
@@ -294,22 +337,33 @@ protocol LaneEngine: AnyObject {
     var label: String { get }
 
     /// Called on audioQueue for EVERY tap buffer (hardware-rate mono
-    /// float32), with the gate's verdicts. The engine decides what to do:
-    /// realtime substitutes silence for !gatePassed (continuous-timeline
-    /// contract); cascade drops non-speech and derives utterance
-    /// boundaries from the speech flag (§6.1).
-    func sendAudio(_ buffer: AVAudioPCMBuffer, speech: Bool, gatePassed: Bool)
+    /// float32) with the gate's verdicts. The engine decides what to do
+    /// with it (silence substitution vs. drop) — and the engine owns its
+    /// converters: it MUST compare `buffer.format` against its
+    /// converter's input format on every call and rebuild on change.
+    /// Route churn (USB replug, BT codec renegotiation) changes the
+    /// hardware rate mid-conversation; today AppModel rebuilds the
+    /// resamplers on route change, and that responsibility moves inside
+    /// the seam — a stale converter in the STT path fails SILENTLY
+    /// (research §2.2), so this is a correctness rule, not an
+    /// optimization.
+    func sendAudio(_ buffer: AVAudioPCMBuffer, verdict: GateVerdict)
 
     func start()
     func close()
 
     // Callbacks on the engine's private queue; consumers hop to main.
     var onState: ((LaneEngineState) -> Void)? { get set }
+    var onNotice: ((LaneNotice) -> Void)? { get set }
     var onTranscript: ((TranscriptEvent) -> Void)? { get set }
     /// 24 kHz mono PCM16 LE — the existing playback seam.
     var onTranslatedAudio: ((Data) -> Void)? { get set }
-    /// Monotonic dollar increments (realtime: billed seconds × rate;
-    /// Apple cascade: never fires).
+    /// Monotonic dollar increments (realtime: billed seconds × the
+    /// per-minute rate, which moves from CostMeter into the adapter;
+    /// Apple cascade: never fires). Deliberately NOT identity-guarded by
+    /// AppModel — an engine evicted at idle-close keeps this callback
+    /// alive through its close drain so drained audio still bills,
+    /// exactly like onBilledSeconds today.
     var onCostDelta: ((Double) -> Void)? { get set }
     var onMetric: ((LaneMetric) -> Void)? { get set }
 
@@ -344,18 +398,62 @@ enum LaneEngineSnapshot {
 
 `RealtimeLaneEngine` is a thin adapter: it owns a
 `RealtimeTranslationClient` + the lane's `StreamResampler`, forwards
-deltas/audio/billing, and keeps the reconnect loop AppModel runs today
-(the reconnect logic moves into the adapter so AppModel stops knowing
-about sockets; behavior identical). `sendAudio` keeps the exact current
-semantics: gate-suppressed buffers become silence, everything is resampled
-to 24 kHz PCM16 and appended.
+deltas/audio/billing, and absorbs the reconnect loop AppModel runs today.
+`sendAudio` keeps the exact current semantics: gate-suppressed buffers
+become silence, everything is resampled to 24 kHz PCM16 and appended.
 
 AppModel changes are mechanical: `clients: [Int: RealtimeTranslationClient]`
-becomes `engines: [Int: any LaneEngine]`; `makeClient` becomes a factory
-switching on the pipeline setting; `wireClient` wires the new callbacks;
-lazy-open-on-speech, idle-close, and disabled-mic close are unchanged and
-apply to both engine kinds (for the cascade they bound *resource* use
-rather than billing).
+becomes `engines: [Int: any LaneEngine]`; `sessionStates` becomes
+`[Int: LaneEngineState]` (dot mapping: idle→gray, starting/reconnecting→
+yellow, running→green, degraded→orange, failed→red); `makeClient` becomes
+a factory switching on the pipeline setting; `wireClient` wires the new
+callbacks. **Lifecycle is pipeline-dependent**: lazy-open-on-speech and
+idle-close remain exactly as today for realtime engines (they bound
+billing); cascade engines open eagerly at Start and are exempt from
+idle-close (§6.1 — closing an analyzer is terminal and re-opening re-pays
+seconds of warm-up on the first utterance after every lull, for zero
+saved cost). Disabled-mic close applies to both kinds; re-enabling builds
+a fresh engine.
+
+#### 5.1.1 CP1 acceptance: the realtime contract, itemized
+
+CP1's "zero behavior change" claim is only testable if the observable
+contract is written down. Moving the reconnect machinery into
+`RealtimeLaneEngine` must preserve ALL of the following, verbatim from
+today's AppModel behavior:
+
+1. **Indefinite retry, capped backoff**: reconnect attempts continue for
+   as long as the conversation runs, delay `min(30, 2^min(attempts,5))` s.
+   The retry chain is bounded only by `close()` (Stop, idle-close,
+   disabled-mic): a pending backoff timer inside a closed engine must
+   no-op, mirroring today's "client still registered" guard at timer
+   fire.
+2. **Survival-gated counter reset**: the attempt counter resets only
+   after a connection survives ≥ 5 s in `.open` (`sessionOpenedAt`
+   discipline) — an open-then-instant-reject loop must not retry with a
+   fresh counter forever.
+3. **Attempt-5 banner**: on the 5th consecutive attempt, raise
+   `LaneNotice.raised(id: "reconnect.<lane>", text:)` with today's
+   "keeps failing — still retrying every 30 s" wording; AppModel maps it
+   to `errorBanner`.
+4. **Self-clearing recovery**: after 5 s of surviving `.open`, the engine
+   emits `cleared(id: "reconnect.<lane>")`; AppModel clears `errorBanner`
+   only if the currently displayed banner was raised under that id —
+   an unrelated error that replaced it meanwhile must survive (today's
+   text-equality check, keyed by id instead).
+5. **Billing through the drain**: `onCostDelta` is not identity-guarded;
+   an idle-closed engine's close drain keeps billing (existing
+   `onBilledSeconds` comment contract).
+6. **Lazy open + pre-open queue**: first-speech open with the client's
+   ~30 s pre-open audio queue and flush-on-open ordering, untouched
+   (stays inside `RealtimeTranslationClient`).
+7. **Pipeline statuses**: `snapshot()` returns the same
+   `RealtimeTranslationClient.Snapshot` (wrapped), sampled at 1 Hz, so
+   the Diagnostics panel renders identically.
+
+Acceptance test: a realtime conversation with induced network loss
+(airplane-mode toggles at various phases) is indistinguishable from
+today's build — same dots, same banners, same recovery, same cost.
 
 ### 5.2 Stage providers
 
@@ -402,9 +500,11 @@ protocol TranslationProviderFactory {
 }
 
 protocol Translator: AnyObject {
-    /// Serialized internally; callers may invoke from any queue. Future
-    /// streaming providers can deliver via onDelta before returning.
-    func translate(_ text: String) async throws -> String
+    /// Serialized internally; callers may invoke from any queue. `job`
+    /// correlates streaming deltas with the awaited result — future
+    /// streaming providers deliver via onDelta(job, delta) before
+    /// returning the final text.
+    func translate(_ text: String, job: UUID) async throws -> String
     var onDelta: ((UUID, String) -> Void)? { get set }   // optional streaming hook
     func cancelAll()
 }
@@ -428,9 +528,13 @@ protocol TTSProviderFactory {
 }
 
 protocol SpeechSynth: AnyObject {
-    /// Jobs are FIFO per synth instance. Audio arrives as 24 kHz mono
-    /// PCM16 chunks (providers convert internally), bracketed by
-    /// onFinished per job.
+    /// Audio arrives as 24 kHz mono PCM16 chunks (providers convert
+    /// internally), bracketed by onFinished per job. The synth has NO
+    /// internal queue contract and NO per-job cancel: the lane engine
+    /// owns the pending queue and submits at most ONE job at a time
+    /// (submit next on onFinished) — backpressure drops (§7) happen in
+    /// the engine's queue before submission, and cancelAll is only for
+    /// Stop/close.
     func synthesize(text: String, job: UUID)
     func cancelAll()
     var onAudio: ((UUID, Data) -> Void)? { get set }
@@ -484,28 +588,50 @@ identically across lanes (locale from the source-language setting via
 lets the OS share one backing engine across lanes.
 
 - **Input**: the lane engine converts gate-passed buffers to
-  `bestAvailableAudioFormat(compatibleWith: [transcriber])` (queried once
-  at start; expected 16 kHz mono) with a dedicated `AVAudioConverter`,
-  wraps them in `AnalyzerInput`, and yields into the stream's
-  continuation. Non-speech buffers are *not* sent (unlike realtime's
-  silence-substitution) — this is the "interleaved schedule" mitigation
-  from Apple's own concurrency guidance, and it means the analyzer's
-  audio clock only advances during speech.
-- **Segmentation**: an utterance opens on the first speech buffer after
-  quiet. When the gate's speech flag has been false for 300 ms
-  (debounce; the gate hangover already smoothed word gaps), the engine
-  calls `endUtterance()` → `finalize(through: lastSpeechTime)`, which
-  forces the final result for the segment without ending the session.
-  A monologue that never pauses is split anyway: when a *final* result
-  arrives mid-utterance ending in sentence punctuation (。！？.!?), the
-  accumulated sentence(s) are released downstream as a sub-segment —
-  same trick TranscriptStore's sentence-timeout uses today. Punctuation
-  is an accelerator, never a requirement (zh punctuation is unverified):
-  the VAD boundary alone always produces a translatable segment.
+  `bestAvailableAudioFormat(compatibleWith: [transcriber])` (queried at
+  start; expected 16 kHz mono) with a dedicated `AVAudioConverter`,
+  rebuilt whenever the incoming `buffer.format` changes (§5.1 rule —
+  route churn changes the hardware rate, and a stale converter here
+  fails *silently*). Buffers are wrapped in `AnalyzerInput` and yielded
+  into the stream's continuation. Non-speech buffers are *not* sent
+  (unlike realtime's silence-substitution), so the analyzer's audio
+  clock only advances during speech and idle lanes cost nothing.
+- **Segmentation** (this is where cascade latency is won or lost): an
+  utterance opens on the first `pass && voicedNow` buffer after quiet.
+  The close trigger is a **400 ms debounce of `voicedNow` going false**
+  — the *raw* VAD flag, NOT the hangover-smoothed `speech` flag. The
+  hangover (1.5 s worn / 2.0 s ambient) exists to keep the *gate* open
+  across word gaps and MUST NOT sit in the cascade's response path;
+  audio keeps flowing through the hangover tail (`pass` stays true), so
+  if the debounce fires early and the speaker resumes, the trailing
+  audio was captured and the next utterance opens cleanly. On close:
+  `endUtterance()` → `finalize(through: lastSpeechTime)`, forcing the
+  segment's final result without ending the session.
+  Two forced-split rules bound utterance length independent of the VAD:
+  1. **Punctuation sub-segmentation** (accelerator): when a *final*
+     result arrives mid-utterance ending in sentence punctuation
+     (。！？.!?), the accumulated sentence(s) release downstream early.
+     zh punctuation is UNVERIFIED (probe item 4) — nothing depends on it.
+  2. **Max-duration split** (hard bound): at 12 s of continuous
+     utterance, `finalize(through: now)` fires and a new utterance UUID
+     continues seamlessly. Without this, ambient mode (2.0 s hangover,
+     12 s sustained-voice timeout, continuous surrounding chatter) can
+     hold one utterance open for minutes, starving MT and TTS until the
+     room quiets and then dumping one giant segment. The bound
+     guarantees translation flows during continuous speech even if
+     punctuation never appears.
 - **Results**: volatile results replace the utterance's source text live
   (`.sourceText(utterance:text:isFinal:false)`) — Chinese appears on
   screen *while the person talks*, which the realtime pipeline never did.
   The final result replaces it once more and feeds translation.
+- **Lifecycle**: cascade engines open **eagerly at Start** for enabled
+  lanes and stay open until Stop — they are exempt from idle-close.
+  Rationale: `close()` is terminal for an analyzer (a finished analyzer
+  cannot accept a new input sequence), so idle-closing after the default
+  120 s lull would re-pay analyzer creation + `prepareToAnalyze` +
+  possibly voice rule-loading on the *first utterance after every quiet
+  spell* — the exact moment users judge latency — to save nothing (no
+  billing, and an idle analyzer receiving no audio costs ~nothing).
 - **Warm-up**: `prepareToAnalyze(in:)` for every enabled lane at Start
   (halves finalize latency; ANE-state variance noted in research).
 - **Assets**: `AssetInventory` request at setup time with `Progress`
@@ -519,8 +645,14 @@ lets the OS share one backing engine across lanes.
   text arrives late rather than never, `LaneEngineState.degraded`
   ("2 speech models for 4 mics — simultaneous speech may lag") makes it
   visible, and the Diagnostics row shows pool waits. Pool acquisition
-  order is FIFO by utterance start. This is also the fallback if the
-  probe finds the device caps at 1–2 analyzers.
+  order is FIFO by utterance start. Expectation-setting per §2.2: engine
+  sharing may not lift the iOS 26 admission limit, so this mode is a
+  likely PRIMARY outcome, not a corner case — and it is sketched here,
+  not fully designed (per-acquisition timecode bookkeeping, demuxing a
+  shared transcriber's results back to the owning lane, and mid-utterance
+  transitions into pooled mode are real work). The phasing (§11) gates
+  CP2 on the probe: if the device admits fewer analyzers than enabled
+  lanes, pooled mode gets its own design pass before CP2 starts.
 
 ### 6.2 AppleTranslationProvider (Translation framework)
 
@@ -559,7 +691,11 @@ synthesizers silently dead), each bound to the lane's configured voice.
   `AVAudioConverter` to 24 kHz mono; convert each chunk; emit PCM16 Data
   via `onAudio` → the lane engine forwards to `onTranslatedAudio` → the
   existing `playEnglishAudio` schedules it on the lane's player node with
-  ducking untouched. Zero-length buffer → `onFinished`.
+  ducking untouched. Zero-length buffer → `onFinished`. (Yes, this is a
+  wasteful voice-native-float → PCM16 → float32 round trip; it is the
+  price of keeping the playback seam, ducking, and future cloud-TTS
+  providers — which genuinely emit 24 kHz PCM16 — on one code path.
+  Fractions of a millisecond per chunk; not worth a second seam.)
 - **Concurrency**: per-lane synths give per-lane FIFO for free. Whether
   two `write()` renders run truly concurrently is probe item 3; if not
   (or if glitchy), all synths share one serial render queue owned by
@@ -579,16 +715,27 @@ synthesizers silently dead), each bound to the lane's configured voice.
 
 ### 6.4 Per-lane voice configuration
 
-- **Storage**: `AppSettings.laneVoice(provider: String, channel: Int)` →
-  `"laneVoice.\(provider).\(channel)"` (UserDefaults, same pattern as
-  speaker names). Stored value is the provider-scoped voice identifier.
+- **Storage**: `AppSettings.laneVoice(provider:language:channel:)` →
+  `"laneVoice.\(provider).\(language).\(channel)"` (UserDefaults, same
+  pattern as speaker names). The **target language is part of the key**:
+  `outputLanguage` already supports more than English, and an en-US voice
+  identifier validates fine while happily mispronouncing French — keying
+  by language means switching the output language switches to that
+  language's voice assignments (auto-assigned on first use) instead of
+  reusing the wrong ones.
 - **Defaults**: on first use (or when a stored voice fails validation),
   auto-assign distinct voices: enumerate `voices(for: outputLanguage)`,
   rank premium > enhanced > default, interleave gender/accent variety
   (en-US/en-GB mix), assign index-wise per channel, then persist so the
-  assignment is stable ever after.
-- **Validation**: at Start, `AVSpeechSynthesisVoice(identifier:)` nil →
-  log, banner-note, auto-reassign (voices are deletable/purgeable).
+  assignment is stable ever after. **Fewer usable voices than enabled
+  lanes** (thin non-English inventories; a fresh device): cycle the
+  ranked list so duplicates land on the least-adjacent channels, log it,
+  and show a "2 lanes share this voice — download more voices" note on
+  the affected Settings rows. Distinct-by-default is best-effort, never
+  a blocker.
+- **Validation**: at Start, `AVSpeechSynthesisVoice(identifier:)` nil OR
+  `voice.language` not matching the target language → log, banner-note,
+  auto-reassign (voices are deletable/purgeable).
   Observe `availableVoicesDidChangeNotification` to refresh Settings live.
 - **UI**: each speaker row in Settings gains a voice menu (name +
   quality badge) and a ▶ preview that renders a sample sentence through
@@ -631,31 +778,101 @@ capturing ──endUtterance──▶ finalizing ──final text──▶ trans
   the realtime close drain), `Translator.cancelAll()`,
   `SpeechSynth.cancelAll()`, then state `.idle`. In-flight utterances
   finalize into the transcript if the drain returns them in time.
-- **Latency budget** (expected, to be validated by probe):
+- **Latency budget** (expected, to be validated by probe; every term in
+  the response path is listed — nothing rides for free):
 
 | Stage | Expected |
 | --- | --- |
-| Live Chinese on screen (volatile) | 0.3–0.5 s behind speech |
-| Speech-end → final Chinese | ~1.0–2.0 s (with pre-warm) |
-| Final → translation (Apple, on-device) | unmeasured publicly; probe. Working assumption ≤ 0.3 s/sentence |
-| Translation → first translated audio | ~0.1–0.5 s (warm voice) |
-| **Speech-end → translated audio** | **~1.5–3 s** (vs realtime's 0.5–1.5 s mid-speech) |
+| Live Chinese on screen (volatile) | 0.3–0.5 s behind speech (unaffected by boundary detection) |
+| Utterance boundary detection (`voicedNow` debounce, §6.1) | ~0.4 s after true speech end |
+| Boundary → final Chinese (`finalize(through:)`, pre-warmed) | ~1.0–2.0 s, high ANE-state variance (0.05–3 s observed in the field reports) |
+| Final → translation (Apple, on-device) | unmeasured publicly; probe item 5. Working assumption ≤ 0.3 s/sentence |
+| Translation → first translated audio (warm voice) | ~0.1–0.5 s |
+| **Speech-end → translated audio** | **~1.8–3.2 s typical; tail to ~4.5 s when the ANE is cold** (vs realtime's 0.5–1.5 s arriving mid-speech) |
 
-The cascade trades interpreter-style overlap for: source text *ahead* of
-the realtime pipeline (volatile results beat the whisper stream's lag),
-offline operation, $0, and voice-per-speaker. That trade is the point;
-the doc states it so nobody expects realtime parity. The designed-in
-mitigations if field latency disappoints, in order: translate on the
-volatile text at VAD-end and reconcile when the final differs (research:
-~95% match on short utterances), sentence sub-segmentation (§6.1, already
-in v1), and `.lowLatency` strategy pinning (26.4).
+  Had the boundary been derived from the hangover-smoothed `speech` flag,
+  the worn profile's 1.5 s (ambient: 2.0 s) hangover would sit at the
+  head of this chain and push the typical case past 3–4.5 s — that is
+  why `GateVerdict` carries `voicedNow` (§5.1) and the debounce runs on
+  it. The cascade trades interpreter-style overlap for: source text
+  *ahead* of the realtime pipeline (volatile results beat the whisper
+  stream's lag), offline operation, $0, and voice-per-speaker. That
+  trade is the point; the doc states it so nobody expects realtime
+  parity. The designed-in mitigations if field latency disappoints, in
+  order: translate on the volatile text at the VAD boundary and
+  reconcile when the final differs (research: ~95% match on short
+  utterances), tighter debounce, and `.lowLatency` strategy pinning
+  (26.4). Sentence sub-segmentation and the 12 s hard split are already
+  v1 (§6.1).
+
+### 7.1 Transcript integration (TranscriptStore changes)
+
+TranscriptStore today is built around one invariant the cascade breaks:
+**at most one open utterance per lane** (`openUtteranceIndex`), advanced
+by append-only deltas and closed by quiet-timeout (`finalizeStale`) with
+`reopenRecentIfNeeded` patching up late deltas. The cascade pipelines
+utterances — N's translation lands *after* N+1's bubble opened — and
+finalizes explicitly. The store changes:
+
+- **Identity**: cascade events are UUID-keyed. The store gains
+  `openCascade: [UUID: Int]` (utterance UUID → array index, shifted by
+  `trim()` exactly like `openUtteranceIndex`), allowing multiple open
+  bubbles per lane. Bubbles append in utterance-open order; a bubble's
+  translation fills in place when it arrives (visually identical to
+  today's late whisper bursts filling finalized bubbles).
+- **Provenance**: `Utterance` gains
+  `segmentation: .quietTimeout | .explicit`. `finalizeStale`,
+  `reopenRecentIfNeeded`, and the sentence-timeout fast path apply ONLY
+  to `.quietTimeout` (realtime) utterances — they'd otherwise hard-cap-
+  finalize a cascade bubble whose translation is 2 s away in the MT
+  queue, or double-finalize racing the explicit event. `.explicit`
+  utterances are closed by `translationText(isFinal: true)` (or by
+  source-final when translation failed, so the bubble shows 中文 + "—").
+  Safety net: an `.explicit` bubble with no pipeline activity for 30 s
+  finalizes with whatever it has (a lane engine death mid-utterance must
+  not leave a bubble open forever), logged as such.
+- **Replace-aware sentence counting**: `noteSentenceBoundary` counts
+  enders in *appended deltas*; running it on wholesale volatile
+  replacements would re-count the same 。 on every revision and
+  over-fire the prompter (or, bypassed, never fire it in cascade mode).
+  The replace path tracks `countedEnders: Int` per open utterance and
+  bumps `sentenceEventTotal` only by the positive delta of enders in the
+  new text vs. that counter. `finalizedTotal` bumps on explicit
+  finalization exactly once. Net effect: the prompter's two triggers
+  (docs/REPLY-FLOW.md §3) fire with the same meaning in both pipelines,
+  and the prompter needs no changes.
+- **Pinyin**: replaces go through the same 0.3 s-throttled recompute;
+  the final replace recomputes unconditionally (same rule as
+  finalization today).
 
 ## 8. Failure handling & availability
 
-### 8.1 Setup card (Settings → Translation pipeline)
+### 8.1 Settings & setup card (Settings → Translation pipeline)
+
+New settings (UserDefaults, `AppSettings` conventions):
+
+- `pipeline` — `"realtime"` (default) | `"cascade"`. **Read once at
+  Start**; toggling mid-conversation applies to the next conversation
+  (same rule as everything else lanes are built from).
+- `cascadeSourceLanguage` — BCP-47, default `"zh-Hans"`. The cascade
+  needs an *explicit* source (SpeechTranscriber locale + translation
+  source) where realtime auto-detects; the picker is populated from the
+  intersection of `SpeechTranscriber.supportedLocales` (via
+  `supportedLocale(equivalentTo:)`) and the Translation framework's
+  `supportedLanguages`. Behavioral divergence, stated on the picker:
+  realtime reads `outputLanguage` per lazy session open (a mid-
+  conversation change affects newly opened sessions); the cascade fixes
+  the (source, target) pair at Start in `CascadeContext`.
+- `laneVoice.<provider>.<language>.<channel>` — §6.4.
+- `cascadeSpeechRate` — global TTS rate multiplier (§6.3).
+- Existing settings that gain no cascade meaning are simply ignored by
+  cascade engines (`noiseReduction` is an OpenAI server-side knob;
+  `idleCloseSeconds` is realtime-only per §5.1) — the Settings UI
+  annotates them "realtime pipeline only".
 
 Selecting "On-device cascade" reveals a status card with one row per
-stage, each showing `ProviderAvailability`:
+stage, each showing `ProviderAvailability` (rows localized from
+`cascadeSourceLanguage`/`outputLanguage`, shown here for zh→en):
 
 - **Speech recognition (中文)** — installed / [Download] with inline
   `Progress` (AssetInventory, no system sheet) / unsupported.
@@ -714,9 +931,16 @@ results pasted into this doc:
 1. **Playgrounds compatibility**: `import Translation` + `import Speech`;
    create a headless `TranslationSession`, a `SpeechTranscriber`, and an
    `AVSpeechSynthesizer.write()` render inside the app playground. Also:
-   the translation download sheet from a Playgrounds-hosted view.
+   the translation download sheet from a Playgrounds-hosted view, and
+   confirmation that a pack-less headless session errors with
+   `.notInstalled` at `translate()` time (init non-throwing), plus that
+   Playgrounds accepts the `.iOS("26.0")` platform bump.
 2. **Concurrent analyzers**: 1→4 zh_CN transcribers on looped recorded
    audio; record where `insufficientResources` hits and CPU/thermal.
+   Expectation set by §2.2: identical configs may NOT raise the
+   admission limit on iOS 26 — a cap of 1–2 is a plausible result, and
+   it reroutes CP2 through a pooled-mode design pass (§11), it does not
+   kill the cascade.
 3. **Concurrent `write()`**: two/three simultaneous renders, different
    voices; correctness + wall-clock vs serialized.
 4. **zh punctuation**: transcribe scripted Mandarin (statements,
@@ -728,20 +952,33 @@ results pasted into this doc:
 7. **Voice inventory dump**: `speechVoices()` on the target iPad —
    identifiers, qualities, formats (write one buffer per voice, log
    `buffer.format`).
+8. **Sustained load**: a 30-minute 4-lane run on looped audio (STT + MT
+   + TTS all active): thermal state notifications, battery drain, and
+   whether finalize latency degrades over time. A dinner is 2+ hours of
+   this; a one-off CPU number doesn't answer it.
 
-Go/no-go: items 1–2 are gating (a Playgrounds or 2-analyzer failure
-forces redesign — pooled mode §6.1 becoming the default, or the cascade
-shipping as 2-lane). Items 3–7 tune constants and copy.
+Go/no-go: items 1–2 are gating (a Playgrounds failure forces redesign;
+an analyzer cap below the enabled-lane count reroutes CP2 through the
+pooled-mode design pass). Items 3–8 tune constants, copy, and
+expectations.
 
 ## 11. Phasing
 
-- **CP0 — probe** (§10). Ships alone; zero risk to the running app.
+- **CP0 — probe** (§10). Includes the `Package.swift` bump to
+  `.iOS("26.0")` (the probe exercises iOS 26 APIs; the claim that
+  Playgrounds 4.7 implies iPadOS 26 hardware comes from this repo's own
+  research and is itself verified by the probe building at all).
+  Otherwise zero risk to the running app.
 - **CP1 — seam refactor**: `LaneEngine` protocol, `RealtimeLaneEngine`
   adapter, AppModel/Diagnostics/Metrics ported to the seam. Behavior
-  change: none (the acceptance test is a realtime conversation
-  indistinguishable from today's, plus the existing reconnect banners).
+  change: none — acceptance is the itemized contract in §5.1.1,
+  exercised with induced network loss.
+- **Gate between CP1 and CP2**: if probe item 2 admitted fewer analyzers
+  than 4, the pooled mode (§6.1) is promoted from sketch to a designed
+  section of this doc (timecode bookkeeping, result demuxing,
+  mid-utterance pool transitions) and re-reviewed before CP2 begins.
 - **CP2 — Apple cascade**: providers, CascadeLaneEngine, TranscriptStore
-  replace-path, settings + setup card + per-lane voices. First real
+  changes (§7.1), settings + setup card + per-lane voices. First real
   conversations; latency table (§7) validated and filled in.
 - **CP3 — polish**: cascade Diagnostics/Metrics rendering, degraded-mode
   UX, voice previews, speech-rate slider, README/docs.
@@ -765,6 +1002,11 @@ shipping as 2-lane). Items 3–7 tune constants and copy.
 | v1 translates finals only | Simplicity first; volatile-translate is a bounded, designed-in follow-up if field latency disappoints |
 | Audio-skip backpressure (keep text, drop stale speech) | A live table can't use 30 s-old audio; the transcript preserves completeness |
 | Personal Voice excluded | Incompatible with `write()` buffer rendering (system falls back to direct output) |
+| `GateVerdict.voicedNow` at the seam (raw VAD, pre-hangover) | The 1.5–2.0 s gate hangover exists for gate continuity, not segmentation; deriving utterance ends from the smoothed flag would put it at the head of every cascade response (§7 table) |
+| Cascade exempt from idle-close, eager open at Start | Analyzer close is terminal; reopen re-pays seconds of warm-up on the first post-lull utterance to save $0 |
+| Engines own format self-healing (sniff `buffer.format` per send) | Route churn changes the hardware rate mid-conversation; a stale STT converter fails silently — AppModel's route-change resampler rebuild moves inside the seam it can no longer see into |
+| Utterance provenance flag in TranscriptStore | Quiet-timeout machinery (finalizeStale, reopen, sentence fast path) applied to explicitly-finalized cascade bubbles double-finalizes and truncates; the two segmentation regimes must not touch each other's utterances |
+| 12 s max-utterance hard split | Ambient-mode chatter can hold the VAD open for minutes; punctuation (unverified for zh) must stay an accelerator, so a duration bound is the only guaranteed mid-speech release |
 
 ## 13. Sources
 

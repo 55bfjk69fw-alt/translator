@@ -133,13 +133,14 @@ URLs inline. Anything marked **UNVERIFIED** lands in the hardware probe
   identically-configured transcribers "share the same backing engine
   instances and models" (real SpeechTranscriber doc text), which reduces
   memory/ANE load but may NOT raise the admission limit — so the design
-  treats the pooled degraded mode (§6.1) as a likely primary outcome, not
-  a corner case, until the probe says otherwise. **No public data on how
-  many concurrent zh_CN streams a given iPad admits — UNVERIFIED, probe
-  item 2 (gating).** Feeding only gate-passed speech keeps simultaneous
-  *active* analyses rare either way.
-  Confidence: high (limits + sharing text), unverified (the number and
-  whether sharing affects admission).
+  treats the analyzer pool (§6.1.1) as the primary design, not a corner
+  case. Feeding only gate-passed speech keeps simultaneous *active*
+  analyses rare either way.
+  **MEASURED (CP0 probe, §10): the target iPad admits 3 simultaneous
+  zh_CN analyses; the 4th throws `SFSpeechErrorDomain` code 16
+  ("Maximum number of simultaneous requests reached") — identical
+  configs did not raise the admission limit, confirming the caution
+  above. Throughput ≥25× real time even at 3 concurrent lanes.**
 - Streaming behavior: ~0.3–0.5 s to first volatile result (field report);
   **~1.4–2.1 s from end-of-speech to finalized text** (Apple-forum
   measurements; `prepareToAnalyze(in:)` pre-warming cuts it to ~1.45 s
@@ -600,12 +601,17 @@ Deliberate simplifications vs Pipecat/LiveKit, and why they're safe:
 
 ### 6.1 AppleSTTProvider (SpeechAnalyzer + SpeechTranscriber)
 
-Per lane: one long-lived `SpeechAnalyzer` in autonomous mode
+Analyzers are owned by a shared **AnalyzerPool** (in `CascadeContext`),
+not by lanes — the CP0 probe measured an admission limit of **3
+simultaneous analyses** on the target iPad (§10), one short of the 4
+lanes, so pooling is the primary design, with lane-static binding as its
+natural degenerate case when the pool is big enough. Each pool slot is
+one long-lived `SpeechAnalyzer` in autonomous mode
 (`start(inputSequence:)`) with one `SpeechTranscriber` configured
-identically across lanes (locale from the source-language setting via
+identically across slots (locale from the source-language setting via
 `supportedLocale(equivalentTo:)`, preset `.progressiveTranscription`
-(volatile + fast), no `audioTimeRange` in v1) — identical configs are what
-lets the OS share one backing engine across lanes.
+(volatile + fast), no `audioTimeRange` in v1). The pool design is
+§6.1.1.
 
 - **Input**: the lane engine converts gate-passed buffers to
   `bestAvailableAudioFormat(compatibleWith: [transcriber])` (queried at
@@ -652,46 +658,72 @@ lets the OS share one backing engine across lanes.
   (`.sourceText(utterance:text:isFinal:false)`) — Chinese appears on
   screen *while the person talks*, which the realtime pipeline never did.
   The final result replaces it once more and feeds translation.
-- **Lifecycle**: cascade engines open **eagerly at Start** for enabled
-  lanes and stay open until Stop — they are exempt from idle-close.
-  Rationale: `close()` is terminal for an analyzer (a finished analyzer
-  cannot accept a new input sequence), so idle-closing after the default
-  120 s lull would re-pay analyzer creation + `prepareToAnalyze` +
-  possibly voice rule-loading on the *first utterance after every quiet
-  spell* — the exact moment users judge latency — to save nothing (no
-  billing, and an idle analyzer receiving no audio costs ~nothing).
-  Eager open deliberately front-loads the admission-limit collision:
-  creating all N analyzers at Start is the naive-concurrency scenario
-  §2.2 warns about, and that is the point — a device that can't admit N
-  fails *deterministically at Start* (degraded banner, pooled mode)
-  instead of surprising the user mid-conversation when a fourth speaker
-  finally talks. Probe item 2 therefore tests simultaneous creation, not
-  just incremental. **Re-enable mid-conversation**: a cascade engine for
-  a re-enabled mic is built lazily on that lane's next `sendAudio` (the
-  per-buffer enabled-mask read already notices the transition), re-paying
-  its warm-up — acceptable for an explicit user action, and stated here
-  so the eager-at-Start rule visibly has exactly one exception.
+- **Lifecycle**: the pool and the per-lane engines open **eagerly at
+  Start** and stay open until Stop — exempt from idle-close. Rationale:
+  finishing an analyzer is terminal (it cannot accept a new input
+  sequence), so idle-closing after the default 120 s lull would re-pay
+  slot creation + `prepareToAnalyze` + possibly voice rule-loading on
+  the *first utterance after every quiet spell* — the exact moment users
+  judge latency — to save nothing (no billing, and an idle slot
+  receiving no audio costs ~nothing). Eager open also front-loads the
+  admission-limit discovery: the pool learns N *deterministically at
+  Start* instead of surprising the user mid-conversation when a fourth
+  speaker finally talks. **Re-enable mid-conversation**: a cascade
+  engine for a re-enabled mic is built lazily on that lane's next
+  `sendAudio` (the per-buffer enabled-mask read already notices the
+  transition); the pool itself is unaffected — lanes are lightweight
+  (converter + synth + segmentation state), the analyzers live in the
+  pool.
 - **Warm-up**: `prepareToAnalyze(in:)` for every enabled lane at Start
   (halves finalize latency; ANE-state variance noted in research).
 - **Assets**: `AssetInventory` request at setup time with `Progress`
   surfaced in the setup card (§8.1); `.assetUnavailable` at Start →
   banner pointing at the card.
-- **Degraded mode (insufficientResources)**: if creating analyzer N
-  throws, the provider drops to a *pooled* mode: N−1 analyzers serve all
-  lanes, acquired per utterance (gate-open) and released at finalize.
-  Overlapping speech beyond the pool buffers up to 30 s of audio per lane
-  (same bound as the realtime pre-open queue) and transcribes on release —
-  text arrives late rather than never, `LaneEngineState.degraded`
-  ("2 speech models for 4 mics — simultaneous speech may lag") makes it
-  visible, and the Diagnostics row shows pool waits. Pool acquisition
-  order is FIFO by utterance start. Expectation-setting per §2.2: engine
-  sharing may not lift the iOS 26 admission limit, so this mode is a
-  likely PRIMARY outcome, not a corner case — and it is sketched here,
-  not fully designed (per-acquisition timecode bookkeeping, demuxing a
-  shared transcriber's results back to the owning lane, and mid-utterance
-  transitions into pooled mode are real work). The phasing (§11) gates
-  CP2 on the probe: if the device admits fewer analyzers than enabled
-  lanes, pooled mode gets its own design pass before CP2 starts.
+#### 6.1.1 The AnalyzerPool (pooled-mode design pass, gate satisfied)
+
+The probe admitted 3 of 4 lanes, so this section is the design pass the
+phasing gate required. The measured throughput makes pooling cheap:
+transcription ran ≥25× real time (10.8 s of audio in ~0.3–0.4 s, even
+with 3 concurrent lanes), so a lane that waits for a slot and then
+burst-feeds its buffered audio catches up in well under a second.
+
+- **Discovery at Start**: create-and-start identical zh slots one at a
+  time up to `min(enabledLanes, 4)`, catching the admission error
+  (`SFSpeechErrorDomain` code 16, "Maximum number of simultaneous
+  requests reached" — the probe's exact observed failure). The count
+  that succeeds is the pool size N (measured: 3). This keeps Start-time
+  failure deterministic and turns "how many does this device allow"
+  into a runtime measurement instead of a constant.
+- **Slots**: long-lived for the conversation, pre-warmed with
+  `prepareToAnalyze(in:)`, each with its own input continuation, its own
+  results-harvest task, and a running **time cursor** (`CMTime`) that
+  advances by each fed buffer's duration. A slot serves ONE lane at a
+  time, so result demux is trivial: the harvest task forwards volatile
+  and final results to the slot's current owner.
+- **Acquisition**: a lane acquires a slot at utterance open (first
+  `pass && voicedNow` buffer) and releases it after `endUtterance()` →
+  `finalize(through: cursor)` delivers the final result. The utterance
+  occupies a contiguous range on the slot's timeline; the cursor carries
+  across acquisitions (finalize-through does not end the session).
+  Acquisition is FIFO by utterance start.
+- **Contention** (all N slots busy — a 4th simultaneous speaker): the
+  lane buffers its converted audio (bounded at ~30 s, the realtime
+  pre-open queue's bound) and burst-feeds on acquisition; at ≥25× real
+  time the backlog clears in <1 s, so the listener experiences a
+  sub-second extra delay on the *fourth* concurrent voice — a rarity the
+  gate's bleed rejection already makes rarer. The lane reports
+  `.degraded("waiting for a speech model — simultaneous speech may
+  lag")` only if the wait itself exceeds 2 s; Diagnostics counts waits
+  and their durations either way.
+- **N ≥ enabled lanes** (fewer mics, or a future OS raising the limit):
+  the same code path simply never contends — no separate "direct"
+  mode.
+- **Slot death**: recreate once (fresh analyzer, cursor reset, owner
+  re-acquires); on repeated failure the pool shrinks by one and logs.
+- **Interaction with the 12 s hard split**: a split releases and
+  immediately re-acquires the same slot (FIFO grants it to the waiting
+  continuation utterance unless another lane was already queued —
+  fairness over stickiness).
 
 ### 6.2 AppleTranslationProvider (Translation framework)
 
@@ -764,9 +796,19 @@ synthesizers silently dead), each bound to the lane's configured voice.
   reusing the wrong ones.
 - **Defaults**: on first use (or when a stored voice fails validation),
   auto-assign distinct voices: enumerate `voices(for: outputLanguage)`,
-  rank premium > enhanced > default, interleave gender/accent variety
-  (en-US/en-GB mix), assign index-wise per channel, then persist so the
-  assignment is stable ever after. **Fewer usable voices than enabled
+  rank **premium > enhanced > super-compact > compact > everything
+  else**, interleave gender/accent variety (en-US/en-GB mix), assign
+  index-wise per channel, then persist so the assignment is stable ever
+  after. The bottom tier exists because the probe's inventory (§10)
+  showed a fresh device is dominated by voices that pass the
+  novelty/personal filter but should never be auto-assigned: the
+  `com.apple.eloquence.*` set (Eddy/Flo/Grandma/Grandpa/…) and the
+  legacy MacinTalk voices (`com.apple.speech.synthesis.voice.*` — Fred,
+  Kathy, …). They stay selectable in the picker (grouped last), just
+  never chosen automatically. On a stock device the auto-assignment
+  therefore lands on Samantha/Daniel/Karen/Moira-class voices, and the
+  Settings hint to download enhanced/premium voices is what unlocks
+  genuinely distinct, pleasant lanes. **Fewer usable voices than enabled
   lanes** (thin non-English inventories; a fresh device): cycle the
   ranked list so duplicates land on the least-adjacent channels, log it,
   and show a "2 lanes share this voice — download more voices" note on
@@ -817,32 +859,36 @@ capturing ──endUtterance──▶ finalizing ──final text──▶ trans
   the realtime close drain), `Translator.cancelAll()`,
   `SpeechSynth.cancelAll()`, then state `.idle`. In-flight utterances
   finalize into the transcript if the drain returns them in time.
-- **Latency budget** (expected, to be validated by probe; every term in
-  the response path is listed — nothing rides for free):
+- **Latency budget** — pre-probe expectations vs CP0 measurements
+  (probe, 2026-07-14, clean paced TTS audio; live far-field mic speech
+  may run slower, so the expected column keeps its margin):
 
-| Stage | Expected |
-| --- | --- |
-| Live Chinese on screen (volatile) | 0.3–0.5 s behind speech (unaffected by boundary detection) |
-| Utterance boundary detection (two-tier `voicedNow` debounce, §6.1) | 0.4 s (sentence-ended) – 0.75 s after true speech end |
-| Boundary → final Chinese (`finalize(through:)`, pre-warmed) | ~1.0–2.0 s, high ANE-state variance (0.05–3 s observed in the field reports) |
-| Final → translation (Apple, on-device) | unmeasured publicly; probe item 5. Working assumption ≤ 0.3 s/sentence |
-| Translation → first translated audio (warm voice) | ~0.1–0.5 s |
-| **Speech-end → translated audio** | **~1.8–3.5 s typical; tail to ~4.5 s when the ANE is cold** (vs realtime's 0.5–1.5 s arriving mid-speech) |
+| Stage | Expected (pre-probe) | Measured (CP0) |
+| --- | --- | --- |
+| Live Chinese on screen (volatile) | 0.3–0.5 s behind speech | not separately timed |
+| Utterance boundary detection (two-tier `voicedNow` debounce, §6.1) | 0.4 s (sentence-ended) – 0.75 s | by construction |
+| Boundary → final Chinese (`finalize(through:)`) | ~1.0–2.0 s (field reports) | **p50 0.08 s; 0.03–0.05 s with `prepareToAnalyze`** |
+| Final → translation (Apple, on-device) | ≤ 0.3 s assumed | **p50 62 ms, p95 210 ms (cold 210 ms); batch 59 ms/sentence** |
+| Translation → first translated audio (warm voice) | ~0.1–0.5 s | overlapping renders confirmed; per-utterance TTFB not separately timed |
+| **Speech-end → translated audio** | ~1.8–3.5 s | **~0.7–1.6 s projected** (debounce-dominated) |
 
-  Had the boundary been derived from the hangover-smoothed `speech` flag,
-  the worn profile's 1.5 s (ambient: 2.0 s) hangover would sit at the
-  head of this chain and push the typical case past 3–4.5 s — that is
-  why `GateVerdict` carries `voicedNow` (§5.1) and the debounce runs on
-  it. The cascade trades interpreter-style overlap for: source text
-  *ahead* of the realtime pipeline (volatile results beat the whisper
-  stream's lag), offline operation, $0, and voice-per-speaker. That
-  trade is the point; the doc states it so nobody expects realtime
-  parity. The designed-in mitigations if field latency disappoints, in
-  order: translate on the volatile text at the VAD boundary and
-  reconcile when the final differs (research: ~95% match on short
-  utterances), tighter debounce, and `.lowLatency` strategy pinning
-  (26.4). Sentence sub-segmentation and the 12 s hard split are already
-  v1 (§6.1).
+  The measured finalize latency is ~20× better than the public field
+  reports (clean audio, short utterances, warm shared engine — but even
+  a 5× degradation on live mics leaves the total under ~2 s). The
+  budget is now dominated by the boundary debounce itself, which is
+  deliberate margin, not model time. Had the boundary been derived from
+  the hangover-smoothed `speech` flag, the worn profile's 1.5 s
+  (ambient: 2.0 s) hangover would sit at the head of this chain — that
+  is why `GateVerdict` carries `voicedNow` (§5.1). The cascade still
+  trades interpreter-style overlap (realtime translates mid-speech; the
+  cascade answers after the utterance) for: source text *ahead* of the
+  realtime pipeline (volatile results beat the whisper stream's lag),
+  offline operation, $0, and voice-per-speaker. Mitigations if live
+  latency disappoints, in order: translate on the volatile text at the
+  VAD boundary and reconcile (research: ~95% match on short
+  utterances), tighter debounce, `.lowLatency` strategy pinning (26.4).
+  Sentence sub-segmentation and the 12 s hard split are already v1
+  (§6.1).
 
 ### 7.1 Transcript integration (TranscriptStore changes)
 
@@ -1008,6 +1054,54 @@ an analyzer cap below the enabled-lane count reroutes CP2 through the
 pooled-mode design pass). Items 3–8 tune constants, copy, and
 expectations.
 
+### Probe results (2026-07-14, CP0 run on the target iPad, iPadOS 26)
+
+1. **Playgrounds compatibility: PASS across the board.** `import Speech`
+   + `import Translation` built and ran inside the app playground; the
+   headless `TranslationSession` translated (你好 → Hello) with the pack
+   installed; `AssetInventory.downloadAndInstall()` fetched the zh_CN
+   model programmatically; the translation-pack system sheet presented
+   from the Playgrounds-hosted `.translationTask` view; `write()`
+   rendered normally. 30 supported SpeechTranscriber locales on-device,
+   zh_CN matched and installed.
+2. **Concurrent analyzers: admission limit = 3.** n=1..3 all-at-once ran
+   clean; n=4 threw `SFSpeechErrorDomain` code 16 ("Maximum number of
+   simultaneous requests reached"). Gate outcome: **pooled mode is the
+   primary design (§6.1.1)** — the design pass the phasing gate required
+   is done and re-reviewed. Throughput: each run transcribed 10.8 s of
+   audio in ~0.3–0.4 s (≥25× real time even 3-wide), which is what makes
+   pool contention effectively invisible (burst catch-up < 1 s).
+3. **Concurrent `write()`: renders overlap.** Two synthesizers rendered
+   simultaneously with complete buffer sets (457/469 buffers). The
+   serial-vs-concurrent wall-clock comparison (0.74 s vs 0.11 s) is
+   contaminated by voice warm-up in the serial baseline, but the
+   correctness conclusion stands: **per-lane synthesizers, no shared
+   render queue needed.** Tingting's `write()` format: 22 050 Hz, mono,
+   float32 — the sniff-and-convert rule earns its keep.
+4. **zh punctuation: present but inconsistent.** 。 and ？ appeared, but
+   several sentence boundaries surfaced as `，` and the final sentence
+   ended unpunctuated. The transcriber also normalizes ("上午十点" →
+   "上午 10:00"). Validates the design's stance: punctuation is an
+   accelerator (the 400 ms fast tier fires when it's there), the VAD
+   boundary + 12 s split carry the guarantee. `，` is NOT a fast-close
+   ender.
+5. **Translation latency: negligible.** Cold 210 ms; serial p50 62 ms /
+   p95 210 ms over 20 sentences; batch 59 ms/sentence. Serialized
+   per-pair sessions are comfortably sufficient; the batch escape hatch
+   is unnecessary at dinner-table volumes.
+6. **Finalize latency: p50 0.08 s (0.03–0.05 s with
+   `prepareToAnalyze`)** on paced, clean TTS audio — ~20× better than
+   the public field reports. Pre-warm stays (it still halves the
+   number); the §7 budget keeps margin for live far-field audio.
+7. **Voice inventory: 180 voices, all default-tier.** No enhanced or
+   premium installed on a stock device; the usable-after-filtering set
+   is dominated by `com.apple.eloquence.*` and legacy MacinTalk voices —
+   hence the ranking floor in §6.4. Genuinely distinct pleasant lanes
+   need the one-time enhanced/premium downloads (Settings →
+   Accessibility → Read & Speak → Voices).
+8. **Sustained load: not yet run** — worth doing before the first long
+   dinner; the probe button remains.
+
 ## 11. Phasing
 
 - **CP0 — probe** (§10). Includes the `Package.swift` bump to
@@ -1019,10 +1113,10 @@ expectations.
   adapter, AppModel/Diagnostics/Metrics ported to the seam. Behavior
   change: none — acceptance is the itemized contract in §5.1.1,
   exercised with induced network loss.
-- **Gate between CP1 and CP2**: if probe item 2 admitted fewer analyzers
-  than 4, the pooled mode (§6.1) is promoted from sketch to a designed
-  section of this doc (timecode bookkeeping, result demuxing,
-  mid-utterance pool transitions) and re-reviewed before CP2 begins.
+- **Gate between CP1 and CP2** — TRIGGERED and SATISFIED: probe item 2
+  admitted 3 of 4 lanes, and §6.1.1 is the resulting pooled-mode design
+  pass (slots, cursors, FIFO acquisition, burst catch-up), re-reviewed
+  with the probe numbers in hand.
 - **CP2 — Apple cascade**: providers, CascadeLaneEngine, TranscriptStore
   changes (§7.1), settings + setup card + per-lane voices. First real
   conversations; latency table (§7) validated and filled in.

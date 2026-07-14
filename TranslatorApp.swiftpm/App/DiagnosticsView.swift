@@ -10,6 +10,7 @@ struct DiagnosticsView: View {
     @ObservedObject private var log = Log.shared
     @State private var logCopied = false
     @StateObject private var probe = DualInputProbe()
+    @StateObject private var cascadeProbe = CascadeProbe()
 
     // Hosted inside MonitorView's NavigationStack (which owns the pane
     // switcher); this view supplies only its title and toolbar items.
@@ -20,6 +21,7 @@ struct DiagnosticsView: View {
             pipelineSection
             benchSection
             probeSection
+            CascadeProbeSection(probe: cascadeProbe)
             logSection
         }
         .navigationTitle("Diagnostics")

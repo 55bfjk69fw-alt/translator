@@ -82,6 +82,15 @@ final class RealtimeTranslationClient: NSObject {
     /// load and unbounded latency+memory growth.
     private var inflightAudioBytes = 0
     private var warnedBacklog = false
+    /// True while flushPendingAudio replays the queue. The flush runs as one
+    /// block on the serial queue, and send completions — the only thing that
+    /// drains the backlog counter — land on that same queue, so they CANNOT
+    /// interleave with the flush: mid-flush the counter necessarily inflates
+    /// by the whole queued amount regardless of network health. Checking the
+    /// limits against it there would reset a just-opened connection
+    /// deterministically (10 s of queued speech > the 8 s hard limit). Live
+    /// chunks re-apply the limits within 200 ms of the flush ending.
+    private var flushingPendingAudio = false
     /// Backlog (in audio seconds) past which silence is shed, and past
     /// which the connection is reset: ~2.5 s is where added delay stops
     /// being conversational; ~8 s is past saving — a reset plus the
@@ -321,7 +330,14 @@ final class RealtimeTranslationClient: NSObject {
     private func connectOnQueue() {
         guard state == .idle || stateIsClosed else { return }
         guard let url = config.url(endpointTemplate: endpointTemplate) else {
+            // A retry always arrives in .closed, and the didSet collapses
+            // closed→closed — without an explicit notification the retry
+            // loop would silently die here after one attempt, in exactly
+            // the config-error case whose banner tells the user to go fix
+            // Settings (the fix is only picked up by a later reconnect).
+            let wasClosed = stateIsClosed
             state = .closed("Bad endpoint URL")
+            if wasClosed { onStateChange?(state) }
             return
         }
         intentionallyClosed = false
@@ -403,6 +419,8 @@ final class RealtimeTranslationClient: NSObject {
         task = nil
         urlSession?.invalidateAndCancel()
         urlSession = nil
+        inflightAudioBytes = 0
+        warnedBacklog = false
         if state != .idle { state = .closed(nil) }
     }
 
@@ -451,7 +469,7 @@ final class RealtimeTranslationClient: NSObject {
         // connection, and the reconnect queue carries only fresh speech.
         let silent = Self.isPureSilence(pcm16)
         let backlog = Double(inflightAudioBytes) / Self.billedBytesPerSecond
-        if backlog > Self.backlogSoftLimitSeconds {
+        if !flushingPendingAudio, backlog > Self.backlogSoftLimitSeconds {
             if !warnedBacklog {
                 warnedBacklog = true
                 Log.warn("[\(label)] uplink running \(String(format: "%.1f", backlog))s behind — shedding silence until it drains")
@@ -563,8 +581,10 @@ final class RealtimeTranslationClient: NSObject {
         // The queued speech may follow an unsent gap; lead with a quiet
         // splice so it doesn't butt against pre-drop audio in session time
         // (same job as AppModel's resume splice).
+        flushingPendingAudio = true
         sendAppendEvent(Data(count: 14_400)) // 300 ms @ 24 kHz PCM16
         for chunk in queued { sendAppendEvent(chunk.data) }
+        flushingPendingAudio = false
     }
 
     private func sendJSON(_ object: [String: Any]) {
@@ -591,6 +611,11 @@ final class RealtimeTranslationClient: NSObject {
         stopPing()
         task?.cancel(with: .abnormalClosure, reason: nil)
         task = nil
+        // Outstanding completions are identity-rejected once task is nil, so
+        // without this the counter freezes at its peak and Diagnostics pins
+        // a stale "backed up" symptom on a lane with no connection at all.
+        inflightAudioBytes = 0
+        warnedBacklog = false
         state = .closed(reason)
     }
 
@@ -747,6 +772,10 @@ final class RealtimeTranslationClient: NSObject {
         // event gap on an "open" socket means it's half-dead —
         // receive() can hang for minutes without erroring, and a
         // lost pong never invokes the sendPing handler either.
+        // Bench-verify with the pause regime (issue #1's billing check):
+        // if server heartbeats turn out to STOP while no audio is being
+        // appended, this check would reset healthy paused lanes at 75 s —
+        // in that case gate it on time-since-last-append instead.
         let eventGap = Date().timeIntervalSince(lastServerEventAt)
         if eventGap > 75 {
             failConnection("no server events for \(Int(eventGap))s — connection presumed dead")

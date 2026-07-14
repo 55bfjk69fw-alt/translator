@@ -444,11 +444,16 @@ final class AppModel: ObservableObject {
         audioQueue.sync {
             resamplers.removeAll()
             warnedMissingResampler.removeAll()
-            // Fresh converters mean a fresh append timeline: stale pause/tail
-            // state must not splice a pre-rebuild pre-roll into it.
             silenceTailRemaining.removeAll()
-            appendPaused.removeAll()
             preRoll.removeAll()
+            // Every channel restarts PAUSED, not cleared: an engine rebuild
+            // is a real capture gap on a session whose clients survive it,
+            // so the next passing buffer must splice (a speaker talking
+            // through a route change would otherwise butt the two phrase
+            // halves together in session time). Channels without a client
+            // shed the flag on their next buffer; a fresh lazy-opened
+            // session leads with 300 ms of silence, which is harmless.
+            appendPaused = Set(0..<channelCount)
             for channel in 0..<channelCount {
                 resamplers[channel] = StreamResampler(inputSampleRate: rate)
             }

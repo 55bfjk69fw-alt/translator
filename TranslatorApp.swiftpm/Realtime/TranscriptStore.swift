@@ -261,6 +261,18 @@ final class TranscriptStore: ObservableObject {
         contentRevision += 1
     }
 
+    /// Recompute every still-open utterance's pinyin from its full text.
+    /// The streaming throttle can leave the cache a few deltas behind, and
+    /// Stop kills the finalize timer — the only unconditional recompute —
+    /// so without this a stopped conversation could display stale pinyin
+    /// in the post-conversation transcript indefinitely.
+    func flushPinyin() {
+        for (_, index) in openUtteranceIndex where utterances.indices.contains(index) {
+            utterances[index].sourcePinyin = utterances[index].sourceText.pinyin
+            utterances[index].translatedPinyin = utterances[index].translatedText.pinyin
+        }
+    }
+
     /// One WARN per half-empty bubble: these lines are the direct evidence
     /// for "Chinese characters missing" (translation, no source) and for the
     /// server never sending translation for a segment (source, no output).

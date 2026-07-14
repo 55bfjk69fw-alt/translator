@@ -131,6 +131,10 @@ final class AppModel: ObservableObject {
     private var resamplers: [Int: StreamResampler] = [:]
     private var reconnectAttempts: [Int: Int] = [:]
     private var sessionOpenedAt: [Int: Date] = [:]
+    /// The exact still-retrying banner text shown per lane (main thread),
+    /// so recovery can clear its own banner without clobbering an unrelated
+    /// error that replaced it in the meantime.
+    private var reconnectBanner: [Int: String] = [:]
 
     // audioQueue-confined lazy-session state. Sessions open on first
     // detected speech per channel (a powered-off TX is pure silence and
@@ -403,6 +407,10 @@ final class AppModel: ObservableObject {
         uiTimer = nil
         finalizeTimer?.invalidate()
         finalizeTimer = nil
+        // The finalize timer owned the only unconditional pinyin recompute;
+        // killing it with throttled-stale caches would freeze that staleness
+        // into the post-conversation transcript.
+        transcript.flushPinyin()
         engineGraph.onInputChannels = nil
         engineGraph.stop()
         audioQueue.sync {
@@ -415,6 +423,7 @@ final class AppModel: ObservableObject {
         }
         sessionStates.removeAll()
         reconnectAttempts.removeAll()
+        reconnectBanner.removeAll()
         sessionOpenedAt.removeAll()
         pipelineMonitor.clear()
         resetPlaybackState()
@@ -586,6 +595,19 @@ final class AppModel: ObservableObject {
                 switch state {
                 case .open:
                     self.sessionOpenedAt[lane] = Date()
+                    // A recovered session must retract its own scare banner
+                    // promptly — the close-time counter reset can be an hour
+                    // away on a healthy session, and "keeps failing" over a
+                    // green dot reads as a broken app. 5 s of survival is
+                    // the same proof bar the counter reset uses; the text
+                    // equality check keeps this from clobbering an unrelated
+                    // error that replaced the banner meanwhile.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+                        guard let self, self.sessionStates[lane] == .open,
+                              let banner = self.reconnectBanner[lane] else { return }
+                        self.reconnectBanner[lane] = nil
+                        if self.errorBanner == banner { self.errorBanner = nil }
+                    }
                 case .closed:
                     // Only a session that survived a while proves the config
                     // works; resetting the attempt counter on every open let
@@ -648,7 +670,9 @@ final class AppModel: ObservableObject {
             // client still registered — are what bound the retry chain:
             // Stop and idle-close both end it.
             if attempts == 5 {
-                self.errorBanner = "Session for \(self.laneName(lane)) keeps failing — still retrying every 30 s. Check the network; if the network is fine, check the API key and event log."
+                let banner = "Session for \(self.laneName(lane)) keeps failing — still retrying every 30 s. Check the network; if the network is fine, check the API key and event log."
+                self.reconnectBanner[lane] = banner
+                self.errorBanner = banner
             }
             let delay = min(30, pow(2, Double(min(attempts, 5))))
             Log.warn("Reconnecting \(self.laneName(lane)) in \(Int(delay))s (attempt \(attempts))")

@@ -156,7 +156,7 @@ struct MetricsView: View {
     private func overviewCard(_ snapshot: MetricsSnapshot, samples: [PipelineSample]) -> some View {
         let realtime = snapshot.realtimeCostTotal
         let assist = snapshot.assistCostTotal
-        let billedMinutes = realtime / CostMeter.dollarsPerSessionMinute
+        let billedMinutes = realtime / CostMeter.combinedDollarsPerSessionMinute
         let responseMedian = median(snapshot.firstResponses.suffix(20).map(\.seconds))
         let connectMedian = median(snapshot.connects.suffix(20).map(\.seconds))
         let unpriced = snapshot.assistRequests.contains { !$0.failed && $0.estimatedCost == nil }
@@ -215,7 +215,7 @@ struct MetricsView: View {
 
     private func costCard(_ samples: [PipelineSample]) -> some View {
         card("Cost over time") {
-            Text("Cumulative dollars: realtime audio sessions ($\(String(format: "%.3f", CostMeter.dollarsPerSessionMinute))/min) vs prompter chat requests (estimated from token prices).")
+            Text("Cumulative dollars: realtime audio sessions — translation ($\(String(format: "%.3f", CostMeter.dollarsPerSessionMinute))/min) plus source transcription (≈$\(String(format: "%.3f", CostMeter.transcriptionDollarsPerSessionMinute))/min) — vs prompter chat requests (estimated from token prices).")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
             chartOrPlaceholder(samples, "No samples yet.") {

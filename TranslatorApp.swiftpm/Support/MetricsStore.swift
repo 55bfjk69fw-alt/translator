@@ -182,6 +182,12 @@ final class MetricsStore: ObservableObject {
     /// The prompter-cost ledger; never trimmed (unlike the request events).
     private var assistCostTotal: Double = 0
 
+    /// Live prompter total for the status-bar cost estimate. The published
+    /// snapshot's copy only rebuilds while the Metrics tab is visible, so it
+    /// can't feed a live readout; this reads the ledger directly.
+    /// Main-confined like the rest of the store.
+    var assistDollars: Double { assistCostTotal }
+
     /// Per-lane last-seen client counters, for rate-of-change between
     /// samples. Counters restart at zero on every reconnect; the snapshot's
     /// connectionID says which connection a reading belongs to, so a change

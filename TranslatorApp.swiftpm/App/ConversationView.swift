@@ -30,6 +30,16 @@ struct ConversationView: View {
                         .padding(8)
                         .background(.red)
                 }
+                // Money notice on its own row (and color) so an error banner
+                // firing in the same window can't replace it.
+                if let notice = model.costNotice {
+                    Text(notice)
+                        .font(.callout)
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(8)
+                        .background(.indigo)
+                }
                 transcriptList
                     // Dragging the transcript tucks the keyboard away with
                     // the finger (Messages-style); a plain tap on it does

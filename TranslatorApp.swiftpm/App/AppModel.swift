@@ -157,6 +157,10 @@ final class AppModel: ObservableObject {
     /// Cascade cross-lane pieces (pool, shared translator); nil while the
     /// realtime pipeline runs. Main-thread lifecycle; engines capture it.
     private var cascadeContext: CascadeContext?
+    /// The previous conversation's pool teardown; the next cascade Start
+    /// awaits it so the retiring slots' admission share doesn't
+    /// under-size the new pool (main thread).
+    private var lastCascadeTeardown: Task<Void, Never>?
     private var lastVoiceAt: [Int: Date] = [:]
     /// Last logged voiced state per channel (audioQueue-confined) so
     /// speech start/end transitions land in the diagnostics log.
@@ -389,10 +393,14 @@ final class AppModel: ObservableObject {
 
         let pipeline = AppSettings.pipeline
         if pipeline == .cascade {
+            // Pool cap = enabled lanes (§6.1.1's min(enabledLanes, 4)) —
+            // one enabled mic must not warm three extra analyzers.
+            let enabledCount = (0..<channelCount).filter { AppSettings.speakerEnabled($0) }.count
             cascadeContext = CascadeContext(
                 sourceLanguage: AppSettings.cascadeSourceLanguage,
                 targetLanguage: AppSettings.outputLanguage,
-                laneCap: channelCount
+                laneCap: max(1, enabledCount),
+                awaitingPriorTeardown: lastCascadeTeardown
             )
         }
         audioQueue.sync {
@@ -463,8 +471,9 @@ final class AppModel: ObservableObject {
         sessionStates.removeAll()
         noticeTexts.removeAll()
         // Engines are closed above; only now may the pool's analyzers be
-        // finished (terminal) — the one place that ever happens (§7).
-        cascadeContext?.teardown()
+        // finished (terminal) — the one place that ever happens (§7). The
+        // handle lets the next Start wait out the admission share.
+        lastCascadeTeardown = cascadeContext?.teardown()
         cascadeContext = nil
         pipelineMonitor.clear()
         resetPlaybackState()
@@ -601,10 +610,14 @@ final class AppModel: ObservableObject {
     private func makeEngine(lane: Int, apiKey: String) -> any LaneEngine {
         let engine: any LaneEngine
         if activePipeline == .cascade, let context = cascadeContext {
-            let language = AppSettings.outputLanguage
+            // The conversation's LATCHED target language, not a live
+            // settings read — a mid-conversation output-language change
+            // must not give a re-enabled lane a voice mismatching the
+            // translations.
+            let language = context.targetLanguageCode
             let voice = AppleTTSProvider.voice(for: lane, language: language)
             if voice == nil {
-                Log.warn("No usable \(language) voice for lane \(lane) — TTS will fall back to the system default voice")
+                Log.warn("No usable \(language) voice for lane \(lane) — TTS will fall back to a \(language) system voice")
             }
             engine = CascadeLaneEngine(
                 lane: lane,

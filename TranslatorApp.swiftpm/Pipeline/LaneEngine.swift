@@ -79,7 +79,7 @@ enum TranscriptEvent {
 enum LaneMetric {
     case connectSeconds(Double)          // realtime: WS connect
     case firstResponseSeconds(Double)    // realtime: speech → first content
-    case sttFinalizeSeconds(Double)      // cascade: speech-end → final text
+    case sttFinalizeSeconds(Double)      // cascade: close-request → final text (excludes the debounce)
     case translationSeconds(Double)      // cascade: final text → translation
     case ttsFirstAudioSeconds(Double)    // cascade: translation → first PCM
     case endToEndSeconds(Double)         // cascade: speech-end → first PCM

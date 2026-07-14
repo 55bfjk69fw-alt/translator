@@ -22,6 +22,26 @@ final class CascadeSetupModel: ObservableObject {
     /// the hard constraint; the translation row reports the chosen pair.
     @Published private(set) var sourceOptions: [String] = ["zh-Hans"]
 
+    private var voicesObserver: NSObjectProtocol?
+
+    init() {
+        // Voice availability is not stable (downloads, deletions, storage
+        // purges) — refresh the card live when the inventory changes.
+        voicesObserver = NotificationCenter.default.addObserver(
+            forName: AVSpeechSynthesizer.availableVoicesDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.refresh() }
+        }
+    }
+
+    deinit {
+        if let voicesObserver {
+            NotificationCenter.default.removeObserver(voicesObserver)
+        }
+    }
+
     func refresh() {
         Task { await refreshNow() }
     }
@@ -41,17 +61,25 @@ final class CascadeSetupModel: ObservableObject {
         } else {
             sttStatus = .unsupported("\(source) not supported on this device")
         }
-        // Source options: dedupe supported locales down to language codes.
+        // Source options (§8.1): STT-supported locales ∩ translation-
+        // supported languages, deduped to language(+script for zh) codes.
+        // Locale.Language does the code work — a naive prefix(2) mangles
+        // 3-letter codes (yue_CN → "yu") and collapses zh-Hans/zh-Hant.
         let supported = await SpeechTranscriber.supportedLocales
+        let translatable = Set(
+            await LanguageAvailability().supportedLanguages
+                .compactMap { $0.languageCode?.identifier }
+        )
         var seen = Set<String>()
         var options: [String] = []
         for locale in supported {
-            let code = locale.identifier(.bcp47)
-            let language = String(code.prefix(2))
-            if !seen.contains(language) {
-                seen.insert(language)
-                options.append(language == "zh" ? "zh-Hans" : language)
-            }
+            let language = Locale.Language(identifier: locale.identifier(.bcp47))
+            guard let base = language.languageCode?.identifier else { continue }
+            let script = Locale.Language(identifier: language.maximalIdentifier).script?.identifier
+            let code = base == "zh" ? "zh-\(script ?? "Hans")" : base
+            guard !seen.contains(code), translatable.isEmpty || translatable.contains(base) else { continue }
+            seen.insert(code)
+            options.append(code)
         }
         sourceOptions = options.sorted()
         // Translation row.
@@ -120,8 +148,15 @@ final class VoicePreviewPlayer {
             engine.prepare()
             try? engine.start()
         }
+        // play() on a stopped engine raises an ObjC exception — a failed
+        // start (session contention, interruption) must degrade to a
+        // silent no-op, not a crash.
+        guard engine.isRunning else {
+            Log.warn("Voice preview: audio engine failed to start — preview skipped")
+            return
+        }
         player.play()
-        let synth = AppleSpeechSynth(lane: 99, voiceIdentifier: voiceIdentifier, rate: rate)
+        let synth = AppleSpeechSynth(lane: 99, voiceIdentifier: voiceIdentifier, rate: rate, languageHint: language)
         self.synth = synth
         synth.onAudio = { [weak self] _, data in
             DispatchQueue.main.async {
@@ -140,6 +175,9 @@ final class VoicePreviewPlayer {
         synth?.cancelAll()
         synth = nil
         player.stop()
+        // Don't leave hardware IO running for the life of the Settings
+        // view once the sample ends.
+        if engine.isRunning { engine.stop() }
     }
 }
 
@@ -198,9 +236,17 @@ struct CascadePipelineSection: View {
                     voiceRow(channel: channel)
                 }
                 VStack(alignment: .leading) {
-                    Text(String(format: "Speech rate: %.2f×", speechRate))
+                    // AVSpeechUtterance.rate is a normalized 0–1 value,
+                    // so this multiplier is NOT a linear speed factor —
+                    // label it qualitatively and let the preview button
+                    // be the judge.
+                    Text("Speech rate")
                         .font(.callout)
-                    Slider(value: $speechRate, in: 0.7...1.5, step: 0.05)
+                    HStack {
+                        Text("slower").font(.caption2).foregroundStyle(.secondary)
+                        Slider(value: $speechRate, in: 0.7...1.5, step: 0.05)
+                        Text("faster").font(.caption2).foregroundStyle(.secondary)
+                    }
                 }
             }
         } header: {

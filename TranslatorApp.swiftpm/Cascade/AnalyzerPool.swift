@@ -33,6 +33,10 @@ actor AnalyzerPool {
         var cursorSeconds: Double = 0
         var owner: (@Sendable (ResultEvent) -> Void)?
         var harvest: Task<Void, Never>?
+        /// A finalize failed on this slot: an un-finalized region may
+        /// survive its release, so it must never be granted again (its
+        /// leftover results could be delivered to another lane).
+        var suspect = false
 
         init(analyzer: SpeechAnalyzer, transcriber: SpeechTranscriber,
              continuation: AsyncStream<AnalyzerInput>.Continuation) {
@@ -88,7 +92,13 @@ actor AnalyzerPool {
                             )
                         }
                     } catch {
-                        Log.warn("[pool] slot \(slotIndex) results stream ended with error: \(error.localizedDescription)")
+                        // Slot death (§8.2): a dead slot left in the free
+                        // list is a black hole that silently eats every
+                        // Nth utterance — shrink the pool instead. This
+                        // also catches a slot that over-counted discovery
+                        // by failing on its results stream at birth.
+                        Log.warn("[pool] slot \(slotIndex) died (results stream error: \(error.localizedDescription)) — shrinking pool")
+                        await self?.markDead(slotIndex: slotIndex)
                     }
                 }
             } catch {
@@ -140,18 +150,43 @@ actor AnalyzerPool {
         do {
             try await slot.analyzer.finalize(through: cursor)
         } catch {
-            Log.warn("[pool] finalize(through:) failed on slot \(slotIndex): \(error.localizedDescription)")
+            // An un-finalized region may now survive this utterance's
+            // release; quarantine the slot so its leftovers can never be
+            // delivered to another lane (the design-round-4 demux hole).
+            Log.warn("[pool] finalize(through:) failed on slot \(slotIndex) — quarantining: \(error.localizedDescription)")
+            slot.suspect = true
         }
     }
 
-    /// Unbind the owner and grant the slot to the next FIFO waiter.
+    /// Unbind the owner and grant the slot to the next FIFO waiter (or
+    /// retire it if a failed finalize made it suspect).
     func release(slotIndex: Int) {
         guard slots.indices.contains(slotIndex), !tornDown else { return }
         slots[slotIndex].owner = nil
+        if slots[slotIndex].suspect {
+            markDead(slotIndex: slotIndex)
+            return
+        }
         if waiters.isEmpty {
             freeSlots.append(slotIndex)
         } else {
             waiters.removeFirst().resume(returning: slotIndex)
+        }
+    }
+
+    /// Retire a slot: never grant it again; if the whole pool is gone,
+    /// fail pending waiters so lanes surface .failed instead of hanging.
+    private func markDead(slotIndex: Int) {
+        guard slots.indices.contains(slotIndex) else { return }
+        slots[slotIndex].owner = nil
+        slots[slotIndex].suspect = true
+        slots[slotIndex].harvest?.cancel()
+        freeSlots.removeAll { $0 == slotIndex }
+        poolSize = slots.indices.filter { !slots[$0].suspect }.count
+        Log.warn("[pool] slot retired — \(poolSize) live slot(s) remain")
+        if poolSize == 0 {
+            for waiter in waiters { waiter.resume(returning: nil) }
+            waiters.removeAll()
         }
     }
 

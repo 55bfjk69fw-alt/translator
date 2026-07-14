@@ -157,7 +157,10 @@ final class TranscriptStore: ObservableObject {
     /// translation).
     func setCascadeTranslation(lane: Int, utterance: UUID, text: String, isFinal: Bool) {
         guard let index = cascadeIndex(lane: lane, utterance: utterance, allowCreate: !text.isEmpty) else { return }
-        utterances[index].translatedText = text
+        // A final EMPTY translation on a bubble with source text renders
+        // as "—" (translation failed/absent — §7.1's promised affordance).
+        let display = (isFinal && text.isEmpty && !utterances[index].sourceText.isEmpty) ? "—" : text
+        utterances[index].translatedText = display
         utterances[index].lastTranslationActivity = Date()
         utterances[index].lastActivity = Date()
         if isFinal {
@@ -181,6 +184,14 @@ final class TranscriptStore: ObservableObject {
             return index
         }
         guard allowCreate else { return nil }
+        // Never re-create a bubble for a UUID that already exists in the
+        // array (e.g. closed by the safety net before a hung MT job
+        // resolved): duplicate Identifiable IDs are undefined behavior in
+        // SwiftUI's ForEach diffing. Route the late text into the
+        // existing bubble instead.
+        if let existing = utterances.lastIndex(where: { $0.id == utterance }) {
+            return existing
+        }
         var bubble = Utterance(
             laneID: lane,
             segmentation: .explicit,

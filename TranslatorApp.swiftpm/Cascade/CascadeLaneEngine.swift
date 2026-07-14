@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import Translation
 
 /// The on-device cascade lane engine (docs/CASCADE-PIPELINE.md §6–§7):
 /// gate-passed audio → AnalyzerPool slot (STT) → shared AppleTranslator →
@@ -130,7 +131,12 @@ final class CascadeLaneEngine: LaneEngine {
         self.context = context
         self.label = "cascade ch\(lane)"
         self.queue = DispatchQueue(label: "translator.cascade.lane.\(lane)")
-        self.synth = AppleSpeechSynth(lane: lane, voiceIdentifier: voiceIdentifier, rate: speechRate)
+        self.synth = AppleSpeechSynth(
+            lane: lane,
+            voiceIdentifier: voiceIdentifier,
+            rate: speechRate,
+            languageHint: context.targetLanguageCode
+        )
         wireSynth()
         startWorker()
     }
@@ -283,6 +289,11 @@ final class CascadeLaneEngine: LaneEngine {
     /// Set when a close should hand its slot straight to the follow-on
     /// utterance (the 12 s split) instead of releasing it.
     private var settleKeepsSlot = false
+    /// Set by a timed-out settle: the finalize's real final may still be
+    /// in flight, and the next final to arrive on this lane is that
+    /// straggler — swallow it instead of attributing it to a newer
+    /// utterance.
+    private var staleDropUntilFinal = false
 
     // MARK: - Pool worker
 
@@ -337,6 +348,13 @@ final class CascadeLaneEngine: LaneEngine {
         analyzerFormat = readiness.analyzerFormat
         ready = true
         state = .running
+        // Pre-readiness ambient audio older than a few seconds would lead
+        // the NEXT utterance as unrelated context — keep the buffer only
+        // if it's fresh (likely the user's first words after Start).
+        if current == nil, Date().timeIntervalSince(lastLaneBufferAppendAt) > 3 {
+            laneBuffer.removeAll()
+            laneBufferSeconds = 0
+        }
         if readiness.poolSize < 4 {
             Log.info("[\(label)] analyzer pool size \(readiness.poolSize) — lanes share slots per utterance")
         }
@@ -346,6 +364,10 @@ final class CascadeLaneEngine: LaneEngine {
         guard !closed else { return }
         guard granted else {
             slotState = .none
+            // The pool died underneath us (all slots retired).
+            if current != nil {
+                state = .failed("speech model failed — restart the conversation")
+            }
             return
         }
         if current == nil {
@@ -359,8 +381,12 @@ final class CascadeLaneEngine: LaneEngine {
             return
         }
         slotState = .held
-        stats.slotWaits += 1
-        stats.lastSlotWaitSeconds = waitSeconds
+        // Count only genuine contention (an uncontended grant is a few ms
+        // of actor hop) so the Diagnostics "waits" line means something.
+        if waitSeconds > 0.05 {
+            stats.slotWaits += 1
+            stats.lastSlotWaitSeconds = waitSeconds
+        }
         if waitSeconds > 2 {
             state = .degraded("waiting for a speech model — simultaneous speech may lag")
         } else if case .degraded = state {
@@ -378,18 +404,35 @@ final class CascadeLaneEngine: LaneEngine {
 
     private func handleResult(_ event: AnalyzerPool.ResultEvent) {
         guard !closed, var utterance = current else { return }
+        // Trust results only while a slot is legitimately bound: after a
+        // timed-out settle released the slot, a straggler final from the
+        // old range must not land in the next utterance (duplicated
+        // speech) — slotState is .none until re-acquisition, and for the
+        // keep-slot (12 s split) timeout the flag below swallows exactly
+        // the stale final. If the stale final never comes, the next
+        // genuine one is sacrificed and that settle degrades to its
+        // volatile text — graceful, logged, and rare.
+        guard slotState == .held else { return }
+        if staleDropUntilFinal {
+            if event.isFinal { staleDropUntilFinal = false }
+            return
+        }
         if event.isFinal {
             stats.finalChars += event.text.count
-            utterance.finalParts.append(event.text)
-            utterance.volatileText = ""
+            if !event.text.isEmpty {
+                utterance.finalParts.append(event.text)
+                utterance.volatileText = ""
+            }
             current = utterance
             let joined = utterance.finalParts.joined()
+            // An empty final after visible volatiles must not wipe them.
+            let effective = joined.isEmpty ? utterance.volatileText : joined
             if utterance.closeRequestedAt != nil {
                 // The close's finalize delivered — settle now.
-                settleUtterance(finalText: joined, timedOut: false)
+                settleUtterance(finalText: effective, timedOut: false)
             } else if endsWithSentenceEnder(joined) {
                 releaseSubSegment(utterance, finalText: joined)
-            } else {
+            } else if !joined.isEmpty {
                 onTranscript?(.sourceText(utterance: utterance.id, text: joined, isFinal: false))
             }
         } else {
@@ -410,6 +453,7 @@ final class CascadeLaneEngine: LaneEngine {
             stats.lastFinalizeSeconds = seconds
             onMetric?(.sttFinalizeSeconds(seconds))
         }
+        if timedOut { staleDropUntilFinal = true }
         if settleKeepsSlot, slotState == .held {
             // 12 s split: hand the slot straight to the follow-on
             // utterance and flush the audio buffered during the finalize
@@ -440,9 +484,9 @@ final class CascadeLaneEngine: LaneEngine {
         let text = finalText.trimmingCharacters(in: .whitespacesAndNewlines)
         stats.utterancesFinalized += 1
         guard !text.isEmpty else {
-            // Nothing recognized: close the bubble empty-handed only if
-            // one was ever shown.
-            onTranscript?(.sourceText(utterance: utterance.id, text: "", isFinal: true))
+            // Nothing recognized: close the bubble (if volatiles ever
+            // opened one) WITHOUT wiping the text it shows — the store
+            // ignores this event when no bubble exists.
             onTranscript?(.translationText(utterance: utterance.id, text: "", isFinal: true))
             return
         }
@@ -491,8 +535,10 @@ final class CascadeLaneEngine: LaneEngine {
             onTranscript?(.translationText(utterance: job.id, text: "", isFinal: true))
             // A missing pack is stage-fatal but must not kill capture
             // (§8.2): transcription continues, translations show "—".
-            if description.localizedCaseInsensitiveContains("notinstalled")
-                || description.localizedCaseInsensitiveContains("not installed") {
+            // Typed check (TranslationError.notInstalled has a ~= operator
+            // over `any Error`) — matching localizedDescription would
+            // break on non-English device locales.
+            if let error, TranslationError.notInstalled ~= error {
                 translationDead = true
                 onNotice?(.raised(
                     id: "cascade.mt.\(lane)",
@@ -561,11 +607,16 @@ final class CascadeLaneEngine: LaneEngine {
     // MARK: - Helpers
 
     private func convertInput(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
-        guard let format = analyzerFormat ?? StreamResamplerFallbackFormat() else { return nil }
+        guard let format = analyzerFormat ?? fallbackAnalyzerFormat() else { return nil }
         let rate = buffer.format.sampleRate
-        if inputConverter == nil || inputRate != rate {
+        // Rebuild on INPUT rate change (route churn) AND on OUTPUT format
+        // change (readiness swapping the fallback guess for the pool's
+        // real analyzer format) — a converter stuck on the fallback would
+        // feed the analyzer wrong-format audio for the whole
+        // conversation, which fails silently (§2.2).
+        if inputConverter == nil || inputRate != rate || inputConverter?.outputFormat != format {
             if inputConverter != nil {
-                Log.info("[\(label)] input rate changed to \(Int(rate)) Hz — rebuilding STT converter")
+                Log.info("[\(label)] STT converter rebuilt (\(Int(rate)) Hz in → \(Int(format.sampleRate)) Hz out)")
             }
             inputConverter = AVAudioConverter(from: buffer.format, to: format)
             inputRate = rate
@@ -590,14 +641,18 @@ final class CascadeLaneEngine: LaneEngine {
     }
 
     /// Pre-readiness conversions target 16 kHz mono int16 (the measured
-    /// analyzer format) so early buffers are usable once the real format
-    /// arrives; if the real format differs, the pool converts nothing —
-    /// these few buffers are sacrificed and logged.
-    private func StreamResamplerFallbackFormat() -> AVAudioFormat? {
+    /// analyzer format). If the pool's real format differs, the rebuild
+    /// rule above re-converts nothing retroactively — the pre-readiness
+    /// buffers are sacrificed (bounded by the 3 s staleness drop) and the
+    /// converter self-heals for everything after.
+    private func fallbackAnalyzerFormat() -> AVAudioFormat? {
         AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16_000, channels: 1, interleaved: true)
     }
 
+    private var lastLaneBufferAppendAt = Date.distantPast
+
     private func appendToLaneBuffer(_ buffer: AVAudioPCMBuffer) {
+        lastLaneBufferAppendAt = Date()
         laneBuffer.append(buffer)
         laneBufferSeconds += Double(buffer.frameLength) / buffer.format.sampleRate
         while laneBufferSeconds > Self.laneBufferCapSeconds, !laneBuffer.isEmpty {
@@ -606,9 +661,13 @@ final class CascadeLaneEngine: LaneEngine {
         }
     }
 
+    /// Closing quotes/brackets legitimately trail a sentence ender
+    /// (same set TranscriptStore's completeness check skips).
+    private static let trailingClosers: Set<Character> = ["\"", "\u{201D}", "\u{2019}", "'", ")", "）", "」", "』", "]", "】"]
+
     private func endsWithSentenceEnder(_ text: String) -> Bool {
         for char in text.reversed() {
-            if char.isWhitespace { continue }
+            if char.isWhitespace || Self.trailingClosers.contains(char) { continue }
             return Self.sentenceEnders.contains(char)
         }
         return false

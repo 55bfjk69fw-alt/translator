@@ -109,11 +109,19 @@ final class AppleSpeechSynth: SpeechSynth {
     private var currentJob: UUID?
     private var converter: AVAudioConverter?
     private var cancelled = false
+    /// One-deep hold: write()-while-writing on a single synthesizer was
+    /// never probe-validated, so a job arriving while another renders
+    /// (e.g. the prewarm racing the first real utterance) waits here and
+    /// starts on the sentinel buffer of the previous one. The lane engine
+    /// itself never submits two real jobs concurrently.
+    private var pendingJob: (text: String, job: UUID, deliver: Bool)?
+    private let languageHint: String
 
-    init(lane: Int, voiceIdentifier: String, rate: Double) {
+    init(lane: Int, voiceIdentifier: String, rate: Double, languageHint: String) {
         self.voiceIdentifier = voiceIdentifier
         self.rate = AVSpeechUtteranceDefaultSpeechRate * Float(rate)
         self.label = "tts ch\(lane)"
+        self.languageHint = languageHint
         self.queue = DispatchQueue(label: "translator.cascade.tts.\(lane)")
     }
 
@@ -130,16 +138,29 @@ final class AppleSpeechSynth: SpeechSynth {
     private func synthesize(text: String, job: UUID, deliver: Bool) {
         queue.async {
             guard !self.cancelled else { return }
-            self.currentJob = job
-            self.converter = nil
-            let utterance = AVSpeechUtterance(string: text)
-            utterance.voice = AVSpeechSynthesisVoice(identifier: self.voiceIdentifier)
-                ?? AVSpeechSynthesisVoice(language: nil)
-            utterance.rate = self.rate
-            self.synthesizer.write(utterance) { [weak self] buffer in
-                guard let self else { return }
-                self.queue.async { self.handleBuffer(buffer, job: job, deliver: deliver) }
+            if self.currentJob != nil {
+                self.pendingJob = (text, job, deliver)
+                return
             }
+            self.beginRender(text: text, job: job, deliver: deliver)
+        }
+    }
+
+    /// Queue-confined.
+    private func beginRender(text: String, job: UUID, deliver: Bool) {
+        currentJob = job
+        converter = nil
+        let utterance = AVSpeechUtterance(string: text)
+        // Fall back to a TARGET-LANGUAGE voice, never the device-locale
+        // default (a Chinese system voice reading English is worse than
+        // any English compact voice).
+        utterance.voice = AVSpeechSynthesisVoice(identifier: voiceIdentifier)
+            ?? AVSpeechSynthesisVoice(language: languageHint)
+            ?? AVSpeechSynthesisVoice(language: nil)
+        utterance.rate = rate
+        synthesizer.write(utterance) { [weak self] buffer in
+            guard let self else { return }
+            self.queue.async { self.handleBuffer(buffer, job: job, deliver: deliver) }
         }
     }
 
@@ -152,6 +173,10 @@ final class AppleSpeechSynth: SpeechSynth {
         if pcm.frameLength == 0 {
             currentJob = nil
             if deliver { onFinished?(job, nil) }
+            if let pending = pendingJob {
+                pendingJob = nil
+                beginRender(text: pending.text, job: pending.job, deliver: pending.deliver)
+            }
             return
         }
         guard deliver else { return }
@@ -169,6 +194,7 @@ final class AppleSpeechSynth: SpeechSynth {
         queue.async {
             self.cancelled = true
             self.currentJob = nil
+            self.pendingJob = nil
             self.synthesizer.stopSpeaking(at: .immediate)
         }
     }

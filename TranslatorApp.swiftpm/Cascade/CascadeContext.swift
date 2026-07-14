@@ -32,14 +32,21 @@ final class CascadeContext {
     let sourceLocale: Locale
     let sourceLanguage: Locale.Language
     let targetLanguage: Locale.Language
+    /// Raw BCP-47 target code, latched at Start — per-lane voices must be
+    /// resolved against THIS, not a live AppSettings read, or a
+    /// mid-conversation language change plus a lane re-enable yields a
+    /// voice in the new language speaking the old one's text.
+    let targetLanguageCode: String
 
     private let readinessTask: Task<Readiness, Never>
 
-    init(sourceLanguage: String, targetLanguage: String, laneCap: Int) {
+    init(sourceLanguage: String, targetLanguage: String, laneCap: Int,
+         awaitingPriorTeardown priorTeardown: Task<Void, Never>?) {
         let source = Locale.Language(identifier: sourceLanguage)
         let target = Locale.Language(identifier: targetLanguage)
         self.sourceLanguage = source
         self.targetLanguage = target
+        self.targetLanguageCode = targetLanguage
         self.sourceLocale = Locale(identifier: sourceLanguage)
         self.translator = AppleTranslator(source: source, target: target)
         let pool = self.pool
@@ -47,8 +54,11 @@ final class CascadeContext {
         // Discovery starts immediately; lanes await ready() before their
         // first acquire, so Start stays synchronous and readiness resolves
         // within the .starting window (sub-second when assets are
-        // installed).
+        // installed). A quick Stop→Start must first wait out the previous
+        // conversation's pool teardown, or the old slots' admission share
+        // under-sizes (even zero-sizes) this pool.
         self.readinessTask = Task {
+            if let priorTeardown { await priorTeardown.value }
             async let installed = AppleTranslator.isAvailable(source: source, target: target)
             let size = await pool.build(locale: locale, cap: laneCap)
             let format = await pool.analyzerFormat
@@ -67,10 +77,12 @@ final class CascadeContext {
 
     /// Stop-only teardown: finishes every pool slot (terminal) and ends
     /// the translator's worker. Lane engines are closed first by AppModel,
-    /// so nothing submits after this.
-    func teardown() {
+    /// so nothing submits after this. Returns the task the NEXT
+    /// conversation's context must await before building its pool.
+    @discardableResult
+    func teardown() -> Task<Void, Never> {
         translator.cancelAll()
-        Task { [pool] in
+        return Task { [pool] in
             await pool.teardown()
         }
     }

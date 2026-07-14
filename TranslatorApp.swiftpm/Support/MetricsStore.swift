@@ -117,7 +117,7 @@ struct MetricsSnapshot {
 /// a hardcoded snapshot — update it when prices move.
 enum AssistPricing {
     private static let perMillionTokens: [String: (input: Double, output: Double)] = [
-        "gpt-5": (1.25, 10.00),          // also matches gpt-5.x / gpt-5-chat-*
+        "gpt-5": (1.25, 10.00),          // also matches gpt-5-chat-*; dotted generations (gpt-5.x) normalize to their tier entry
         "gpt-5-mini": (0.25, 2.00),
         "gpt-5-nano": (0.05, 0.40),
         "gpt-4.1": (2.00, 8.00),
@@ -131,7 +131,18 @@ enum AssistPricing {
         "o1": (15.00, 60.00),
     ]
 
+    /// Dotted gpt-5 generations (gpt-5.4-mini) share their tier's pricing, but
+    /// "gpt-5.4-mini".hasPrefix("gpt-5-mini") is false, so without collapsing
+    /// the leading "gpt-5.<digits>" to "gpt-5" they'd stop at the full-size
+    /// gpt-5 entry — a ~5x/~25x overestimate for mini/nano.
+    private static func normalized(_ model: String) -> String {
+        guard let generation = model.range(of: "^gpt-5\\.[0-9]+", options: .regularExpression)
+        else { return model }
+        return "gpt-5" + model[generation.upperBound...]
+    }
+
     static func estimatedDollars(model: String, promptTokens: Int, completionTokens: Int) -> Double? {
+        let model = normalized(model)
         let match = perMillionTokens
             .filter { model.hasPrefix($0.key) }
             .max { $0.key.count < $1.key.count }

@@ -33,6 +33,7 @@ final class CascadeLaneEngine: LaneEngine {
         case waitReady
         case acquire
         case feed(AVAudioPCMBuffer)
+        case padSilence
         case finalize
         case release
         case teardownLane
@@ -78,6 +79,11 @@ final class CascadeLaneEngine: LaneEngine {
         var finalParts: [String] = []
         var lastVoicedNowAt: Date
         var closeRequestedAt: Date?
+        /// Field-debugging counters: whether STT results flowed at all for
+        /// this utterance is the first question every misbehavior report
+        /// asks.
+        var volatileEvents = 0
+        var finalEvents = 0
     }
     private var current: Utterance?
 
@@ -124,7 +130,11 @@ final class CascadeLaneEngine: LaneEngine {
     private static let fastCloseSeconds: TimeInterval = 0.4
     private static let slowCloseSeconds: TimeInterval = 0.75
     private static let maxUtteranceSeconds: TimeInterval = 12
-    private static let finalWaitSeconds: TimeInterval = 2.5
+    /// Bounded wait for the close's final result before settling with the
+    /// volatile text (~95% identical on short utterances per research).
+    /// Deliberately short: waiting long buys little accuracy and costs
+    /// every utterance's latency when finalization is slow.
+    private static let finalWaitSeconds: TimeInterval = 1.2
 
     init(lane: Int, context: CascadeContext, voiceIdentifier: String, speechRate: Double) {
         self.lane = lane
@@ -260,6 +270,10 @@ final class CascadeLaneEngine: LaneEngine {
         settleKeepsSlot = keepSlot && slotState == .held
         Log.info("[\(label)] utterance close (\(reason))")
         if slotState == .held {
+            // Silence pad first: end-of-speech evidence + input progress
+            // past the boundary, without which the transcriber was
+            // observed never flushing its finalization on-device.
+            commands.yield(.padSilence)
             commands.yield(.finalize)
         }
         // Bounded wait for the final result: if the analyzer recognized
@@ -269,8 +283,11 @@ final class CascadeLaneEngine: LaneEngine {
         queue.asyncAfter(deadline: .now() + Self.finalWaitSeconds) { [weak self] in
             guard let self, let stuck = self.current, stuck.id == id,
                   stuck.closeRequestedAt != nil else { return }
-            Log.warn("[\(self.label)] no final result within \(Self.finalWaitSeconds)s — settling with volatile text")
             let text = (stuck.finalParts + [stuck.volatileText]).joined()
+            // The result counts are the diagnosis: 0V/0F = the analyzer
+            // returned NOTHING for this utterance (wedged slot or format
+            // problem); NV/0F = volatiles flow but finalize never flushes.
+            Log.warn("[\(self.label)] no final within \(Self.finalWaitSeconds)s — settling with \(text.count) chars of volatile text (results: \(stuck.volatileEvents)V/\(stuck.finalEvents)F)")
             self.settleUtterance(finalText: text, timedOut: true)
         }
     }
@@ -318,6 +335,8 @@ final class CascadeLaneEngine: LaneEngine {
                     self.queue.async { self.slotGranted(granted != nil, waitSeconds: wait) }
                 case .feed(let buffer):
                     if let slot { await self.context.pool.feed(slotIndex: slot, buffer: buffer) }
+                case .padSilence:
+                    if let slot { await self.context.pool.feedSilence(slotIndex: slot, seconds: 0.6) }
                 case .finalize:
                     if let slot { await self.context.pool.finalizeCurrent(slotIndex: slot) }
                 case .release:
@@ -434,6 +453,7 @@ final class CascadeLaneEngine: LaneEngine {
         }
         if event.isFinal {
             stats.finalChars += event.text.count
+            utterance.finalEvents += 1
             if !event.text.isEmpty {
                 utterance.finalParts.append(event.text)
                 utterance.volatileText = ""
@@ -452,6 +472,7 @@ final class CascadeLaneEngine: LaneEngine {
             }
         } else {
             stats.volatileChars += event.text.count
+            utterance.volatileEvents += 1
             utterance.volatileText = event.text
             current = utterance
             let display = (utterance.finalParts + [event.text]).joined()
@@ -504,6 +525,9 @@ final class CascadeLaneEngine: LaneEngine {
     private func finishUtterance(_ utterance: Utterance, finalText: String) {
         let text = finalText.trimmingCharacters(in: .whitespacesAndNewlines)
         stats.utterancesFinalized += 1
+        if text.isEmpty {
+            Log.warn("[\(label)] utterance produced NO text (results: \(utterance.volatileEvents)V/\(utterance.finalEvents)F) — nothing recognized, or STT results are not flowing on this slot")
+        }
         guard !text.isEmpty else {
             // Nothing recognized: close the bubble (if volatiles ever
             // opened one) WITHOUT wiping the text it shows — the store

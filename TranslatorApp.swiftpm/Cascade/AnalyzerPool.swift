@@ -143,12 +143,38 @@ actor AnalyzerPool {
     /// waits for the final to arrive on its onResult (bounded by its own
     /// timeout) and then calls release() — the wait lives where the
     /// knowledge is.
+    /// Feed zero-filled audio to a held slot: end-of-speech evidence plus
+    /// input progress past the finalize boundary, which streaming ASR
+    /// needs to flush a finalization (first field test: closes starved of
+    /// post-boundary input produced no finals). The pad is finalized with
+    /// everything else, so no dangling region survives release.
+    func feedSilence(slotIndex: Int, seconds: Double) {
+        guard slots.indices.contains(slotIndex), !tornDown,
+              let format = analyzerFormat else { return }
+        let frames = AVAudioFrameCount(seconds * format.sampleRate)
+        guard frames > 0,
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return }
+        buffer.frameLength = frames
+        if let channel = buffer.int16ChannelData {
+            memset(channel[0], 0, Int(frames) * MemoryLayout<Int16>.size)
+        } else if let channel = buffer.floatChannelData {
+            memset(channel[0], 0, Int(frames) * MemoryLayout<Float>.size)
+        }
+        slots[slotIndex].continuation.yield(AnalyzerInput(buffer: buffer))
+        slots[slotIndex].cursorSeconds += seconds
+    }
+
     func finalizeCurrent(slotIndex: Int) async {
         guard slots.indices.contains(slotIndex), !tornDown else { return }
         let slot = slots[slotIndex]
-        let cursor = CMTime(seconds: slot.cursorSeconds, preferredTimescale: 48_000)
         do {
-            try await slot.analyzer.finalize(through: cursor)
+            // nil = finalize everything fed so far. The first field test
+            // used a CMTime built from our fed-duration cursor and got NO
+            // finals — whether from a timeline mismatch or lookahead
+            // starvation, nil sidesteps the cursor-accounting question
+            // entirely and still satisfies the full-cursor close rule
+            // (docs/CASCADE-PIPELINE.md §6.1) by definition.
+            try await slot.analyzer.finalize(through: nil)
         } catch {
             // An un-finalized region may now survive this utterance's
             // release; quarantine the slot so its leftovers can never be

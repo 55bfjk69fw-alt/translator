@@ -114,7 +114,10 @@ URLs inline. Anything marked **UNVERIFIED** lands in the hardware probe
   ([docs](https://developer.apple.com/documentation/speech/speechanalyzer),
   [WWDC25 277](https://developer.apple.com/videos/play/wwdc2025/277/))
 - **zh_CN is a first-class locale** (42 supported locales incl. zh_CN,
-  zh_TW, zh_HK, yue_CN, community-dumped from the API since beta 3).
+  zh_TW, zh_HK, yue_CN, community-dumped from the API since beta 3;
+  the CP0 probe measured 30 on the target device's build with zh_CN
+  present and installed — counts vary by OS build, the on-device
+  number governs).
   Match via `SpeechTranscriber.supportedLocale(equivalentTo:)`, not string
   comparison (API reports underscore forms). Confidence: high.
 - Assets: downloaded programmatically via
@@ -266,9 +269,10 @@ it (player nodes, ducking, transcript UI) is reused by both pipelines.
 
 Cross-lane pieces owned by a new `CascadeContext` (created per
 conversation when the cascade is selected): the shared
-`TranslationSession` (one per language pair, lanes share it), the shared
-TTS render queue (if the probe forces serialization), and the analyzer
-budget tracker (§6.1 degraded mode).
+`TranslationSession` (one per language pair, lanes share it), the
+**AnalyzerPool** (§6.1.1), and — retained as a contingency only, since
+the probe showed 2-wide `write()` renders overlap (§10) but 3–4-wide is
+unverified — a shared TTS render queue.
 
 ## 4. Minimum OS: iOS 26
 
@@ -618,10 +622,14 @@ identically across slots (locale from the source-language setting via
   start; expected 16 kHz mono) with a dedicated `AVAudioConverter`,
   rebuilt whenever the incoming `buffer.format` changes (§5.1 rule —
   route churn changes the hardware rate, and a stale converter here
-  fails *silently*). Buffers are wrapped in `AnalyzerInput` and yielded
-  into the stream's continuation. Non-speech buffers are *not* sent
-  (unlike realtime's silence-substitution), so the analyzer's audio
-  clock only advances during speech and idle lanes cost nothing.
+  fails *silently*; the probe measured the analyzer format as 16 kHz
+  mono int16). Converted buffers are wrapped in `AnalyzerInput` and
+  yielded into the **acquired slot's** continuation while the lane holds
+  one; between acquisitions — waiting under contention, or the
+  post-release hangover tail — they land in the lane-side buffer
+  (§6.1.1) and burst-feed on the next acquisition. Non-speech buffers
+  are *not* sent (unlike realtime's silence-substitution), so slots only
+  advance during speech and idle lanes cost nothing.
 - **Segmentation** (this is where cascade latency is won or lost): an
   utterance opens on the first `pass && voicedNow` buffer after quiet.
   The close trigger is a **debounce of `voicedNow` going false** — the
@@ -629,18 +637,26 @@ identically across slots (locale from the source-language setting via
   flag. The hangover (1.5 s worn / 2.0 s ambient) exists to keep the
   *gate* open across word gaps and MUST NOT sit in the cascade's
   response path; audio keeps flowing through the hangover tail (`pass`
-  stays true), so if the debounce fires early and the speaker resumes,
-  the trailing audio was captured and the next utterance opens cleanly
-  for *capture*. The quality trade-off is acknowledged, not free:
+  stays true) — into the held slot until close, and into the lane-side
+  buffer after release (§6.1.1) — so if the debounce fires early and
+  the speaker resumes, the trailing audio was captured (analyzed at the
+  next acquisition as leading context) and the next utterance opens
+  cleanly. The quality trade-off is acknowledged, not free:
   a spurious close still splits one thought into two context-free MT
   calls and two TTS jobs (Apple MT takes no context), so the debounce
   is **two-tier**, reusing the codebase's `finalizeSentenceTimeout`
   precedent: **400 ms when the accumulated volatile text already ends
   in a sentence ender, 750 ms otherwise** (mid-sentence hesitations
   routinely exceed 400 ms). Both constants are probe-tuned (item 6
-  measures exactly this). On close: `endUtterance()` →
-  `finalize(through: lastSpeechTime)`, forcing the segment's final
-  result without ending the session.
+  measures exactly this). On close: `endUtterance()` → finalize through
+  **everything fed to the slot so far** (the full cursor — deliberately
+  NOT `lastSpeechTime`): the segment's final result is forced without
+  ending the session, and no un-finalized volatile region ever remains
+  on a slot at release — the precondition that makes §6.1.1's
+  one-owner-at-a-time result demux safe. The few hundred ms of
+  already-fed tail audio inside the finalized range is trailing
+  near-silence; the rest of the tail arrives post-release and buffers
+  lane-side.
   Two forced-split rules bound utterance length independent of the VAD:
   1. **Punctuation sub-segmentation** (accelerator): when a *final*
      result arrives mid-utterance ending in sentence punctuation
@@ -674,8 +690,8 @@ identically across slots (locale from the source-language setting via
   transition); the pool itself is unaffected — lanes are lightweight
   (converter + synth + segmentation state), the analyzers live in the
   pool.
-- **Warm-up**: `prepareToAnalyze(in:)` for every enabled lane at Start
-  (halves finalize latency; ANE-state variance noted in research).
+- **Warm-up**: pool slots are pre-warmed at Start (§6.1.1). Measured
+  effect (§10): finalize p50 0.08 s → 0.03 s.
 - **Assets**: `AssetInventory` request at setup time with `Progress`
   surfaced in the setup card (§8.1); `.assetUnavailable` at Start →
   banner pointing at the card.
@@ -688,12 +704,15 @@ with 3 concurrent lanes), so a lane that waits for a slot and then
 burst-feeds its buffered audio catches up in well under a second.
 
 - **Discovery at Start**: create-and-start identical zh slots one at a
-  time up to `min(enabledLanes, 4)`, catching the admission error
-  (`SFSpeechErrorDomain` code 16, "Maximum number of simultaneous
-  requests reached" — the probe's exact observed failure). The count
-  that succeeds is the pool size N (measured: 3). This keeps Start-time
-  failure deterministic and turns "how many does this device allow"
-  into a runtime measurement instead of a constant.
+  time up to `min(enabledLanes, 4)`, catching the admission error. The
+  probe observed `SFSpeechErrorDomain` code 16 ("Maximum number of
+  simultaneous requests reached"); Apple publishes no raw values for
+  `SFSpeechError.Code`, so equating code 16 with the documented
+  `insufficientResources` case is unconfirmed — discovery therefore
+  matches on the error DOMAIN and logs the code, depending on neither
+  name. The count that succeeds is the pool size N (measured: 3). This
+  keeps Start-time behavior deterministic and turns "how many does this
+  device allow" into a runtime measurement instead of a constant.
 - **Slots**: long-lived for the conversation, pre-warmed with
   `prepareToAnalyze(in:)`, each with its own input continuation, its own
   results-harvest task, and a running **time cursor** (`CMTime`) that
@@ -702,19 +721,25 @@ burst-feeds its buffered audio catches up in well under a second.
   and final results to the slot's current owner.
 - **Acquisition**: a lane acquires a slot at utterance open (first
   `pass && voicedNow` buffer) and releases it after `endUtterance()` →
-  `finalize(through: cursor)` delivers the final result. The utterance
+  `finalize(through: cursor)` delivers the final result — where the
+  cursor is the FULL fed timeline (§6.1's close rule), so release never
+  leaves an un-finalized volatile region on the slot; that invariant is
+  what makes one-owner demux safe across owner switches. The utterance
   occupies a contiguous range on the slot's timeline; the cursor carries
   across acquisitions (finalize-through does not end the session).
   Acquisition is FIFO by utterance start.
 - **Contention** (all N slots busy — a 4th simultaneous speaker): the
   lane buffers its converted audio (bounded at ~30 s, the realtime
-  pre-open queue's bound) and burst-feeds on acquisition; at ≥25× real
-  time the backlog clears in <1 s, so the listener experiences a
-  sub-second extra delay on the *fourth* concurrent voice — a rarity the
-  gate's bleed rejection already makes rarer. The lane reports
+  pre-open queue's bound) and burst-feeds on acquisition. Typical
+  contention is brief — a slot frees whenever any in-flight utterance
+  finalizes (~0.1 s measured), so waits are bounded by the remaining
+  length of someone else's utterance and backlogs are seconds of audio
+  clearing in well under a second at the measured ≥25× rate. Worst case
+  (full 30 s buffer): ~1.2–1.5 s of catch-up — and that rate is one
+  device on clean looped audio, so Diagnostics counts every wait and
+  its duration rather than trusting the number. The lane reports
   `.degraded("waiting for a speech model — simultaneous speech may
-  lag")` only if the wait itself exceeds 2 s; Diagnostics counts waits
-  and their durations either way.
+  lag")` only if the wait itself exceeds 2 s.
 - **N ≥ enabled lanes** (fewer mics, or a future OS raising the limit):
   the same code path simply never contends — no separate "direct"
   mode.
@@ -978,8 +1003,9 @@ to the paid pipeline.
 
 | Failure | Behavior |
 | --- | --- |
-| Analyzer throws `insufficientResources` at open | Pooled degraded mode (§6.1), lane state `.degraded`, banner once |
-| Analyzer dies mid-conversation | Recreate once (same slot); second death → lane `.failed`, other lanes unaffected |
+| Admission error while sizing the pool at Start | Normal and silent — that IS the pool-sizing mechanism (§6.1.1): no banner, no `.degraded`; matched by error domain with the code logged (the named-case identity is unconfirmed) |
+| A pool slot dies mid-conversation | Recreate once (fresh analyzer, cursor reset, owner re-acquires); repeated death shrinks the pool by one and logs — no lane fails, the cost is shared contention |
+| A lane waits > 2 s for a slot | `.degraded("waiting for a speech model — simultaneous speech may lag")`; Diagnostics counts every wait regardless |
 | `.notInstalled` from translate (pack deleted) | Stage fatal: transcription continues, translation column shows "—", banner → setup card |
 | TTS job error / voice vanished | Job's `onFinished(error:)` → skip audio for that utterance, log; voice re-validation at next Start |
 | Anything fatal in a lane | Lane isolates (existing per-lane philosophy); Stop not required |
@@ -1071,13 +1097,14 @@ expectations.
    is done and re-reviewed. Throughput: each run transcribed 10.8 s of
    audio in ~0.3–0.4 s (≥25× real time even 3-wide), which is what makes
    pool contention effectively invisible (burst catch-up < 1 s).
-3. **Concurrent `write()`: renders overlap.** Two synthesizers rendered
-   simultaneously with complete buffer sets (457/469 buffers). The
-   serial-vs-concurrent wall-clock comparison (0.74 s vs 0.11 s) is
-   contaminated by voice warm-up in the serial baseline, but the
-   correctness conclusion stands: **per-lane synthesizers, no shared
-   render queue needed.** Tingting's `write()` format: 22 050 Hz, mono,
-   float32 — the sniff-and-convert rule earns its keep.
+3. **Concurrent `write()`: 2-wide renders overlap.** Two synthesizers
+   rendered simultaneously with complete buffer sets (457/469 buffers).
+   The serial-vs-concurrent wall-clock comparison (0.74 s vs 0.11 s) is
+   contaminated by voice warm-up in the serial baseline, and 3–4-wide
+   was not tested — so the conclusion is exactly this: per-lane
+   synthesizers proceed as the design, with §6.3's serial-render
+   fallback retained as the contingency. Tingting's `write()` format:
+   22 050 Hz, mono, float32 — the sniff-and-convert rule earns its keep.
 4. **zh punctuation: present but inconsistent.** 。 and ？ appeared, but
    several sentence boundaries surfaced as `，` and the final sentence
    ended unpunctuated. The transcriber also normalizes ("上午十点" →
@@ -1115,8 +1142,9 @@ expectations.
   exercised with induced network loss.
 - **Gate between CP1 and CP2** — TRIGGERED and SATISFIED: probe item 2
   admitted 3 of 4 lanes, and §6.1.1 is the resulting pooled-mode design
-  pass (slots, cursors, FIFO acquisition, burst catch-up), re-reviewed
-  with the probe numbers in hand.
+  pass (slots, cursors, FIFO acquisition, burst catch-up), taken through
+  the same adversarial review loop as the rest of this document before
+  CP2 work began.
 - **CP2 — Apple cascade**: providers, CascadeLaneEngine, TranscriptStore
   changes (§7.1), settings + setup card + per-lane voices. First real
   conversations; latency table (§7) validated and filled in.
@@ -1146,7 +1174,9 @@ expectations.
 | Cascade exempt from idle-close, eager open at Start | Analyzer close is terminal; reopen re-pays seconds of warm-up on the first post-lull utterance to save $0 |
 | Engines own format self-healing (sniff `buffer.format` per send) | Route churn changes the hardware rate mid-conversation; a stale STT converter fails silently — AppModel's route-change resampler rebuild moves inside the seam it can no longer see into |
 | Utterance provenance flag in TranscriptStore | Quiet-timeout machinery (finalizeStale, reopen, sentence fast path) applied to explicitly-finalized cascade bubbles double-finalizes and truncates; the two segmentation regimes must not touch each other's utterances |
-| 12 s max-utterance hard split | Ambient-mode chatter can hold the VAD open for minutes; punctuation (unverified for zh) must stay an accelerator, so a duration bound is the only guaranteed mid-speech release |
+| 12 s max-utterance hard split | Ambient-mode chatter can hold the VAD open for minutes; punctuation (inconsistent for zh per the probe) must stay an accelerator, so a duration bound is the only guaranteed mid-speech release |
+| AnalyzerPool as the primary STT topology, sized at runtime | Measured: the target iPad admits 3 simultaneous analyses for 4 lanes; discovery-at-Start turns an undocumented device-dependent limit into a measurement, N ≥ lanes degenerates to static binding with no second code path, and ≥25× real-time throughput makes contention a sub-second event |
+| Slot release finalizes through the FULL fed cursor | A `lastSpeechTime` finalize would leave the hangover tail un-finalized on the slot at owner switch, mis-attributing its late results to the next lane — the one hole in the one-owner demux argument (review round 4) |
 
 ## 13. Sources
 

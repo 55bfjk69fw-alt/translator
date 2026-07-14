@@ -139,6 +139,10 @@ final class AppModel: ObservableObject {
     /// so recovery can clear its own banner without clobbering an unrelated
     /// error that replaced it in the meantime.
     private var reconnectBanner: [Int: String] = [:]
+    /// Whether the lane's last close was the client's backlog reset (main
+    /// thread) — picks the saturated-uplink banner wording over the generic
+    /// connection-failure one.
+    private var lastCloseWasBacklog: [Int: Bool] = [:]
 
     // audioQueue-confined lazy-session state. Sessions open on first
     // detected speech per channel (a powered-off TX is pure silence and
@@ -441,8 +445,14 @@ final class AppModel: ObservableObject {
         finalizeTimer = nil
         // The finalize timer owned the only unconditional pinyin recompute;
         // killing it with throttled-stale caches would freeze that staleness
-        // into the post-conversation transcript.
+        // into the post-conversation transcript. Twice: once now, and once
+        // after the clients' 3 s close-drain, whose late deltas (delta
+        // callbacks are deliberately not identity-guarded) land after the
+        // first pass with only the throttled recompute left.
         transcript.flushPinyin()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) { [weak self] in
+            self?.transcript.flushPinyin()
+        }
         engineGraph.onInputChannels = nil
         engineGraph.stop()
         audioQueue.sync {
@@ -459,6 +469,7 @@ final class AppModel: ObservableObject {
         sessionStates.removeAll()
         reconnectAttempts.removeAll()
         reconnectBanner.removeAll()
+        lastCloseWasBacklog.removeAll()
         sessionOpenedAt.removeAll()
         pipelineMonitor.clear()
         resetPlaybackState()
@@ -676,12 +687,21 @@ final class AppModel: ObservableObject {
                         self.reconnectBanner[lane] = nil
                         if self.errorBanner == banner { self.errorBanner = nil }
                     }
-                case .closed:
+                case .closed(let reason):
                     // Only a session that survived a while proves the config
                     // works; resetting the attempt counter on every open let
                     // an open-then-instant-reject loop retry forever.
+                    // A backlog reset is the exception: those sessions live
+                    // 10+ s by construction (the backlog takes that long to
+                    // grow), so forgiving them pinned the backoff at 2 s and
+                    // kept the banner unreachable on a saturated uplink —
+                    // the attempt counter must keep climbing there so the
+                    // cadence escalates to 30 s and the user gets told.
+                    let backlogReset = reason?.hasPrefix(RealtimeTranslationClient.backlogResetReasonPrefix) == true
+                    self.lastCloseWasBacklog[lane] = backlogReset
                     if let openedAt = self.sessionOpenedAt.removeValue(forKey: lane),
-                       Date().timeIntervalSince(openedAt) >= 5 {
+                       Date().timeIntervalSince(openedAt) >= 5,
+                       !backlogReset {
                         self.reconnectAttempts[lane] = 0
                     }
                     self.scheduleReconnectIfNeeded(lane: lane)
@@ -738,7 +758,10 @@ final class AppModel: ObservableObject {
             // client still registered — are what bound the retry chain:
             // Stop and idle-close both end it.
             if attempts == 5 {
-                let banner = "Session for \(self.laneName(lane)) keeps failing — still retrying every 30 s. Check the network; if the network is fine, check the API key and event log."
+                let name = self.laneName(lane)
+                let banner = self.lastCloseWasBacklog[lane] == true
+                    ? "The network can't keep up with \(name)'s audio — translations will lag and arrive in bursts until the connection improves."
+                    : "Session for \(name) keeps failing — still retrying every 30 s. Check the network; if the network is fine, check the API key and event log."
                 self.reconnectBanner[lane] = banner
                 self.errorBanner = banner
             }

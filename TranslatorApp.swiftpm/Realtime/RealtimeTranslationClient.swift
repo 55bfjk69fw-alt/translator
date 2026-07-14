@@ -91,12 +91,28 @@ final class RealtimeTranslationClient: NSObject {
     /// deterministically (10 s of queued speech > the 8 s hard limit). Live
     /// chunks re-apply the limits within 200 ms of the flush ending.
     private var flushingPendingAudio = false
+    /// Bytes still undrained from the last flush, decayed to track the live
+    /// counter as completions land. The hard reset measures growth ABOVE
+    /// this residue: a flush legitimately parks up to ~10 s in URLSession's
+    /// buffer, and a fresh TCP connection needs seconds — not the 200 ms to
+    /// the first live chunk — to drain it even on a healthy link. Resetting
+    /// on the residue would discard every replay a long outage queues, then
+    /// re-queue and loop. The silence-shedding soft limit stays on the TOTAL
+    /// backlog: not adding load while a burst drains is exactly right.
+    private var flushResidualBytes = 0
     /// Backlog (in audio seconds) past which silence is shed, and past
     /// which the connection is reset: ~2.5 s is where added delay stops
     /// being conversational; ~8 s is past saving — a reset plus the
     /// fresh-speech reconnect queue recovers faster than draining would.
     private static let backlogSoftLimitSeconds = 2.5
     private static let backlogHardLimitSeconds = 8.0
+    /// Shared with AppModel: a close whose reason starts with this is the
+    /// backlog reset above — a session that "survived ≥5 s" this way proves
+    /// only that the uplink is slow, so it must not forgive the reconnect
+    /// attempt counter (that forgiveness pinned the backoff at 2 s and made
+    /// the still-retrying banner unreachable on exactly the degradation the
+    /// user most needs told about).
+    static let backlogResetReasonPrefix = "outbound backlog"
     /// When audio was last appended (queue-confined). With gate-closed
     /// pauses upstream, a quiet lane appends nothing for minutes; the ping
     /// tick sends one silent chunk past this age so intermediaries can't
@@ -346,6 +362,7 @@ final class RealtimeTranslationClient: NSObject {
         // Late completions from the old task are identity-rejected, so the
         // backlog counter restarts with the connection.
         inflightAudioBytes = 0
+        flushResidualBytes = 0
         warnedBacklog = false
         connectionID = UUID()
         // Each connection is a fresh billed session server-side: elapsed_ms
@@ -420,6 +437,7 @@ final class RealtimeTranslationClient: NSObject {
         urlSession?.invalidateAndCancel()
         urlSession = nil
         inflightAudioBytes = 0
+        flushResidualBytes = 0
         warnedBacklog = false
         if state != .idle { state = .closed(nil) }
     }
@@ -468,19 +486,23 @@ final class RealtimeTranslationClient: NSObject {
         // silence is dropped first; a hopeless backlog resets the
         // connection, and the reconnect queue carries only fresh speech.
         let silent = Self.isPureSilence(pcm16)
-        let backlog = Double(inflightAudioBytes) / Self.billedBytesPerSecond
-        if !flushingPendingAudio, backlog > Self.backlogSoftLimitSeconds {
-            if !warnedBacklog {
-                warnedBacklog = true
-                Log.warn("[\(label)] uplink running \(String(format: "%.1f", backlog))s behind — shedding silence until it drains")
-            }
-            if silent {
-                stats.chunksShed += 1
-                return
-            }
-            if backlog > Self.backlogHardLimitSeconds {
-                failConnection("outbound backlog \(Int(backlog))s — uplink can't keep up; resetting for fresh audio")
-                return
+        if !flushingPendingAudio {
+            flushResidualBytes = min(flushResidualBytes, inflightAudioBytes)
+            let backlog = Double(inflightAudioBytes) / Self.billedBytesPerSecond
+            let growth = Double(inflightAudioBytes - flushResidualBytes) / Self.billedBytesPerSecond
+            if backlog > Self.backlogSoftLimitSeconds {
+                if !warnedBacklog {
+                    warnedBacklog = true
+                    Log.warn("[\(label)] uplink running \(String(format: "%.1f", backlog))s behind — shedding silence until it drains")
+                }
+                if silent {
+                    stats.chunksShed += 1
+                    return
+                }
+                if growth > Self.backlogHardLimitSeconds {
+                    failConnection("\(Self.backlogResetReasonPrefix) grew \(Int(growth))s — uplink can't keep up; resetting for fresh audio")
+                    return
+                }
             }
         }
         stats.audioChunksSent += 1
@@ -585,6 +607,7 @@ final class RealtimeTranslationClient: NSObject {
         sendAppendEvent(Data(count: 14_400)) // 300 ms @ 24 kHz PCM16
         for chunk in queued { sendAppendEvent(chunk.data) }
         flushingPendingAudio = false
+        flushResidualBytes = inflightAudioBytes
     }
 
     private func sendJSON(_ object: [String: Any]) {
@@ -611,10 +634,24 @@ final class RealtimeTranslationClient: NSObject {
         stopPing()
         task?.cancel(with: .abnormalClosure, reason: nil)
         task = nil
+        // Audio still in flight was counted at hand-off but died with the
+        // socket — the server never bills what it never received, so
+        // retract it from the billed estimate (elapsed_ms keeps the floor
+        // honest; the correction can only move the estimate down).
+        if inflightAudioBytes > 0 {
+            stats.audioBytesSent = max(0, stats.audioBytesSent - inflightAudioBytes)
+            let corrected = max(maxElapsedMs / 1000.0,
+                                Double(stats.audioBytesSent) / Self.billedBytesPerSecond)
+            if corrected < reportedBilledSeconds {
+                onBilledSeconds?(corrected - reportedBilledSeconds)
+                reportedBilledSeconds = corrected
+            }
+        }
         // Outstanding completions are identity-rejected once task is nil, so
         // without this the counter freezes at its peak and Diagnostics pins
         // a stale "backed up" symptom on a lane with no connection at all.
         inflightAudioBytes = 0
+        flushResidualBytes = 0
         warnedBacklog = false
         state = .closed(reason)
     }

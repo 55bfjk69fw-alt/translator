@@ -139,6 +139,10 @@ final class AppModel: ObservableObject {
     /// so recovery can clear its own banner without clobbering an unrelated
     /// error that replaced it in the meantime.
     private var reconnectBanner: [Int: String] = [:]
+    /// Whether the lane's last close was the client's backlog reset (main
+    /// thread) — picks the saturated-uplink banner wording over the generic
+    /// connection-failure one.
+    private var lastCloseWasBacklog: [Int: Bool] = [:]
 
     // audioQueue-confined lazy-session state. Sessions open on first
     // detected speech per channel (a powered-off TX is pure silence and
@@ -153,6 +157,28 @@ final class AppModel: ObservableObject {
     /// resampler (audioQueue-confined) — a silent-drop path that otherwise
     /// looks exactly like "gate open, nothing captured".
     private var warnedMissingResampler: Set<Int> = []
+
+    // Gate-closed append pausing (audioQueue-confined). Sessions are no
+    // longer fed silence for the whole lull between utterances: after the
+    // gate's hangover closes, a short silence tail is appended (the server
+    // segments phrases on trailing quiet), then the stream pauses entirely.
+    // Server-verified safe: appended audio is treated as contiguous with
+    // what came before (no timestamps on append), which is also why a
+    // resume must splice in a quiet gap — otherwise the new phrase butts
+    // against the previous one in session time.
+    /// Buffers of trailing silence still owed to a lane's session.
+    private var silenceTailRemaining: [Int: Int] = [:]
+    /// Channels whose outbound stream is currently paused.
+    private var appendPaused: Set<Int> = []
+    /// Last 200 ms of real resampled audio per non-passing channel, sent on
+    /// resume so the word onset the gate's attack clipped isn't lost.
+    private var preRoll: [Int: Data] = [:]
+
+    /// ~1.2 s of silence after the hangover closes — long enough to be the
+    /// server's phrase-boundary cue, no longer billed past that.
+    private static let silenceTailBufferCount = 6
+    /// 300 ms splice inserted when a paused stream resumes.
+    private static let resumeSpliceSilence = Data(count: 14_400) // 24 kHz PCM16
 
     // Engine watchdog bookkeeping (main thread). The engine auto-stops on
     // configuration changes and interruptions; the watchdog brings it back.
@@ -419,14 +445,23 @@ final class AppModel: ObservableObject {
         finalizeTimer = nil
         // The finalize timer owned the only unconditional pinyin recompute;
         // killing it with throttled-stale caches would freeze that staleness
-        // into the post-conversation transcript.
+        // into the post-conversation transcript. Twice: once now, and once
+        // after the clients' 3 s close-drain, whose late deltas (delta
+        // callbacks are deliberately not identity-guarded) land after the
+        // first pass with only the throttled recompute left.
         transcript.flushPinyin()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) { [weak self] in
+            self?.transcript.flushPinyin()
+        }
         engineGraph.onInputChannels = nil
         engineGraph.stop()
         audioQueue.sync {
             pipelineActive = false
             sessionAPIKey = nil
             lastVoiceAt.removeAll()
+            silenceTailRemaining.removeAll()
+            appendPaused.removeAll()
+            preRoll.removeAll()
             for (_, client) in clients { client.close() }
             clients.removeAll()
             resamplers.removeAll()
@@ -434,6 +469,7 @@ final class AppModel: ObservableObject {
         sessionStates.removeAll()
         reconnectAttempts.removeAll()
         reconnectBanner.removeAll()
+        lastCloseWasBacklog.removeAll()
         sessionOpenedAt.removeAll()
         pipelineMonitor.clear()
         resetPlaybackState()
@@ -459,6 +495,16 @@ final class AppModel: ObservableObject {
         audioQueue.sync {
             resamplers.removeAll()
             warnedMissingResampler.removeAll()
+            silenceTailRemaining.removeAll()
+            preRoll.removeAll()
+            // Every channel restarts PAUSED, not cleared: an engine rebuild
+            // is a real capture gap on a session whose clients survive it,
+            // so the next passing buffer must splice (a speaker talking
+            // through a route change would otherwise butt the two phrase
+            // halves together in session time). Channels without a client
+            // shed the flag on their next buffer; a fresh lazy-opened
+            // session leads with 300 ms of silence, which is harmless.
+            appendPaused = Set(0..<channelCount)
             for channel in 0..<channelCount {
                 resamplers[channel] = StreamResampler(inputSampleRate: rate)
             }
@@ -534,17 +580,40 @@ final class AppModel: ObservableObject {
                 }
                 continue
             }
-            guard let client = clients[channel] ?? lazyOpenSession(channel: channel, speech: speech) else { continue }
-            let outgoing: AVAudioPCMBuffer?
-            if decision.pass {
-                outgoing = buffers[channel]
-            } else {
-                // Replace suppressed audio with silence to keep the session's
-                // audio timeline continuous.
-                outgoing = EngineGraph.silentBuffer(frames: frames, sampleRate: sampleRate)
+            // The real audio is resampled on every buffer — sent or not — so
+            // the converter's filter state stays gapless and the freshest
+            // 200 ms is always available as pre-roll.
+            guard let data = resampler.convert(buffers[channel]) else { continue }
+            if !decision.pass { preRoll[channel] = data }
+            let existingClient = clients[channel]
+            guard let client = existingClient ?? lazyOpenSession(channel: channel, speech: speech) else {
+                // No session: nothing owes a tail and there is nothing to pause.
+                silenceTailRemaining[channel] = nil
+                appendPaused.remove(channel)
+                continue
             }
-            if let outgoing, let data = resampler.convert(outgoing) {
-                client.sendAudio(data, containsSpeech: speech)
+            if decision.pass {
+                let resumed = appendPaused.remove(channel) != nil
+                if resumed || existingClient == nil {
+                    // A fresh session's first append and a resumed stream both
+                    // lead with the pre-roll; only a resume needs the quiet
+                    // splice (a new session has no previous phrase to butt
+                    // against). Oversized appends are fine — the server
+                    // splits them into 200 ms frames itself.
+                    var spliced = Data()
+                    if resumed { spliced.append(Self.resumeSpliceSilence) }
+                    if let pre = preRoll.removeValue(forKey: channel) { spliced.append(pre) }
+                    spliced.append(data)
+                    client.sendAudio(spliced, containsSpeech: speech)
+                } else {
+                    client.sendAudio(data, containsSpeech: speech)
+                }
+                silenceTailRemaining[channel] = Self.silenceTailBufferCount
+            } else if let tail = silenceTailRemaining[channel], tail > 0 {
+                silenceTailRemaining[channel] = tail - 1
+                client.sendAudio(Data(count: data.count), containsSpeech: false)
+            } else {
+                appendPaused.insert(channel)
             }
         }
         pushMeters(decisions)
@@ -618,12 +687,21 @@ final class AppModel: ObservableObject {
                         self.reconnectBanner[lane] = nil
                         if self.errorBanner == banner { self.errorBanner = nil }
                     }
-                case .closed:
+                case .closed(let reason):
                     // Only a session that survived a while proves the config
                     // works; resetting the attempt counter on every open let
                     // an open-then-instant-reject loop retry forever.
+                    // A backlog reset is the exception: those sessions live
+                    // 10+ s by construction (the backlog takes that long to
+                    // grow), so forgiving them pinned the backoff at 2 s and
+                    // kept the banner unreachable on a saturated uplink —
+                    // the attempt counter must keep climbing there so the
+                    // cadence escalates to 30 s and the user gets told.
+                    let backlogReset = reason?.hasPrefix(RealtimeTranslationClient.backlogResetReasonPrefix) == true
+                    self.lastCloseWasBacklog[lane] = backlogReset
                     if let openedAt = self.sessionOpenedAt.removeValue(forKey: lane),
-                       Date().timeIntervalSince(openedAt) >= 5 {
+                       Date().timeIntervalSince(openedAt) >= 5,
+                       !backlogReset {
                         self.reconnectAttempts[lane] = 0
                     }
                     self.scheduleReconnectIfNeeded(lane: lane)
@@ -680,7 +758,10 @@ final class AppModel: ObservableObject {
             // client still registered — are what bound the retry chain:
             // Stop and idle-close both end it.
             if attempts == 5 {
-                let banner = "Session for \(self.laneName(lane)) keeps failing — still retrying every 30 s. Check the network; if the network is fine, check the API key and event log."
+                let name = self.laneName(lane)
+                let banner = self.lastCloseWasBacklog[lane] == true
+                    ? "The network can't keep up with \(name)'s audio — translations will lag and arrive in bursts until the connection improves."
+                    : "Session for \(name) keeps failing — still retrying every 30 s. Check the network; if the network is fine, check the API key and event log."
                 self.reconnectBanner[lane] = banner
                 self.errorBanner = banner
             }

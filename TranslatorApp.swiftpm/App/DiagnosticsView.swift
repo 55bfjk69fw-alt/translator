@@ -367,7 +367,7 @@ private struct LanePipelineRow: View {
                     .foregroundStyle(sessionStateColor)
             }
             if let session = status.session {
-                Text("Sent \(seconds(session.audioSecondsSent)) audio (\(seconds(session.speechSecondsSent)) speech)\(session.chunksQueuedPreOpen > 0 ? ", \(session.chunksQueuedPreOpen) chunks queued pre-open" : "")\(session.sendFailures > 0 ? ", \(session.sendFailures) SEND FAILURES" : "")")
+                Text("Sent \(seconds(session.audioSecondsSent)) audio (\(seconds(session.speechSecondsSent)) speech)\(session.chunksQueuedPreOpen > 0 ? ", \(session.chunksQueuedPreOpen) chunks queued pre-open" : "")\(session.sendBacklogSeconds > 0.3 ? String(format: ", %.1fs backlogged", session.sendBacklogSeconds) : "")\(session.sendFailures > 0 ? ", \(session.sendFailures) SEND FAILURES" : "")")
                     .font(.caption)
                     .foregroundStyle(session.sendFailures > 0 ? .red : .secondary)
                 Text("Received: source \(session.sourceChars) ch (\(agePhrase(session.secondsSinceLastSourceDelta))) · translation \(session.translationChars) ch (\(agePhrase(session.secondsSinceLastTranslationDelta))) · audio \(seconds(session.audioSecondsReceived)) (\(agePhrase(session.secondsSinceLastAudioFrame)))")
@@ -425,6 +425,9 @@ private struct LanePipelineRow: View {
     /// pinned to the row so they're visible without scrolling the event log.
     private func symptoms(_ session: RealtimeTranslationClient.Snapshot) -> [String] {
         var lines: [String] = []
+        if session.sendBacklogSeconds > 2.5 {
+            lines.append("Uplink can't keep up — \(Int(session.sendBacklogSeconds))s of audio backed up (silence being shed)")
+        }
         if case .absent = session.transcriptionAck {
             lines.append("Server ack shows NO source transcription — source text will never arrive on this connection")
         }

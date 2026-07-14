@@ -28,9 +28,10 @@ import Foundation
 ///    whenever someone else talks louder.
 ///
 /// Decisions use only the current buffer (no look-ahead), so the gate adds
-/// zero latency. Suppressed audio is replaced with silence rather than
-/// dropped so each session's audio timeline stays continuous, as the API
-/// expects.
+/// zero latency. Suppressed audio is not sent at all: AppModel appends a
+/// short silence tail after the hangover closes (the server's phrase-end
+/// cue) and then pauses the stream — the server treats later appends as
+/// contiguous, so nothing depends on a gapless timeline.
 final class ChannelGate {
 
     // MARK: - Tunables

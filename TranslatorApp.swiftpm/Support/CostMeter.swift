@@ -39,10 +39,13 @@ final class CostMeter {
     private let lock = NSLock()
 
     /// Thread-safe; clients report increments from their socket queues.
+    /// Negative values are corrections — audio counted at hand-off that
+    /// died with its connection before reaching the server is never billed
+    /// there, so the client retracts it. Clamped at zero.
     func addBilledSeconds(_ seconds: Double) {
-        guard seconds > 0 else { return }
+        guard seconds != 0 else { return }
         lock.lock(); defer { lock.unlock() }
-        billedSeconds += seconds
+        billedSeconds = max(0, billedSeconds + seconds)
     }
 
     /// Total estimated dollars so far.

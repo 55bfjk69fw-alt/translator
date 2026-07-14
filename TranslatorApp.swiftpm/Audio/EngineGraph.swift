@@ -198,22 +198,4 @@ final class EngineGraph {
         buffer.floatChannelData?[0].update(from: samples, count: frames)
         return buffer
     }
-
-    /// Silent mono buffer used when the gate suppresses a channel, keeping
-    /// the outbound audio timeline continuous.
-    static func silentBuffer(frames: Int, sampleRate: Double) -> AVAudioPCMBuffer? {
-        guard let format = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: sampleRate,
-            channels: 1,
-            interleaved: false
-        ), let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frames)) else {
-            return nil
-        }
-        buffer.frameLength = AVAudioFrameCount(frames)
-        if let data = buffer.floatChannelData?[0] {
-            data.update(repeating: 0, count: frames)
-        }
-        return buffer
-    }
 }

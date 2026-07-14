@@ -381,6 +381,11 @@ final class CascadeLaneEngine: LaneEngine {
             return
         }
         slotState = .held
+        // A fresh binding can never receive the previous binding's
+        // straggler (the pool drops unowned results and the .held guard
+        // covered the released window) — clear the latch so it can't eat
+        // this utterance's genuine final.
+        staleDropUntilFinal = false
         // Count only genuine contention (an uncontended grant is a few ms
         // of actor hop) so the Diagnostics "waits" line means something.
         if waitSeconds > 0.05 {
@@ -414,7 +419,17 @@ final class CascadeLaneEngine: LaneEngine {
         // volatile text — graceful, logged, and rare.
         guard slotState == .held else { return }
         if staleDropUntilFinal {
-            if event.isFinal { staleDropUntilFinal = false }
+            if event.isFinal {
+                staleDropUntilFinal = false
+            } else {
+                // Volatiles while latched are (almost certainly) the NEW
+                // range's speech — keep them in the utterance so a
+                // timeout settle still degrades to text rather than to
+                // silence; they're just not displayed while the straggler
+                // could contaminate them.
+                utterance.volatileText = event.text
+                current = utterance
+            }
             return
         }
         if event.isFinal {
@@ -453,11 +468,17 @@ final class CascadeLaneEngine: LaneEngine {
             stats.lastFinalizeSeconds = seconds
             onMetric?(.sttFinalizeSeconds(seconds))
         }
-        if timedOut { staleDropUntilFinal = true }
         if settleKeepsSlot, slotState == .held {
             // 12 s split: hand the slot straight to the follow-on
             // utterance and flush the audio buffered during the finalize
-            // wait as its opening context.
+            // wait as its opening context. This is the ONLY place the
+            // stale-final latch arms: the slot binding survives the
+            // settle, so a straggler final from the old range would land
+            // in the follow-on utterance. In the release path the .held
+            // guard already drops stragglers, and arming there would only
+            // eat the NEXT utterance's genuine final — the re-arm loop
+            // that deafened the lane (review round 2).
+            if timedOut { staleDropUntilFinal = true }
             settleKeepsSlot = false
             current = Utterance(id: UUID(), openedAt: Date(), lastVoicedNowAt: Date())
             stats.utterancesOpened += 1

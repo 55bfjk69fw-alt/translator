@@ -310,11 +310,22 @@ struct GateVerdict {
     /// the hangover tail still flows to STT as trailing context because
     /// `pass` stays true through it.
     ///
-    /// Requires a one-line gate change: ChannelGate already computes
-    /// this internally (`genuine = voicedNow[i] && !bleed[i]`,
-    /// ChannelGate.evaluate step 3) but Decision only exposes the
-    /// hangover-smoothed `voiced` — Decision gains a `genuineNow` field
-    /// carrying the existing value. No gate behavior changes.
+    /// The bleed subtraction is load-bearing, not a nicety: the raw VAD
+    /// fires on bleed too (bleed IS speech), so a close debounce keyed
+    /// on VAD-voicing alone would be starved on a suppressed lane for as
+    /// long as the louder correlated speaker keeps talking — systematic
+    /// in the ambient chest+hand setup, where the losing mic is
+    /// voiced-but-bleed for entire turns. Genuine voicing goes false the
+    /// moment a lane loses its pair, so the debounce closes on schedule.
+    ///
+    /// Requires a small gate change, stated here so CP1 doesn't discover
+    /// it: ChannelGate already computes this internally
+    /// (`genuine = voicedNow[i] && !bleed[i]`, ChannelGate.evaluate
+    /// step 3) but exposes only the hangover-smoothed `voiced` —
+    /// Decision gains a field carrying the existing `genuine` value, and
+    /// ChannelTelemetry gains the same field so the Signal tab can plot
+    /// the flag the cascade actually segments on. No gate behavior
+    /// changes.
     let voicedNow: Bool
     /// Gate pass (bleed-suppressed ⇒ false). Realtime substitutes
     /// silence when false; cascade sends nothing.
@@ -405,7 +416,13 @@ become silence, everything is resampled to 24 kHz PCM16 and appended.
 AppModel changes are mechanical: `clients: [Int: RealtimeTranslationClient]`
 becomes `engines: [Int: any LaneEngine]`; `sessionStates` becomes
 `[Int: LaneEngineState]` (dot mapping: idle→gray, starting/reconnecting→
-yellow, running→green, degraded→orange, failed→red); `makeClient` becomes
+yellow, running→green, degraded→orange, failed→red). One guard-parity
+detail: today AppModel suppresses same-value `sessionStates` publishes,
+and `.reconnecting(attempt: 3) != .reconnecting(attempt: 4)` would
+defeat that on every retry — the publish guard compares **case
+identity**, not full equality, so the dot's publish cadence stays
+exactly today's (the attempt count still reaches Diagnostics via
+`snapshot()`). `makeClient` becomes
 a factory switching on the pipeline setting; `wireClient` wires the new
 callbacks. **Lifecycle is pipeline-dependent**: lazy-open-on-speech and
 idle-close remain exactly as today for realtime engines (they bound
@@ -598,15 +615,23 @@ lets the OS share one backing engine across lanes.
   clock only advances during speech and idle lanes cost nothing.
 - **Segmentation** (this is where cascade latency is won or lost): an
   utterance opens on the first `pass && voicedNow` buffer after quiet.
-  The close trigger is a **400 ms debounce of `voicedNow` going false**
-  — the *raw* VAD flag, NOT the hangover-smoothed `speech` flag. The
-  hangover (1.5 s worn / 2.0 s ambient) exists to keep the *gate* open
-  across word gaps and MUST NOT sit in the cascade's response path;
-  audio keeps flowing through the hangover tail (`pass` stays true), so
-  if the debounce fires early and the speaker resumes, the trailing
-  audio was captured and the next utterance opens cleanly. On close:
-  `endUtterance()` → `finalize(through: lastSpeechTime)`, forcing the
-  segment's final result without ending the session.
+  The close trigger is a **debounce of `voicedNow` going false** — the
+  genuine pre-hangover flag (§5.1), NOT the hangover-smoothed `speech`
+  flag. The hangover (1.5 s worn / 2.0 s ambient) exists to keep the
+  *gate* open across word gaps and MUST NOT sit in the cascade's
+  response path; audio keeps flowing through the hangover tail (`pass`
+  stays true), so if the debounce fires early and the speaker resumes,
+  the trailing audio was captured and the next utterance opens cleanly
+  for *capture*. The quality trade-off is acknowledged, not free:
+  a spurious close still splits one thought into two context-free MT
+  calls and two TTS jobs (Apple MT takes no context), so the debounce
+  is **two-tier**, reusing the codebase's `finalizeSentenceTimeout`
+  precedent: **400 ms when the accumulated volatile text already ends
+  in a sentence ender, 750 ms otherwise** (mid-sentence hesitations
+  routinely exceed 400 ms). Both constants are probe-tuned (item 6
+  measures exactly this). On close: `endUtterance()` →
+  `finalize(through: lastSpeechTime)`, forcing the segment's final
+  result without ending the session.
   Two forced-split rules bound utterance length independent of the VAD:
   1. **Punctuation sub-segmentation** (accelerator): when a *final*
      result arrives mid-utterance ending in sentence punctuation
@@ -632,6 +657,17 @@ lets the OS share one backing engine across lanes.
   possibly voice rule-loading on the *first utterance after every quiet
   spell* — the exact moment users judge latency — to save nothing (no
   billing, and an idle analyzer receiving no audio costs ~nothing).
+  Eager open deliberately front-loads the admission-limit collision:
+  creating all N analyzers at Start is the naive-concurrency scenario
+  §2.2 warns about, and that is the point — a device that can't admit N
+  fails *deterministically at Start* (degraded banner, pooled mode)
+  instead of surprising the user mid-conversation when a fourth speaker
+  finally talks. Probe item 2 therefore tests simultaneous creation, not
+  just incremental. **Re-enable mid-conversation**: a cascade engine for
+  a re-enabled mic is built lazily on that lane's next `sendAudio` (the
+  per-buffer enabled-mask read already notices the transition), re-paying
+  its warm-up — acceptable for an explicit user action, and stated here
+  so the eager-at-Start rule visibly has exactly one exception.
 - **Warm-up**: `prepareToAnalyze(in:)` for every enabled lane at Start
   (halves finalize latency; ANE-state variance noted in research).
 - **Assets**: `AssetInventory` request at setup time with `Progress`
@@ -784,11 +820,11 @@ capturing ──endUtterance──▶ finalizing ──final text──▶ trans
 | Stage | Expected |
 | --- | --- |
 | Live Chinese on screen (volatile) | 0.3–0.5 s behind speech (unaffected by boundary detection) |
-| Utterance boundary detection (`voicedNow` debounce, §6.1) | ~0.4 s after true speech end |
+| Utterance boundary detection (two-tier `voicedNow` debounce, §6.1) | 0.4 s (sentence-ended) – 0.75 s after true speech end |
 | Boundary → final Chinese (`finalize(through:)`, pre-warmed) | ~1.0–2.0 s, high ANE-state variance (0.05–3 s observed in the field reports) |
 | Final → translation (Apple, on-device) | unmeasured publicly; probe item 5. Working assumption ≤ 0.3 s/sentence |
 | Translation → first translated audio (warm voice) | ~0.1–0.5 s |
-| **Speech-end → translated audio** | **~1.8–3.2 s typical; tail to ~4.5 s when the ANE is cold** (vs realtime's 0.5–1.5 s arriving mid-speech) |
+| **Speech-end → translated audio** | **~1.8–3.5 s typical; tail to ~4.5 s when the ANE is cold** (vs realtime's 0.5–1.5 s arriving mid-speech) |
 
   Had the boundary been derived from the hangover-smoothed `speech` flag,
   the worn profile's 1.5 s (ambient: 2.0 s) hangover would sit at the
@@ -826,8 +862,11 @@ finalizes explicitly. The store changes:
   to `.quietTimeout` (realtime) utterances — they'd otherwise hard-cap-
   finalize a cascade bubble whose translation is 2 s away in the MT
   queue, or double-finalize racing the explicit event. `.explicit`
-  utterances are closed by `translationText(isFinal: true)` (or by
-  source-final when translation failed, so the bubble shows 中文 + "—").
+  utterances are closed by `translationText(isFinal: true)`; when
+  translation fails, the engine emits that same event with empty text as
+  the close, and the store renders the bubble as 中文 + "—" (one
+  mechanism, no special store path — the 30 s safety net remains only
+  for a lane engine dying mid-utterance).
   Safety net: an `.explicit` bubble with no pipeline activity for 30 s
   finalizes with whatever it has (a lane engine death mid-utterance must
   not leave a bubble open forever), logged as such.
@@ -936,8 +975,9 @@ results pasted into this doc:
    `.notInstalled` at `translate()` time (init non-throwing), plus that
    Playgrounds accepts the `.iOS("26.0")` platform bump.
 2. **Concurrent analyzers**: 1→4 zh_CN transcribers on looped recorded
-   audio; record where `insufficientResources` hits and CPU/thermal.
-   Expectation set by §2.2: identical configs may NOT raise the
+   audio, both incremental AND all-at-once creation (eager open at Start
+   is the all-at-once case, §6.1); record where `insufficientResources`
+   hits and CPU/thermal. Expectation set by §2.2: identical configs may NOT raise the
    admission limit on iOS 26 — a cap of 1–2 is a plausible result, and
    it reroutes CP2 through a pooled-mode design pass (§11), it does not
    kill the cascade.
@@ -947,8 +987,11 @@ results pasted into this doc:
    questions, exclamations); inspect finals for 。！？.
 5. **Translation latency**: 50 varied zh sentences through one session,
    serialized; p50/p95; then the same via `translations(from:)` batch.
-6. **STT finalize latency**: with/without `prepareToAnalyze`, measure
-   VAD-end → final over 20 utterances.
+6. **STT finalize latency & boundary tuning**: with/without
+   `prepareToAnalyze`, measure VAD-end → final over 20 utterances; on
+   the same recordings, measure the spurious-close rate of the two-tier
+   debounce (§6.1) at several constants — the 400/750 ms defaults are
+   priors, not conclusions.
 7. **Voice inventory dump**: `speechVoices()` on the target iPad —
    identifiers, qualities, formats (write one buffer per voice, log
    `buffer.format`).
@@ -1002,7 +1045,7 @@ expectations.
 | v1 translates finals only | Simplicity first; volatile-translate is a bounded, designed-in follow-up if field latency disappoints |
 | Audio-skip backpressure (keep text, drop stale speech) | A live table can't use 30 s-old audio; the transcript preserves completeness |
 | Personal Voice excluded | Incompatible with `write()` buffer rendering (system falls back to direct output) |
-| `GateVerdict.voicedNow` at the seam (raw VAD, pre-hangover) | The 1.5–2.0 s gate hangover exists for gate continuity, not segmentation; deriving utterance ends from the smoothed flag would put it at the head of every cascade response (§7 table) |
+| `GateVerdict.voicedNow` at the seam (genuine voicing: raw VAD minus bleed, pre-hangover) | The 1.5–2.0 s gate hangover exists for gate continuity, not segmentation; the smoothed flag would put it at the head of every cascade response (§7 table), and VAD-without-bleed-subtraction would starve the close debounce on suppressed lanes for whole turns (§5.1) |
 | Cascade exempt from idle-close, eager open at Start | Analyzer close is terminal; reopen re-pays seconds of warm-up on the first post-lull utterance to save $0 |
 | Engines own format self-healing (sniff `buffer.format` per send) | Route churn changes the hardware rate mid-conversation; a stale STT converter fails silently — AppModel's route-change resampler rebuild moves inside the seam it can no longer see into |
 | Utterance provenance flag in TranscriptStore | Quiet-timeout machinery (finalizeStale, reopen, sentence fast path) applied to explicitly-finalized cascade bubbles double-finalizes and truncates; the two segmentation regimes must not touch each other's utterances |

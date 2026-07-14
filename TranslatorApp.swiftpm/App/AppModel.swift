@@ -55,6 +55,10 @@ final class AppModel: ObservableObject {
     @Published private(set) var route: AudioSessionController.RouteSnapshot?
     @Published private(set) var estimatedCost: Double = 0
     @Published var errorBanner: String?
+    /// The once-per-conversation cost alert. Separate from errorBanner so
+    /// neither channel can overwrite the other (last-writer-wins on a shared
+    /// banner silently ate whichever fired second). Cleared at Start.
+    @Published private(set) var costNotice: String?
 
     /// One row of the Diagnostics "Translation pipeline" panel: everything
     /// between the gate and the transcript for one lane, sampled at 1 Hz by
@@ -217,6 +221,7 @@ final class AppModel: ObservableObject {
         // cost" — start it from zero.
         costMeter.reset()
         costAlertFired = false
+        costNotice = nil
         refreshCost()
 
         // Grab the AirPods from the phone before the conversation session
@@ -874,17 +879,20 @@ final class AppModel: ObservableObject {
         // this runs at 1 Hz — only publish when the estimate actually moved.
         // Both reads are safe here: CostMeter is thread-safe, and this runs
         // on the main thread (UI timer), where MetricsStore is confined.
-        let cost = costMeter.estimatedDollars + metrics.assistDollars
+        // The prompter term is gated on .conversation: during the Start
+        // window the PREVIOUS conversation's ledger is still live
+        // (metrics.startSession runs later in beginConversation), and the
+        // readout must start from zero, not from last dinner's total.
+        let assist = mode == .conversation ? metrics.assistDollars : 0
+        let cost = costMeter.estimatedDollars + assist
         if estimatedCost != cost { estimatedCost = cost }
         // One notice per conversation when the estimate crosses the Settings
-        // threshold (0 = off). The banner is reused as a notice channel; it
-        // does not stop anything. Armed only in .conversation: during Start
-        // the previous conversation's prompter ledger is still live
-        // (metrics.startSession runs later in beginConversation), and a
-        // stale total must not consume this conversation's one banner.
+        // threshold (0 = off). Its own channel, not errorBanner: a reconnect
+        // warning firing in the same window must not clobber a money notice
+        // (nor the reverse). It does not stop anything.
         if mode == .conversation, AppSettings.costAlertDollars > 0, !costAlertFired, cost >= AppSettings.costAlertDollars {
             costAlertFired = true
-            errorBanner = String(format: "Cost check: this conversation has passed the $%.0f alert threshold (set in Settings → Sessions).", AppSettings.costAlertDollars)
+            costNotice = String(format: "Cost check: this conversation has passed the $%.0f alert threshold (set in Settings → Sessions).", AppSettings.costAlertDollars)
         }
     }
 

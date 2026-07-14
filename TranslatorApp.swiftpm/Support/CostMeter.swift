@@ -22,6 +22,14 @@ final class CostMeter {
     /// OpenAI's published per-minute price for gpt-realtime-whisper inside
     /// translation sessions was not verifiable from this codebase — update
     /// when published, like the translate rate above.
+    ///
+    /// Calibration caveat: that dashboard predates the send-path change that
+    /// pauses appends while the gate is closed. On main, appended minutes
+    /// equalled session-clock minutes, so the two lines were proportional by
+    /// construction; if the pause regime makes them diverge (translate on
+    /// the session clock, whisper on appended audio), a single combined rate
+    /// can't represent both — re-derive this ratio from the first
+    /// post-merge dashboard alongside issue #1's billing verification.
     static let transcriptionDollarsPerSessionMinute = 0.0168
     static var combinedDollarsPerSessionMinute: Double {
         dollarsPerSessionMinute + transcriptionDollarsPerSessionMinute

@@ -27,6 +27,24 @@ final class ChannelMeters: ObservableObject {
     }
 }
 
+/// 1 Hz pipeline snapshots for the Diagnostics panel. Deliberately its own
+/// ObservableObject (the ChannelMeters pattern): the snapshot array is
+/// rebuilt every tick and can never compare equal, so publishing it from
+/// AppModel re-rendered everything observing AppModel — the conversation
+/// screen included — once per second for the whole session. Main thread
+/// only.
+final class PipelineMonitor: ObservableObject {
+    @Published private(set) var statuses: [AppModel.LanePipelineStatus] = []
+
+    func update(_ statuses: [AppModel.LanePipelineStatus]) {
+        self.statuses = statuses
+    }
+
+    func clear() {
+        if !statuses.isEmpty { statuses = [] }
+    }
+}
+
 /// Central coordinator: audio session/engine, per-channel gating and
 /// resampling, one translation session per speaker, the reply prompter,
 /// and transcript/cost bookkeeping.
@@ -55,6 +73,10 @@ final class AppModel: ObservableObject {
     @Published private(set) var route: AudioSessionController.RouteSnapshot?
     @Published private(set) var estimatedCost: Double = 0
     @Published var errorBanner: String?
+    /// The once-per-conversation cost alert. Separate from errorBanner so
+    /// neither channel can overwrite the other (last-writer-wins on a shared
+    /// banner silently ate whichever fired second). Cleared at Start.
+    @Published private(set) var costNotice: String?
 
     /// One row of the Diagnostics "Translation pipeline" panel: everything
     /// between the gate and the transcript for one lane, sampled at 1 Hz by
@@ -70,9 +92,12 @@ final class AppModel: ObservableObject {
         var session: RealtimeTranslationClient.Snapshot?
     }
 
-    @Published private(set) var pipelineStatuses: [LanePipelineStatus] = []
-
     let transcript: TranscriptStore
+
+    /// 1 Hz Diagnostics pipeline rows. Its own ObservableObject so snapshot
+    /// churn only re-renders the pipeline section (see the class comment
+    /// above).
+    let pipelineMonitor = PipelineMonitor()
 
     /// 10 Hz level/gate dots. Its own ObservableObject so meter churn only
     /// re-renders the status bar and Diagnostics meter rows (see the class
@@ -110,6 +135,10 @@ final class AppModel: ObservableObject {
     private var resamplers: [Int: StreamResampler] = [:]
     private var reconnectAttempts: [Int: Int] = [:]
     private var sessionOpenedAt: [Int: Date] = [:]
+    /// The exact still-retrying banner text shown per lane (main thread),
+    /// so recovery can clear its own banner without clobbering an unrelated
+    /// error that replaced it in the meantime.
+    private var reconnectBanner: [Int: String] = [:]
 
     // audioQueue-confined lazy-session state. Sessions open on first
     // detected speech per channel (a powered-off TX is pure silence and
@@ -152,6 +181,10 @@ final class AppModel: ObservableObject {
     private var interruptedSince: Date?
     private var lastWatchdogRestart = Date.distantPast
     private var lastEngineDownWarn = Date.distantPast
+
+    /// The cost-alert banner fires at most once per conversation (main
+    /// thread; reset at Start alongside the cost meter).
+    private var costAlertFired = false
 
     /// Playback lanes on the engine: 0..3 = translated English per speaker.
     private let playbackLaneCount = 4
@@ -234,6 +267,8 @@ final class AppModel: ObservableObject {
         // The estimate next to the lane dots reads as "this conversation's
         // cost" — start it from zero.
         costMeter.reset()
+        costAlertFired = false
+        costNotice = nil
         refreshCost()
 
         // Grab the AirPods from the phone before the conversation session
@@ -404,6 +439,10 @@ final class AppModel: ObservableObject {
         uiTimer = nil
         finalizeTimer?.invalidate()
         finalizeTimer = nil
+        // The finalize timer owned the only unconditional pinyin recompute;
+        // killing it with throttled-stale caches would freeze that staleness
+        // into the post-conversation transcript.
+        transcript.flushPinyin()
         engineGraph.onInputChannels = nil
         engineGraph.stop()
         audioQueue.sync {
@@ -419,8 +458,9 @@ final class AppModel: ObservableObject {
         }
         sessionStates.removeAll()
         reconnectAttempts.removeAll()
+        reconnectBanner.removeAll()
         sessionOpenedAt.removeAll()
-        pipelineStatuses = []
+        pipelineMonitor.clear()
         resetPlaybackState()
         refreshCost()
         metrics.endSession()
@@ -623,6 +663,19 @@ final class AppModel: ObservableObject {
                 switch state {
                 case .open:
                     self.sessionOpenedAt[lane] = Date()
+                    // A recovered session must retract its own scare banner
+                    // promptly — the close-time counter reset can be an hour
+                    // away on a healthy session, and "keeps failing" over a
+                    // green dot reads as a broken app. 5 s of survival is
+                    // the same proof bar the counter reset uses; the text
+                    // equality check keeps this from clobbering an unrelated
+                    // error that replaced the banner meanwhile.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+                        guard let self, self.sessionStates[lane] == .open,
+                              let banner = self.reconnectBanner[lane] else { return }
+                        self.reconnectBanner[lane] = nil
+                        if self.errorBanner == banner { self.errorBanner = nil }
+                    }
                 case .closed:
                     // Only a session that survived a while proves the config
                     // works; resetting the attempt counter on every open let
@@ -635,7 +688,12 @@ final class AppModel: ObservableObject {
                 default:
                     break
                 }
-                self.sessionStates[lane] = state
+                // @Published fires objectWillChange on same-value writes,
+                // and state events repeat (reconnect loops re-emit
+                // .connecting/.closed) — publish only real transitions.
+                if self.sessionStates[lane] != state {
+                    self.sessionStates[lane] = state
+                }
             }
         }
         client.onSourceTranscriptDelta = { [weak self] delta in
@@ -671,11 +729,20 @@ final class AppModel: ObservableObject {
             guard self.audioQueue.sync(execute: { self.clients[lane] != nil }) else { return }
             let attempts = (self.reconnectAttempts[lane] ?? 0) + 1
             self.reconnectAttempts[lane] = attempts
-            guard attempts <= 5 else {
-                self.errorBanner = "Session for \(self.laneName(lane)) keeps failing — check the API key and event log."
-                return
+            // Retry for as long as the conversation runs — never give up.
+            // Giving up used to leave the dead client registered in the
+            // lane's slot, and the lazy-open path only fills EMPTY slots,
+            // so a 1-2 min network outage killed the lane for the rest of
+            // the conversation (idle-close never evicts a lane whose
+            // speaker keeps talking). The guards above — stop flag, mode,
+            // client still registered — are what bound the retry chain:
+            // Stop and idle-close both end it.
+            if attempts == 5 {
+                let banner = "Session for \(self.laneName(lane)) keeps failing — still retrying every 30 s. Check the network; if the network is fine, check the API key and event log."
+                self.reconnectBanner[lane] = banner
+                self.errorBanner = banner
             }
-            let delay = min(10, pow(2, Double(attempts)))
+            let delay = min(30, pow(2, Double(min(attempts, 5))))
             Log.warn("Reconnecting \(self.laneName(lane)) in \(Int(delay))s (attempt \(attempts))")
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                 guard !self.stopping, self.mode != .idle else { return }
@@ -843,14 +910,14 @@ final class AppModel: ObservableObject {
     /// client's queue, and the clients dictionary is copied under audioQueue.
     private func refreshPipelineStatuses() {
         guard mode == .conversation else {
-            if !pipelineStatuses.isEmpty { pipelineStatuses = [] }
+            pipelineMonitor.clear()
             return
         }
         let (clientsCopy, voiceTimes) = audioQueue.sync { (clients, lastVoiceAt) }
         let sessionSnapshots = clientsCopy.mapValues { $0.snapshot() }
         let now = Date()
         let open = channelMeters.gateOpen
-        pipelineStatuses = lanes.map { lane in
+        pipelineMonitor.update(lanes.map { lane in
             LanePipelineStatus(
                 id: lane.id,
                 name: lane.name,
@@ -858,7 +925,7 @@ final class AppModel: ObservableObject {
                 secondsSinceSpeech: voiceTimes[lane.id].map { now.timeIntervalSince($0) },
                 session: sessionSnapshots[lane.id]
             )
-        }
+        })
         // The Metrics tab samples the same 1 Hz snapshots the pipeline
         // panel reads — no extra client-queue hops. Lane names ride along so
         // MetricsView never has to observe AppModel (whose meters churn at
@@ -911,7 +978,7 @@ final class AppModel: ObservableObject {
             }
         }
         for lane in closedLanes {
-            sessionStates[lane] = .idle
+            if sessionStates[lane] != .idle { sessionStates[lane] = .idle }
             sessionOpenedAt[lane] = nil
             reconnectAttempts[lane] = 0
             if disabledLanes.contains(lane) {
@@ -925,8 +992,23 @@ final class AppModel: ObservableObject {
     private func refreshCost() {
         // @Published fires objectWillChange even on same-value writes, and
         // this runs at 1 Hz — only publish when the estimate actually moved.
-        let cost = costMeter.estimatedDollars
+        // Both reads are safe here: CostMeter is thread-safe, and this runs
+        // on the main thread (UI timer), where MetricsStore is confined.
+        // The prompter term is gated on .conversation: during the Start
+        // window the PREVIOUS conversation's ledger is still live
+        // (metrics.startSession runs later in beginConversation), and the
+        // readout must start from zero, not from last dinner's total.
+        let assist = mode == .conversation ? metrics.assistDollars : 0
+        let cost = costMeter.estimatedDollars + assist
         if estimatedCost != cost { estimatedCost = cost }
+        // One notice per conversation when the estimate crosses the Settings
+        // threshold (0 = off). Its own channel, not errorBanner: a reconnect
+        // warning firing in the same window must not clobber a money notice
+        // (nor the reverse). It does not stop anything.
+        if mode == .conversation, AppSettings.costAlertDollars > 0, !costAlertFired, cost >= AppSettings.costAlertDollars {
+            costAlertFired = true
+            costNotice = String(format: "Cost check: this conversation has passed the $%.0f alert threshold (set in Settings → Sessions).", AppSettings.costAlertDollars)
+        }
     }
 
     private func observeNotifications() {

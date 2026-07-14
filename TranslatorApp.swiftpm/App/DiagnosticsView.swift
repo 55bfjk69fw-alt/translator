@@ -84,16 +84,7 @@ struct DiagnosticsView: View {
     /// shows up in the conversation" (which link is dead?) and "why is the
     /// Chinese text missing" (was source transcription even acknowledged?).
     private var pipelineSection: some View {
-        Section("Translation pipeline") {
-            if model.pipelineStatuses.isEmpty {
-                Text("Start a conversation to trace each speaker's audio from the gate through their session to the transcript.")
-                    .foregroundStyle(.secondary)
-            } else {
-                ForEach(model.pipelineStatuses) { status in
-                    LanePipelineRow(status: status)
-                }
-            }
-        }
+        PipelineStatusSection(monitor: model.pipelineMonitor)
     }
 
     private var benchSection: some View {
@@ -326,6 +317,26 @@ private struct ChannelMetersSection: View {
                 Text("Tap each transmitter in turn — exactly one meter should move per tap if channels are independent.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+/// Observes PipelineMonitor directly so the 1 Hz snapshot churn re-renders
+/// only these rows, not the whole Diagnostics list (the ChannelMetersSection
+/// pattern).
+private struct PipelineStatusSection: View {
+    @ObservedObject var monitor: PipelineMonitor
+
+    var body: some View {
+        Section("Translation pipeline") {
+            if monitor.statuses.isEmpty {
+                Text("Start a conversation to trace each speaker's audio from the gate through their session to the transcript.")
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(monitor.statuses) { status in
+                    LanePipelineRow(status: status)
+                }
             }
         }
     }

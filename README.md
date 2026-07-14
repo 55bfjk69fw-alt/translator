@@ -112,8 +112,9 @@ translating the table.
    line (who/where/what) from the chip above the tray, and your bio + Mandarin
    level in Settings → Reply prompter — both feed the suggestions.
 5. The status bar shows per-speaker levels, gate state, session health, and a
-   running cost estimate (4 sessions ≈ $8/hour ceiling at $0.034/session-minute;
-   the prompter's text calls add pennies).
+   running cost estimate (4 sessions ≈ $12/hour ceiling at $0.034/session-minute
+   translation plus ≈$0.017/session-minute source transcription; the prompter
+   adds roughly $2–3/hour during continuous chatter at mini-model pricing).
 
 Keep the app in the foreground: Swift Playgrounds apps can't run background audio.
 The app disables the screen-idle timer while a conversation is running.

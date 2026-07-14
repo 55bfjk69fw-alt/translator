@@ -663,7 +663,8 @@ identically across slots (locale from the source-language setting via
      (。！？.!?), the accumulated sentence(s) release downstream early.
      zh punctuation is UNVERIFIED (probe item 4) — nothing depends on it.
   2. **Max-duration split** (hard bound): at 12 s of continuous
-     utterance, `finalize(through: now)` fires and a new utterance UUID
+     utterance, a finalize through everything fed so far (the same
+     full-cursor rule as a normal close) fires and a new utterance UUID
      continues seamlessly. Without this, ambient mode (2.0 s hangover,
      12 s sustained-voice timeout, continuous surrounding chatter) can
      hold one utterance open for minutes, starving MT and TTS until the
@@ -701,7 +702,8 @@ The probe admitted 3 of 4 lanes, so this section is the design pass the
 phasing gate required. The measured throughput makes pooling cheap:
 transcription ran ≥25× real time (10.8 s of audio in ~0.3–0.4 s, even
 with 3 concurrent lanes), so a lane that waits for a slot and then
-burst-feeds its buffered audio catches up in well under a second.
+burst-feeds its buffered audio typically catches up in well under a
+second (~1.5 s at the 30 s buffer bound — see the contention bullet).
 
 - **Discovery at Start**: create-and-start identical zh slots one at a
   time up to `min(enabledLanes, 4)`, catching the admission error. The
@@ -879,10 +881,15 @@ capturing ──endUtterance──▶ finalizing ──final text──▶ trans
   job is dropped *from audio only* — its translation stays on screen,
   a `Log.warn` and a Diagnostics counter record the skip. Rationale:
   at a live table, stale speech is worse than a visible transcript.
-- **Cancellation**: Stop / idle-close calls `close()`: STT
-  `finalizeAndFinishThroughEndOfInput()` with a 3 s drain cap (mirrors
-  the realtime close drain), `Translator.cancelAll()`,
-  `SpeechSynth.cancelAll()`, then state `.idle`. In-flight utterances
+- **Cancellation**: a LANE close (disabled mic — cascade lanes are
+  idle-close-exempt) finalizes through the fed cursor, releases its
+  slot, drops its lane buffer, and cancels its own MT/TTS jobs — it
+  must NEVER finish a slot: slots are shared, and finishing is terminal
+  (a mic toggle would shrink the pool for the rest of the
+  conversation). Only `CascadeContext` teardown at Stop finishes slots:
+  `finalizeAndFinishThroughEndOfInput()` per slot with a 3 s drain cap
+  (mirrors the realtime close drain), then `Translator.cancelAll()`,
+  `SpeechSynth.cancelAll()`, state `.idle`. In-flight utterances
   finalize into the transcript if the drain returns them in time.
 - **Latency budget** — pre-probe expectations vs CP0 measurements
   (probe, 2026-07-14, clean paced TTS audio; live far-field mic speech
@@ -1096,7 +1103,8 @@ expectations.
    primary design (§6.1.1)** — the design pass the phasing gate required
    is done and re-reviewed. Throughput: each run transcribed 10.8 s of
    audio in ~0.3–0.4 s (≥25× real time even 3-wide), which is what makes
-   pool contention effectively invisible (burst catch-up < 1 s).
+   pool contention effectively invisible (burst catch-up typically
+   sub-second; ~1.5 s at the 30 s buffer bound).
 3. **Concurrent `write()`: 2-wide renders overlap.** Two synthesizers
    rendered simultaneously with complete buffer sets (457/469 buffers).
    The serial-vs-concurrent wall-clock comparison (0.74 s vs 0.11 s) is

@@ -1153,9 +1153,11 @@ expectations.
   pass (slots, cursors, FIFO acquisition, burst catch-up), taken through
   the same adversarial review loop as the rest of this document before
   CP2 work began.
-- **CP2 — Apple cascade**: providers, CascadeLaneEngine, TranscriptStore
-  changes (§7.1), settings + setup card + per-lane voices. First real
-  conversations; latency table (§7) validated and filled in.
+- **CP2 — Apple cascade** — SHIPPED (adversarially reviewed, 3 rounds:
+  5 majors + 1 blocking latch defect found and fixed pre-merge):
+  providers, CascadeLaneEngine, TranscriptStore changes (§7.1),
+  settings + setup card + per-lane voices. First real conversations
+  validate the §7 latency table next.
 - **CP3 — polish**: cascade Diagnostics/Metrics rendering, degraded-mode
   UX, voice previews, speech-rate slider, README/docs.
 - **CP4 — cloud providers** (separate follow-up): OpenAI STT/MT/TTS

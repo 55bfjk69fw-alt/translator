@@ -226,7 +226,7 @@ struct ConversationView: View {
 private struct StatusBarView: View {
     @ObservedObject var meters: ChannelMeters
     let lanes: [SpeakerLane]
-    let sessionStates: [Int: RealtimeTranslationClient.State]
+    let sessionStates: [Int: LaneEngineState]
     let estimatedCost: Double
     let showCost: Bool
 
@@ -623,10 +623,10 @@ private struct LaneStatusDot: View {
     let lane: SpeakerLane
     let level: Float
     let open: Bool
-    let state: RealtimeTranslationClient.State?
+    let state: LaneEngineState?
     @AppStorage private var enabled: Bool
 
-    init(lane: SpeakerLane, level: Float, open: Bool, state: RealtimeTranslationClient.State?) {
+    init(lane: SpeakerLane, level: Float, open: Bool, state: LaneEngineState?) {
         self.lane = lane
         self.level = level
         self.open = open
@@ -662,10 +662,14 @@ private struct LaneStatusDot: View {
     }
 
     private var stateColor: Color {
+        // The seam's dot mapping (docs/CASCADE-PIPELINE.md §5.1):
+        // reconnecting stays yellow — the engine is still retrying, and
+        // red is reserved for a lane that has actually given up.
         switch state {
-        case .open: return .green
-        case .connecting: return .yellow
-        case .closed: return .red
+        case .running: return .green
+        case .starting, .reconnecting: return .yellow
+        case .degraded: return .orange
+        case .failed: return .red
         case .idle, nil: return .gray
         }
     }

@@ -368,7 +368,7 @@ private struct LanePipelineRow: View {
                     .font(.caption.bold())
                     .foregroundStyle(sessionStateColor)
             }
-            if let session = status.session {
+            if let session = realtimeSession {
                 Text("Sent \(seconds(session.audioSecondsSent)) audio (\(seconds(session.speechSecondsSent)) speech)\(session.chunksQueuedPreOpen > 0 ? ", \(session.chunksQueuedPreOpen) chunks queued pre-open" : "")\(session.sendFailures > 0 ? ", \(session.sendFailures) SEND FAILURES" : "")")
                     .font(.caption)
                     .foregroundStyle(session.sendFailures > 0 ? .red : .secondary)
@@ -392,10 +392,19 @@ private struct LanePipelineRow: View {
         .padding(.vertical, 2)
     }
 
+    /// The realtime client counters, when this lane runs the realtime
+    /// pipeline (always, until CP2 adds the cascade case and its own rows).
+    private var realtimeSession: RealtimeTranslationClient.Snapshot? {
+        switch status.session {
+        case .realtime(let session): return session
+        case nil: return nil
+        }
+    }
+
     private var sessionStateText: String {
-        switch status.session?.state {
+        switch realtimeSession?.state {
         case .open:
-            if let openFor = status.session?.openForSeconds {
+            if let openFor = realtimeSession?.openForSeconds {
                 return "open \(age(openFor, suffix: ""))"
             }
             return "open"
@@ -407,7 +416,7 @@ private struct LanePipelineRow: View {
     }
 
     private var sessionStateColor: Color {
-        switch status.session?.state {
+        switch realtimeSession?.state {
         case .open: return .green
         case .connecting: return .yellow
         case .closed: return .red

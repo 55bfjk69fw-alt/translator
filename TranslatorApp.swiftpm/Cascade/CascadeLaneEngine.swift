@@ -488,6 +488,7 @@ final class CascadeLaneEngine: LaneEngine {
             let seconds = Date().timeIntervalSince(closeAt)
             stats.lastFinalizeSeconds = seconds
             onMetric?(.sttFinalizeSeconds(seconds))
+            Log.info("[\(label)] settled with final (\(finalText.count) chars, finalize \(String(format: "%.2f", seconds))s, results \(utterance.volatileEvents)V/\(utterance.finalEvents)F)")
         }
         if settleKeepsSlot, slotState == .held {
             // 12 s split: hand the slot straight to the follow-on

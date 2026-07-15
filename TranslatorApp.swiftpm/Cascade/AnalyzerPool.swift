@@ -29,8 +29,8 @@ actor AnalyzerPool {
         var analyzer: SpeechAnalyzer?
         var transcriber: SpeechTranscriber?
         var continuation: AsyncStream<AnalyzerInput>.Continuation?
-        /// Total seconds of audio fed — the implicit-timeline cursor that
-        /// finalize(through:) targets. Carries across acquisitions.
+        /// Total seconds of audio fed (diagnostics only — finalization
+        /// is finish-at-utterance-end, no cursor targeting).
         var cursorSeconds: Double = 0
         var owner: (@Sendable (ResultEvent) -> Void)?
         var harvest: Task<Void, Never>?
@@ -141,6 +141,13 @@ actor AnalyzerPool {
             try await analyzer.prepareToAnalyze(in: analyzerFormat)
             let (stream, continuation) = AsyncStream.makeStream(of: AnalyzerInput.self)
             try await analyzer.start(inputSequence: stream)
+            // A Stop can land during the awaits above; a slot appended to
+            // a torn-down pool would hold its admission share into the
+            // NEXT conversation's build.
+            guard !tornDown else {
+                Task { await analyzer.cancelAndFinishNow() }
+                return false
+            }
             let slot = Slot(analyzer: analyzer, transcriber: transcriber, continuation: continuation)
             let slotIndex = slots.count
             slots.append(slot)
@@ -182,7 +189,13 @@ actor AnalyzerPool {
     /// Returns a slot index bound to `onResult`, suspending FIFO under
     /// contention. nil = pool empty or torn down.
     func acquire(onResult: @escaping @Sendable (ResultEvent) -> Void) async -> Int? {
-        guard !tornDown, poolSize > 0 else { return nil }
+        guard !tornDown else { return nil }
+        // Zero live slots is TRANSIENT with per-utterance slots (three
+        // simultaneous closes retire three slots at once; replacements
+        // are 0.25-0.75 s out) — wait as long as build() ever produced a
+        // pool, instead of failing the lane. A pool that never built at
+        // all is caught earlier by the readiness check.
+        guard poolSize > 0 || buildLocale != nil else { return nil }
         if let free = freeSlots.first {
             freeSlots.removeFirst()
             slots[free].owner = onResult
@@ -252,7 +265,7 @@ actor AnalyzerPool {
         if !finished {
             Log.warn("[pool] finish timed out on slot \(slotIndex) — cancelling")
             _ = await Self.awaitBounded(seconds: 2) {
-                try? await analyzer.cancelAndFinishNow()
+                await analyzer.cancelAndFinishNow()
             }
         }
         retire(slotIndex: slotIndex)
@@ -279,7 +292,7 @@ actor AnalyzerPool {
         guard slots.indices.contains(slotIndex), !slots[slotIndex].retired,
               let analyzer = slots[slotIndex].analyzer else { return }
         _ = await Self.awaitBounded(seconds: 2) {
-            try? await analyzer.cancelAndFinishNow()
+            await analyzer.cancelAndFinishNow()
         }
         retire(slotIndex: slotIndex)
     }
@@ -350,7 +363,7 @@ actor AnalyzerPool {
             if !finished {
                 Log.warn("[pool] slot \(index) finish timed out — abandoning")
                 _ = await Self.awaitBounded(seconds: 2) {
-                    try? await analyzer.cancelAndFinishNow()
+                    await analyzer.cancelAndFinishNow()
                 }
             }
             slot.harvest?.cancel()
@@ -365,9 +378,9 @@ actor AnalyzerPool {
 
     private func deliver(slotIndex: Int, event: ResultEvent) {
         guard slots.indices.contains(slotIndex) else { return }
-        // No owner = the window between release and the next acquire;
-        // stray late results are dropped by design (release only happens
-        // after the owner saw its final or timed out waiting).
+        // No owner = a retired slot's stragglers or the window around a
+        // virgin release — dropped by design (the engine's epoch stamp is
+        // the second line of defense).
         slots[slotIndex].owner?(event)
     }
 }

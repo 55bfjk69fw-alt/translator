@@ -247,13 +247,12 @@ final class CascadeLaneEngine: LaneEngine {
         }
 
         guard let converted = convertInput(buffer) else { return }
-        // Feed the slot ONLY while an utterance is open AND its close has
-        // not been requested: audio fed after the finalize command would
-        // sit un-finalized on the slot's timeline at release — the exact
-        // dangling-region hazard the full-cursor rule exists to prevent.
+        // Feed the slot ONLY while an utterance is open AND its close
+        // has not been requested — post-close audio belongs to the NEXT
+        // utterance (this slot is about to be finished and retired).
         // Everything else (slot wait, post-close tail, resumed speech
-        // racing a close) lands in the lane buffer and burst-feeds at the
-        // next acquisition.
+        // racing a close) lands in the lane buffer and burst-feeds at
+        // the next acquisition.
         if let utterance = current, utterance.closeRequestedAt == nil, slotState == .held {
             commands.yield(.feed(converted))
         } else {
@@ -332,7 +331,7 @@ final class CascadeLaneEngine: LaneEngine {
                     })
                     slot = granted
                     let wait = Date().timeIntervalSince(waitStart)
-                    self.queue.async { self.slotGranted(granted != nil, waitSeconds: wait) }
+                    self.queue.async { self.slotGranted(granted != nil, epoch: epoch, waitSeconds: wait) }
                 case .feed(let buffer):
                     if let slot { await self.context.pool.feed(slotIndex: slot, buffer: buffer) }
                 case .padSilence:
@@ -377,14 +376,41 @@ final class CascadeLaneEngine: LaneEngine {
         }
     }
 
-    private func slotGranted(_ granted: Bool, waitSeconds: Double) {
+    private func slotGranted(_ granted: Bool, epoch: Int, waitSeconds: Double) {
         guard !closed else { return }
         guard granted else {
             slotState = .none
-            // The pool died underneath us (all slots retired).
+            // nil grants now mean teardown or a never-built pool
+            // (transient zero-live waits pool-side).
             if current != nil {
-                state = .failed("speech model failed — restart the conversation")
+                state = .failed("speech model unavailable — check Settings → Translation pipeline")
             }
+            return
+        }
+        // STALE grant: this acquire belonged to an utterance that already
+        // settled (epoch bumped). Nothing has been fed on this binding,
+        // so the slot is genuinely virgin — hand it back, and if a LIVE
+        // utterance is riding the standing acquire, re-acquire under the
+        // current epoch so its results aren't epoch-dropped (review:
+        // standing acquires silently swallowed the successor utterance
+        // under contention).
+        if epoch != slotEpoch {
+            commands.yield(.release)
+            if current != nil {
+                commands.yield(.acquire(epoch: slotEpoch))
+                slotState = .acquiring
+            } else {
+                slotState = .none
+            }
+            return
+        }
+        // Grant landing inside a close's settle window: feeds are blocked
+        // (closeRequestedAt set), so the slot is virgin — return it
+        // rather than finishing a slot that never heard the audio; the
+        // utterance settles from its volatile state.
+        if current?.closeRequestedAt != nil {
+            commands.yield(.release)
+            slotState = .none
             return
         }
         if current == nil {
@@ -398,6 +424,9 @@ final class CascadeLaneEngine: LaneEngine {
             return
         }
         slotState = .held
+        // A successful grant proves the pool recovered — a lane reddened
+        // by a nil grant must not stay failed forever.
+        if case .failed = state { state = .running }
         // Count only genuine contention (an uncontended grant is a few ms
         // of actor hop) so the Diagnostics "waits" line means something.
         if waitSeconds > 0.05 {
@@ -476,8 +505,9 @@ final class CascadeLaneEngine: LaneEngine {
             // spawns a replacement; nothing more to do here.
             slotState = .none
         case .held:
-            // A slot granted AFTER the close request (feeds were blocked,
-            // so it is virgin) — hand it back intact for the next waiter.
+            // Defensive: unreachable after the grant-window guards above
+            // (requestClose converts held→finishing; post-close grants
+            // are released at slotGranted). Virgin by those guards.
             commands.yield(.release)
             slotState = .none
         case .acquiring, .none:

@@ -2,10 +2,11 @@ import Foundation
 import AVFoundation
 import Translation
 
-/// The on-device cascade lane engine (docs/CASCADE-PIPELINE.md §6–§7):
-/// gate-passed audio → AnalyzerPool slot (STT) → shared AppleTranslator →
-/// per-lane AppleSpeechSynth → 24 kHz PCM16 out through the existing
-/// playback seam. Free, offline, per-lane voice.
+/// The cascade lane engine (docs/CASCADE-PIPELINE.md §6–§7, §14):
+/// gate-passed audio → AnalyzerPool slot (STT) → the conversation's
+/// `Translator` (shared Apple session, or per-lane OpenAI with Apple
+/// fallback) → per-lane AppleSpeechSynth → 24 kHz PCM16 out through the
+/// existing playback seam.
 ///
 /// Threading: all mutable state is confined to `queue`. Pool interactions
 /// are serialized IN ORDER through one worker task consuming a command
@@ -19,12 +20,17 @@ final class CascadeLaneEngine: LaneEngine {
     var onNotice: ((LaneNotice) -> Void)?
     var onTranscript: ((TranscriptEvent) -> Void)?
     var onTranslatedAudio: ((Data) -> Void)?
-    var onCostDelta: ((Double) -> Void)?     // never fires: on-device, $0
+    var onCostDelta: ((Double) -> Void)?     // cloud MT token cost ($0 all-Apple)
     var onMetric: ((LaneMetric) -> Void)?
+    /// A NON-FALLBACK translation finalized: (sourceText, translation).
+    /// AppModel appends it to the shared context window on main and
+    /// pushes the window back into every cascade engine (§14.1).
+    var onTranslationPair: ((String, String) -> Void)?
 
     private let lane: Int
     private let queue: DispatchQueue
     private let context: CascadeContext
+    private let translator: any Translator
     private let synth: AppleSpeechSynth
 
     // MARK: - Pool worker (order-preserving bridge to the actor)
@@ -102,7 +108,14 @@ final class CascadeLaneEngine: LaneEngine {
     }
     private var mtQueue: [TranslationJob] = []
     private var mtInFlight = false
+    /// The in-flight job's id, for delta correlation — a straggler delta
+    /// from a resolved job must not repaint the bubble.
+    private var mtInFlightJob: UUID?
     private var translationDead = false
+    /// Cached copy of the cross-lane context window, PUSHED by AppModel
+    /// (never pulled — a lane-queue → main sync fetch would ABBA-deadlock
+    /// against the 1 Hz snapshot() sync, §14.1).
+    private var translationContext: [TranslationContextPair] = []
 
     private struct TTSJob {
         let id: UUID
@@ -122,7 +135,9 @@ final class CascadeLaneEngine: LaneEngine {
         finalChars: 0, slotWaits: 0, lastSlotWaitSeconds: nil,
         holdsSlot: false, bufferedAudioSeconds: 0, audioSkips: 0,
         lastFinalizeSeconds: nil, lastTranslateSeconds: nil,
-        lastTTSFirstAudioSeconds: nil, lastError: nil
+        lastTTSFirstAudioSeconds: nil, lastError: nil,
+        translationProvider: "apple", mtFallbacks: 0,
+        mtFallbackUnavailable: false
     )
 
     private var state: LaneEngineState = .idle {
@@ -144,9 +159,11 @@ final class CascadeLaneEngine: LaneEngine {
     /// every utterance's latency when finalization is slow.
     private static let finalWaitSeconds: TimeInterval = 1.2
 
-    init(lane: Int, context: CascadeContext, voiceIdentifier: String, speechRate: Double) {
+    init(lane: Int, context: CascadeContext, translator: any Translator,
+         voiceIdentifier: String, speechRate: Double) {
         self.lane = lane
         self.context = context
+        self.translator = translator
         self.label = "cascade ch\(lane)"
         self.queue = DispatchQueue(label: "translator.cascade.lane.\(lane)")
         self.synth = AppleSpeechSynth(
@@ -155,8 +172,16 @@ final class CascadeLaneEngine: LaneEngine {
             rate: speechRate,
             languageHint: context.targetLanguageCode
         )
+        stats.translationProvider = context.translationProviderLabel
         wireSynth()
+        wireTranslator()
         startWorker()
+    }
+
+    /// The pushed context window (see translationContext). Callable from
+    /// any thread; fire-and-forget.
+    func updateTranslationContext(_ window: [TranslationContextPair]) {
+        queue.async { self.translationContext = window }
     }
 
     // MARK: - LaneEngine
@@ -539,6 +564,23 @@ final class CascadeLaneEngine: LaneEngine {
 
     // MARK: - Translation stage (queue-confined; one in flight per lane)
 
+    /// Per-instance wiring: correct for per-lane providers (OpenAI); the
+    /// shared Apple instance gets clobbered by whichever lane wired last
+    /// but never fires either callback (see the Translator protocol).
+    private func wireTranslator() {
+        translator.onDelta = { [weak self] job, text in
+            self?.queue.async {
+                guard let self, !self.closed, self.mtInFlightJob == job, !text.isEmpty else { return }
+                self.onTranscript?(.translationText(utterance: job, text: text, isFinal: false))
+            }
+        }
+        // No queue hop: AppModel's sink (CostMeter) is thread-safe, same
+        // as the realtime engine's billing path.
+        translator.onCostDelta = { [weak self] dollars in
+            self?.onCostDelta?(dollars)
+        }
+    }
+
     private func pumpMT() {
         guard !mtInFlight, !closed, let job = mtQueue.first else { return }
         mtQueue.removeFirst()
@@ -548,38 +590,60 @@ final class CascadeLaneEngine: LaneEngine {
             return
         }
         mtInFlight = true
+        mtInFlightJob = job.id
+        // The cached PUSHED window as of this submit — utterance N ships
+        // with the window as of the previous finalization, which is the
+        // intended content (N itself is excluded by rule anyway, §14.1).
+        let window = translationContext
         let started = Date()
         Task { [weak self] in
             guard let self else { return }
             do {
-                let translated = try await self.context.translator.translate(job.sourceText, job: job.id)
-                self.queue.async { self.mtFinished(job: job, text: translated, started: started, error: nil) }
+                let result = try await self.translator.translate(job.sourceText, context: window, job: job.id)
+                self.queue.async { self.mtFinished(job: job, result: result, started: started, error: nil) }
             } catch {
-                self.queue.async { self.mtFinished(job: job, text: nil, started: started, error: error) }
+                self.queue.async { self.mtFinished(job: job, result: nil, started: started, error: error) }
             }
         }
     }
 
-    private func mtFinished(job: TranslationJob, text: String?, started: Date, error: Error?) {
+    private func mtFinished(job: TranslationJob, result: TranslationResult?, started: Date, error: Error?) {
         mtInFlight = false
+        mtInFlightJob = nil
         guard !closed else { return }
-        if let text {
+        if let result {
             let seconds = Date().timeIntervalSince(started)
             stats.lastTranslateSeconds = seconds
             stats.utterancesTranslated += 1
             onMetric?(.translationSeconds(seconds))
-            onTranscript?(.translationText(utterance: job.id, text: text, isFinal: true))
-            enqueueTTS(TTSJob(id: job.id, text: text, speechEndedAt: job.speechEndedAt, submittedAt: Date()))
+            onTranscript?(.translationText(utterance: job.id, text: result.text, isFinal: true))
+            if result.viaFallback {
+                // Fallback pairs stay OUT of the shared context window —
+                // they'd teach the literal style the cloud provider
+                // exists to avoid (§14.1).
+                stats.mtFallbacks += 1
+            } else {
+                onTranslationPair?(job.sourceText, result.text)
+            }
+            enqueueTTS(TTSJob(id: job.id, text: result.text, speechEndedAt: job.speechEndedAt, submittedAt: Date()))
         } else {
             let description = error?.localizedDescription ?? "unknown"
             stats.lastError = "translate: \(description)"
             Log.error("[\(label)] translation failed: \(description)")
             onTranscript?(.translationText(utterance: job.id, text: "", isFinal: true))
+            if let stage = error as? TranslationStageError, case .fallbackUnavailable = stage {
+                // Cloud MT failing AND no offline pack: every outage shows
+                // "—" — surface the missing-pack symptom in Diagnostics.
+                stats.mtFallbackUnavailable = true
+            }
             // A missing pack is stage-fatal but must not kill capture
             // (§8.2): transcription continues, translations show "—".
             // Typed check (TranslationError.notInstalled has a ~= operator
             // over `any Error`) — matching localizedDescription would
-            // break on non-English device locales.
+            // break on non-English device locales. Only the Apple-PRIMARY
+            // path ever surfaces it: the OpenAI translator maps a
+            // missing FALLBACK pack to TranslationStageError, so a
+            // recoverable cloud stage is never killed here.
             if let error, TranslationError.notInstalled ~= error {
                 translationDead = true
                 onNotice?(.raised(

@@ -530,11 +530,16 @@ protocol TranslationProviderFactory {
 
 protocol Translator: AnyObject {
     /// Serialized internally; callers may invoke from any queue. `job`
-    /// correlates streaming deltas with the awaited result — future
-    /// streaming providers deliver via onDelta(job, delta) before
-    /// returning the final text.
-    func translate(_ text: String, job: UUID) async throws -> String
+    /// correlates streaming deltas with the awaited result — streaming
+    /// providers deliver ACCUMULATED text via onDelta(job, textSoFar)
+    /// before resolving. `context` is the pushed cross-lane window
+    /// (§14.1); on-device providers ignore it. Each job resolves EXACTLY
+    /// once; TranslationResult.viaFallback marks a cloud job served by
+    /// its on-device fallback (excluded from the context window, counted
+    /// in Diagnostics).
+    func translate(_ text: String, context: [TranslationContextPair], job: UUID) async throws -> TranslationResult
     var onDelta: ((UUID, String) -> Void)? { get set }   // optional streaming hook
+    var onCostDelta: ((Double) -> Void)? { get set }     // cloud token cost; Apple never fires
     func cancelAll()
 }
 
@@ -1367,13 +1372,29 @@ provider-internal.
 
 ### 14.5 Slices & review gates
 
-(a) OpenAIChatTranslator + context window + fallback + cost + MT picker
-+ key row — the owner's daily driver. Slice-(a) code touchpoints noted
-by review: CascadeContext/engine move from concrete AppleTranslator to
-`any Translator`; the engine's per-lane FIFO comes from its own
+(a) **SHIPPED** — OpenAIChatTranslator + context window + fallback +
+cost + MT picker + key row — the owner's daily driver. Slice-(a) code
+touchpoints noted by review, all landed: CascadeContext/engine moved
+from concrete AppleTranslator to `any Translator` (context factory
+`makeTranslator(lane:)` owns provider-defined cardinality and Stop-time
+cancellation); the engine's per-lane FIFO comes from its own
 one-in-flight MT pump (not the protocol); the engine's "onCostDelta
-never fires" comment dies; OpenAI TTS later stamps TTSVoice.language
-with the requested language (its voices are language-agnostic). (b) OpenAITTSSynth + voice UI
+never fires" comment died. Implementation notes beyond the design
+sketch: `translate` returns `TranslationResult{text, viaFallback}` and
+takes the pushed `context` window as a parameter (the engine caches the
+window and hands it over per job — the fallback-exclusion rule needs
+the engine to KNOW a job fell back, and a flag on the result is
+race-free where a side-channel callback is not); the residual-NIT
+decisions — the global latch banner rides a context-level
+`OpenAITranslationHealth.onNotice` wired by AppModel into the id-keyed
+handleNotice (no lane attribution), and the half-open probe's cost
+flows through `health.onCostDelta` → CostMeter; a missing FALLBACK pack
+surfaces as `TranslationStageError.fallbackUnavailable` (Diagnostics
+symptom + snapshot flag), never `TranslationError.notInstalled`, which
+would trip the engine's Apple-primary stage-fatal latch and kill a
+recoverable cloud stage. OpenAI TTS later stamps TTSVoice.language with
+the requested language (its voices are language-agnostic).
+(b) OpenAITTSSynth + voice UI
 integration. (c) STT protocol extraction + OpenAISTTProvider — deferred
 until a use case demands it (mixed-language tables currently parked).
 Each slice: adversarial code review to LGTM + a field run before the

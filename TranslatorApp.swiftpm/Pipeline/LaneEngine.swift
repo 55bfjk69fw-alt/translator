@@ -118,6 +118,13 @@ struct CascadeSnapshot {
     var lastTranslateSeconds: Double?
     var lastTTSFirstAudioSeconds: Double?
     var lastError: String?
+    /// Translation stage provider tag ("apple" / "openai <model>", CP4).
+    var translationProvider: String
+    /// Jobs a cloud translator served via its on-device fallback.
+    var mtFallbacks: Int
+    /// A fallback attempt failed because the Apple pack isn't installed —
+    /// drives the Diagnostics "download the fallback pack" symptom.
+    var mtFallbackUnavailable: Bool
 }
 
 /// One instance per lane per conversation. Lifecycle is pipeline-dependent

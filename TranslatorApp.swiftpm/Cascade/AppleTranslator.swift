@@ -41,9 +41,14 @@ final class AppleTranslator: Translator {
 
     /// Apple's session is single-shot per string — no streaming deltas.
     var onDelta: ((UUID, String) -> Void)?
+    /// On-device translation is free — never fires.
+    var onCostDelta: ((Double) -> Void)?
 
-    func translate(_ text: String, job: UUID) async throws -> String {
-        try await withCheckedThrowingContinuation { continuation in
+    /// `context` is ignored: the headless session translates one string
+    /// at a time with no conversation awareness (the reason the OpenAI
+    /// provider exists, §14.1).
+    func translate(_ text: String, context: [TranslationContextPair], job: UUID) async throws -> TranslationResult {
+        let translated: String = try await withCheckedThrowingContinuation { continuation in
             // A yield racing cancelAll() lands on a finished stream and
             // would leak the continuation (hanging its lane's MT stage
             // forever) — fail it instead.
@@ -52,6 +57,7 @@ final class AppleTranslator: Translator {
                 continuation.resume(throwing: CancellationError())
             }
         }
+        return TranslationResult(text: translated, viaFallback: false)
     }
 
     /// Ends the worker; queued jobs already yielded still complete (the

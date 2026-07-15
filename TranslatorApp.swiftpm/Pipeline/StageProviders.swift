@@ -9,13 +9,45 @@ import Foundation
 // STT protocol gets extracted when the first per-lane cloud STT provider
 // arrives, rather than guessed now.
 
+/// One finalized source→translation exchange from the shared cross-lane
+/// context window (docs/CASCADE-PIPELINE.md §14.1). Built by AppModel on
+/// main (speaker names are main-confined) and PUSHED into engines — a
+/// lane engine's queue never blocks on main.
+struct TranslationContextPair {
+    let speaker: String
+    let source: String
+    let translation: String
+}
+
+/// What a translate job resolved to. `viaFallback` marks a cloud
+/// provider's job that was served by its on-device fallback — the engine
+/// counts it in Diagnostics and excludes the pair from the shared
+/// context window (fallback output would teach the literal style the
+/// cloud provider exists to avoid).
+struct TranslationResult {
+    let text: String
+    let viaFallback: Bool
+}
+
 /// Text-in/text-out translation. Implementations serialize internally;
-/// callers may invoke from any queue/task.
+/// callers may invoke from any queue/task. Each job resolves EXACTLY
+/// once (the single-resolution invariant, §14.1): a timeout-triggered
+/// fallback and a late cloud success must never both surface.
 protocol Translator: AnyObject {
     /// `job` correlates streaming deltas (onDelta) with the awaited
-    /// result. Single-shot providers (Apple, DeepL) never call onDelta.
-    func translate(_ text: String, job: UUID) async throws -> String
+    /// result. `context` is the pushed cross-lane window; on-device
+    /// providers ignore it.
+    func translate(_ text: String, context: [TranslationContextPair], job: UUID) async throws -> TranslationResult
+    /// Streaming translation-so-far (ACCUMULATED text, not increments —
+    /// the consumer replaces bubble text wholesale). Single-shot
+    /// providers (Apple) never call it. Stops firing once the job
+    /// resolves.
     var onDelta: ((UUID, String) -> Void)? { get set }
+    /// Monotonic dollar increments from token usage. On-device providers
+    /// never fire it. Wiring is per-instance: only per-lane providers may
+    /// fire this (the shared Apple instance has its closures clobbered by
+    /// whichever lane wired last — harmless only while it never calls).
+    var onCostDelta: ((Double) -> Void)? { get set }
     /// Ends the worker; in-flight jobs complete or fail, later submits
     /// fail fast. Stop-time only.
     func cancelAll()

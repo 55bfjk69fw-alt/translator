@@ -147,6 +147,15 @@ Differences from the realtime pipeline, by design
   and the Metrics tab has a per-stage cascade latency chart.
 - Cost shows `$0.00 · on-device`; the reply prompter still uses OpenAI
   (and the API key) if enabled.
+- **The translation stage can run on OpenAI instead** (Translation
+  pipeline → Translation → "OpenAI (cloud)"): a chat model (default
+  `gpt-5-mini`) translates each sentence WITH the scene line and the
+  last few cross-speaker exchanges as context — noticeably less literal
+  than the Apple packs on pronouns/ellipsis. Needs the API key and
+  network; bills per token (the cost meter counts it, and the
+  "on-device" tag drops). When the API is unreachable it falls back to
+  the Apple pack per sentence and recovers automatically. Recognition
+  and voices stay on-device.
 
 ## Signal tab — seeing and tuning the gate
 
@@ -285,6 +294,7 @@ profile.
   alternative to the realtime sessions (`docs/CASCADE-PIPELINE.md`).
 - [ ] Per-lane source language (mixed-language tables; fixes English
   speakers coming out garbled in cascade mode).
-- [ ] CP4: cloud cascade providers (OpenAI STT/TTS/translation,
-  ElevenLabs, DeepL) behind the same stage protocols.
+- [ ] CP4: cloud cascade providers behind the same stage protocols —
+  OpenAI translation SHIPPED (context-aware chat MT with Apple
+  fallback); OpenAI TTS next, OpenAI STT / ElevenLabs / DeepL deferred.
 - [ ] Head-to-head: Gemini Live translate / Azure Live Interpreter fallbacks.

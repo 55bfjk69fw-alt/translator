@@ -30,10 +30,40 @@ enum AppSettings {
     /// Last-selected pane of the Monitor tab (Signal/Metrics/Diagnostics).
     static let monitorPaneKey = "monitorPane"
 
-    // Cascade pipeline (docs/CASCADE-PIPELINE.md §8.1)
+    // Cascade pipeline (docs/CASCADE-PIPELINE.md §8.1, §14)
     static let pipelineKey = "pipeline"
     static let cascadeSourceLanguageKey = "cascadeSourceLanguage"
     static let cascadeSpeechRateKey = "cascadeSpeechRate"
+    static let cascadeTranslationProviderKey = "cascadeTranslationProvider"
+    static let cascadeTranslationModelKey = "cascadeTranslationModel"
+
+    /// Per-stage provider for the cascade's translation stage (§14.4).
+    /// Default Apple; read once at Start (latched in CascadeContext).
+    /// STT/TTS provider pickers arrive with their slices (b)/(c).
+    enum CascadeTranslationProvider: String, CaseIterable, Identifiable {
+        case apple
+        case openai
+        var id: String { rawValue }
+        var displayName: String {
+            switch self {
+            case .apple: return "Apple (on-device)"
+            case .openai: return "OpenAI (cloud)"
+            }
+        }
+    }
+
+    static var cascadeTranslationProvider: CascadeTranslationProvider {
+        CascadeTranslationProvider(rawValue: UserDefaults.standard.string(forKey: cascadeTranslationProviderKey) ?? "") ?? .apple
+    }
+
+    static let defaultCascadeTranslationModel = "gpt-5-mini"
+
+    /// Chat model for the OpenAI translation stage (§14.1) — mini-tier
+    /// default: context-aware MT needs judgment, not frontier reasoning.
+    static var cascadeTranslationModel: String {
+        let value = UserDefaults.standard.string(forKey: cascadeTranslationModelKey) ?? ""
+        return value.isEmpty ? defaultCascadeTranslationModel : value
+    }
 
     /// Which per-lane translation engine a conversation uses. Read once at
     /// Start; toggling mid-conversation applies to the next one.

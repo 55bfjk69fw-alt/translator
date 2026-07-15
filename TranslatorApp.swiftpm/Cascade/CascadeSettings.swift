@@ -199,15 +199,30 @@ struct CascadePipelineSection: View {
     @AppStorage(AppSettings.cascadeSourceLanguageKey) private var sourceLanguage = "zh-Hans"
     @AppStorage(AppSettings.cascadeSpeechRateKey) private var speechRate = 1.0
     @AppStorage(AppSettings.outputLanguageKey) private var outputLanguage = "en"
+    @AppStorage(AppSettings.cascadeTranslationProviderKey) private var translationProviderRaw = AppSettings.CascadeTranslationProvider.apple.rawValue
+    @AppStorage(AppSettings.cascadeTranslationModelKey) private var translationModel = ""
 
     @StateObject private var setup = CascadeSetupModel()
     @State private var preview = VoicePreviewPlayer()
     @State private var packConfig: TranslationSession.Configuration?
     /// Bumped to re-resolve lane voice choices after edits/downloads.
     @State private var voiceRefresh = 0
+    /// MT model picker source — fetched from /v1/models like the
+    /// prompter's picker; the static list covers fetch failure/no key.
+    @State private var availableModels: [String] = []
+    @State private var modelsNote: String?
+
+    private static let fallbackModels = [
+        "gpt-5.1", "gpt-5", "gpt-5-mini", "gpt-5-nano",
+        "gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini"
+    ]
 
     private var pipeline: AppSettings.Pipeline {
         AppSettings.Pipeline(rawValue: pipelineRaw) ?? .realtime
+    }
+
+    private var translationProvider: AppSettings.CascadeTranslationProvider {
+        AppSettings.CascadeTranslationProvider(rawValue: translationProviderRaw) ?? .apple
     }
 
     var body: some View {
@@ -222,7 +237,12 @@ struct CascadePipelineSection: View {
                     Button(setup.downloading ? "Downloading…" : "Download") { setup.downloadSTT() }
                         .disabled(setup.downloading)
                 }
-                statusRow("Translation pack", status: setup.translationStatus) {
+                // With OpenAI MT selected the pack is the per-job OFFLINE
+                // FALLBACK (§14.4): still downloadable here, because a
+                // user who never installed it must not discover that as
+                // "—" on every outage.
+                statusRow(translationProvider == .openai ? "Offline fallback pack" : "Translation pack",
+                          status: setup.translationStatus) {
                     Button("Download") {
                         if packConfig == nil {
                             packConfig = TranslationSession.Configuration(
@@ -235,6 +255,24 @@ struct CascadePipelineSection: View {
                     }
                 }
                 statusRow("Voices", status: setup.voiceStatus) { EmptyView() }
+                Picker("Translation", selection: $translationProviderRaw) {
+                    ForEach(AppSettings.CascadeTranslationProvider.allCases) { option in
+                        Text(option.displayName).tag(option.rawValue)
+                    }
+                }
+                if translationProvider == .openai {
+                    keyStatusRow
+                    Picker("Translation model", selection: $translationModel) {
+                        ForEach(modelChoices, id: \.self) { model in
+                            Text(model).tag(model)
+                        }
+                    }
+                    if let modelsNote {
+                        Text(modelsNote)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 Picker("Source language", selection: $sourceLanguage) {
                     ForEach(setup.sourceOptions, id: \.self) { code in
                         Text(Locale.current.localizedString(forIdentifier: code) ?? code).tag(code)
@@ -261,11 +299,17 @@ struct CascadePipelineSection: View {
         } header: {
             Text("Translation pipeline")
         } footer: {
-            Text(pipeline == .cascade
-                 ? "On-device: free, works offline once the model, pack, and voices are downloaded, and each speaker gets their own voice. Speech-end → translated audio runs ~1–2 s (the realtime pipeline translates mid-speech). Applies at the next Start. \(AppleTTSProvider.voiceDownloadHint)"
-                 : "Realtime (OpenAI) translates while people speak (~0.5–1.5 s, per-minute billing, needs the API key and network). The on-device cascade is free and offline-capable with a distinct voice per speaker. Applies at the next Start.")
+            Text(cascadeFooter)
         }
-        .onAppear { setup.refresh() }
+        .onAppear {
+            setup.refresh()
+            // The picker needs a concrete selection; materialize the
+            // default so the stored value and the UI always agree.
+            if translationModel.isEmpty { translationModel = AppSettings.defaultCascadeTranslationModel }
+        }
+        .task(id: translationProviderRaw) {
+            if translationProvider == .openai { await loadModels() }
+        }
         .translationTask(packConfig) { session in
             do {
                 try await session.prepareTranslation()
@@ -275,6 +319,60 @@ struct CascadePipelineSection: View {
             setup.refresh()
         }
         .onDisappear { preview.stop() }
+    }
+
+    private var cascadeFooter: String {
+        guard pipeline == .cascade else {
+            return "Realtime (OpenAI) translates while people speak (~0.5–1.5 s, per-minute billing, needs the API key and network). The on-device cascade is free and offline-capable with a distinct voice per speaker. Applies at the next Start."
+        }
+        if translationProvider == .openai {
+            return "Cascade with OpenAI translation: recognition and voices stay on-device; translation uses the chat model with recent-conversation context (per-token billing, needs the API key and network — falls back to the Apple pack per sentence when unreachable). Applies at the next Start. \(AppleTTSProvider.voiceDownloadHint)"
+        }
+        return "On-device: free, works offline once the model, pack, and voices are downloaded, and each speaker gets their own voice. Speech-end → translated audio runs ~1–2 s (the realtime pipeline translates mid-speech). Applies at the next Start. \(AppleTTSProvider.voiceDownloadHint)"
+    }
+
+    /// Fetched list first, static fallback otherwise; the current
+    /// selection is always present so the picker never shows an
+    /// unselectable state.
+    private var modelChoices: [String] {
+        var choices = availableModels.isEmpty ? Self.fallbackModels : availableModels
+        let current = translationModel.isEmpty ? AppSettings.defaultCascadeTranslationModel : translationModel
+        if !choices.contains(current) { choices.insert(current, at: 0) }
+        return choices
+    }
+
+    private func loadModels() async {
+        guard availableModels.isEmpty else { return }
+        guard let key = KeychainStore.loadAPIKey(), !key.isEmpty else {
+            modelsNote = "Add an API key to list your account's models — showing common ones."
+            return
+        }
+        do {
+            let models = try await ChatCompletionClient.listModels(apiKey: key)
+            if !models.isEmpty {
+                availableModels = models
+                modelsNote = nil
+            }
+        } catch {
+            modelsNote = "Couldn't fetch your model list — showing common models."
+            Log.warn("[cascade] model list fetch failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Key presence for the OpenAI MT stage (§14.1: the key is required
+    /// at Start again once any OpenAI stage is selected).
+    @ViewBuilder
+    private var keyStatusRow: some View {
+        let hasKey = !(KeychainStore.loadAPIKey() ?? "").isEmpty
+        HStack {
+            Label("API key", systemImage: hasKey ? "checkmark.circle.fill" : "xmark.circle")
+                .foregroundStyle(hasKey ? Color.green : Color.red)
+            Spacer()
+            Text(hasKey ? "saved" : "required — add it in Settings → OpenAI")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .font(.callout)
     }
 
     @ViewBuilder

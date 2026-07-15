@@ -79,6 +79,10 @@ final class AppModel: ObservableObject {
     /// Which pipeline the RUNNING conversation uses (drives the status
     /// bar's on-device annotation); meaningful while mode != .idle.
     @Published private(set) var conversationPipeline: AppSettings.Pipeline = .realtime
+    /// True when the running cascade conversation uses any CLOUD stage
+    /// (§14.4): the status bar's "· on-device" annotation drops because
+    /// cost is no longer zero.
+    @Published private(set) var cascadeUsesCloud = false
     @Published var errorBanner: String?
     /// The once-per-conversation cost alert. Separate from errorBanner so
     /// neither channel can overwrite the other (last-writer-wins on a shared
@@ -164,6 +168,12 @@ final class AppModel: ObservableObject {
     /// awaits it so the retiring slots' admission share doesn't
     /// under-size the new pool (main thread).
     private var lastCascadeTeardown: Task<Void, Never>?
+    /// Rolling window of the last few finalized cross-lane
+    /// source→translation pairs (main thread), PUSHED into cascade
+    /// engines at every finalization — never pulled from a lane queue
+    /// (docs/CASCADE-PIPELINE.md §14.1).
+    private var cascadeContextWindow: [TranslationContextPair] = []
+    private static let cascadeContextWindowSize = 6
     private var lastVoiceAt: [Int: Date] = [:]
     /// Last logged voiced state per channel (audioQueue-confined) so
     /// speech start/end transitions land in the diagnostics log.
@@ -251,10 +261,14 @@ final class AppModel: ObservableObject {
 
     func startConversation() {
         guard mode == .idle else { return }
-        // The on-device cascade needs no API key (the reply prompter
-        // still does, and degrades with its own messaging without one).
+        // The all-Apple cascade needs no API key (the reply prompter
+        // still does, and degrades with its own messaging without one);
+        // selecting any OpenAI cascade stage makes it required again
+        // (§14.1).
         let apiKey = KeychainStore.loadAPIKey() ?? ""
-        if AppSettings.pipeline == .realtime, apiKey.isEmpty {
+        let needsKey = AppSettings.pipeline == .realtime
+            || (AppSettings.pipeline == .cascade && AppSettings.cascadeTranslationProvider == .openai)
+        if needsKey, apiKey.isEmpty {
             errorBanner = "Add your OpenAI API key in Settings first."
             return
         }
@@ -396,7 +410,18 @@ final class AppModel: ObservableObject {
 
         let pipeline = AppSettings.pipeline
         conversationPipeline = pipeline
+        cascadeUsesCloud = false
+        cascadeContextWindow.removeAll()
         if pipeline == .cascade {
+            // Latched at Start like the languages: a Settings change
+            // applies to the next conversation.
+            let translation: CascadeContext.TranslationProvider
+            if AppSettings.cascadeTranslationProvider == .openai {
+                translation = .openAI(apiKey: apiKey, model: AppSettings.cascadeTranslationModel)
+                cascadeUsesCloud = true
+            } else {
+                translation = .apple
+            }
             // Pool cap = enabled lanes (§6.1.1's min(enabledLanes, 4)) —
             // one enabled mic must not warm three extra analyzers.
             let enabledCount = (0..<channelCount).filter { AppSettings.speakerEnabled($0) }.count
@@ -404,8 +429,21 @@ final class AppModel: ObservableObject {
                 sourceLanguage: AppSettings.cascadeSourceLanguage,
                 targetLanguage: AppSettings.outputLanguage,
                 laneCap: max(1, enabledCount),
+                translation: translation,
                 awaitingPriorTeardown: lastCascadeTeardown
             )
+            // The GLOBAL MT latch banner travels a context-level path,
+            // not a lane's (§14.1): network death is global, so no lane
+            // owns it. CostMeter is thread-safe — no hop for the probe's
+            // token cost.
+            if let health = cascadeContext?.translationHealth {
+                health.onNotice = { [weak self] notice in
+                    DispatchQueue.main.async { self?.handleNotice(notice) }
+                }
+                health.onCostDelta = { [weak self] dollars in
+                    self?.costMeter.addDollars(dollars)
+                }
+            }
         }
         audioQueue.sync {
             applyGateTuningLocked()
@@ -609,8 +647,8 @@ final class AppModel: ObservableObject {
 
     /// Create and wire a lane engine without registering or starting it.
     /// Safe to call from any thread (settings/keychain are thread-safe).
-    /// CP1: always the realtime adapter; the pipeline setting switches in
-    /// the cascade here (docs/CASCADE-PIPELINE.md §5.1) once CP2 lands.
+    /// The latched pipeline picks the engine kind here
+    /// (docs/CASCADE-PIPELINE.md §5.1).
     private func makeEngine(lane: Int, apiKey: String) -> any LaneEngine {
         let engine: any LaneEngine
         if activePipeline == .cascade, let context = cascadeContext {
@@ -623,12 +661,24 @@ final class AppModel: ObservableObject {
             if voice == nil {
                 Log.warn("No usable \(language) voice for lane \(lane) — TTS will fall back to a \(language) system voice")
             }
-            engine = CascadeLaneEngine(
+            let cascadeEngine = CascadeLaneEngine(
                 lane: lane,
                 context: context,
+                translator: context.makeTranslator(lane: lane),
                 voiceIdentifier: voice?.identifier ?? "",
                 speechRate: AppSettings.cascadeSpeechRate
             )
+            // Cross-lane context window (§14.1): finalized non-fallback
+            // pairs hop to main, where the window is rebuilt (speaker
+            // names are main-confined) and PUSHED into every cascade
+            // engine. An engine created mid-conversation (lane re-enable)
+            // starts with an empty window and fills on the next pair.
+            cascadeEngine.onTranslationPair = { [weak self] source, translation in
+                DispatchQueue.main.async {
+                    self?.recordCascadePair(lane: lane, source: source, translation: translation)
+                }
+            }
+            engine = cascadeEngine
         } else {
             engine = RealtimeLaneEngine(
                 lane: lane,
@@ -712,6 +762,32 @@ final class AppModel: ObservableObject {
                     self.metrics.recordCascadeStage(lane: lane, stage: "endToEnd", seconds: seconds)
                 }
             }
+        }
+    }
+
+    /// Main thread. One finalized cascade exchange (non-fallback, §14.1's
+    /// content rules) → append to the rolling window and PUSH the new
+    /// window into every cascade engine. Push-only by design: the MT pump
+    /// reads its cached copy on the lane queue, and a lane-queue → main
+    /// fetch would ABBA-deadlock against the 1 Hz snapshot() sync.
+    private func recordCascadePair(lane: Int, source: String, translation: String) {
+        guard mode != .idle, conversationPipeline == .cascade else { return }
+        // Engines only emit non-empty pairs; the guard is belt-and-
+        // suspenders for the window's content rules (no "—" exemplars).
+        let trimmed = translation.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !source.isEmpty, !trimmed.isEmpty, trimmed != "—" else { return }
+        cascadeContextWindow.append(TranslationContextPair(
+            speaker: laneName(lane), source: source, translation: trimmed
+        ))
+        if cascadeContextWindow.count > Self.cascadeContextWindowSize {
+            cascadeContextWindow.removeFirst(cascadeContextWindow.count - Self.cascadeContextWindowSize)
+        }
+        let window = cascadeContextWindow
+        let cascadeEngines = audioQueue.sync {
+            engines.values.compactMap { $0 as? CascadeLaneEngine }
+        }
+        for engine in cascadeEngines {
+            engine.updateTranslationContext(window)
         }
     }
 

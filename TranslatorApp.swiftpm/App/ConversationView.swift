@@ -109,7 +109,10 @@ struct ConversationView: View {
             showCost: model.mode != .idle,
             // Gated on .conversation: bench mode never sets the pipeline,
             // and a stale cascade value must not label a bench's $0.00.
+            // A cascade with any CLOUD stage (§14.4) drops the annotation
+            // — its cost is no longer zero.
             onDevice: model.mode == .conversation && model.conversationPipeline == .cascade
+                && !model.cascadeUsesCloud
         )
     }
 

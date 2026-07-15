@@ -393,6 +393,9 @@ private struct LanePipelineRow: View {
                 Text("Latency: finalize \(latency(cascade.lastFinalizeSeconds)) · translate \(latency(cascade.lastTranslateSeconds)) · TTS \(latency(cascade.lastTTSFirstAudioSeconds))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Text("Stages: STT apple · MT \(cascade.translationProvider) · TTS apple\(cascade.mtFallbacks > 0 ? " · \(cascade.mtFallbacks) MT fallback\(cascade.mtFallbacks == 1 ? "" : "s")" : "")")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 if let error = cascade.lastError {
                     Label(error, systemImage: "exclamationmark.triangle.fill")
                         .font(.caption)
@@ -424,7 +427,12 @@ private struct LanePipelineRow: View {
             lines.append("Utterances open but NO speech results return — check the speech model in Settings → Translation pipeline")
         }
         if snapshot.utterancesFinalized >= 2, snapshot.utterancesTranslated == 0 {
-            lines.append("Text finalizes but nothing translates — check the translation pack in Settings → Translation pipeline")
+            lines.append(snapshot.translationProvider == "apple"
+                ? "Text finalizes but nothing translates — check the translation pack in Settings → Translation pipeline"
+                : "Text finalizes but nothing translates — check network and the API key (Settings → OpenAI)")
+        }
+        if snapshot.mtFallbackUnavailable {
+            lines.append("Cloud translation failing and the offline fallback pack is not installed — download it in Settings → Translation pipeline")
         }
         if let wait = snapshot.lastSlotWaitSeconds, wait > 2 {
             lines.append(String(format: "Last slot wait %.1f s — simultaneous speakers exceeded the speech-model pool", wait))

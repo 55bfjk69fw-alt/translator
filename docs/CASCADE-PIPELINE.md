@@ -1213,3 +1213,122 @@ WWDC: [24-10117 Translation API](https://wwdcnotes.com/documentation/wwdc24-1011
 Field reports: [SpeechAnalyzer finalize latency (Apple forums 794720)](https://developer.apple.com/forums/thread/794720) · [concurrent SFSpeechRecognizer limits (688484)](https://developer.apple.com/forums/thread/688484) · [write() format bug (684419)](https://developer.apple.com/forums/thread/684419) · [write() callback regression (714984)](https://developer.apple.com/forums/thread/714984) · [iOS 17 TTS breakage (738048)](https://developer.apple.com/forums/thread/738048) · [Personal Voice × write() (736148)](https://developer.apple.com/forums/thread/736148) · [SpeechAnalyzer guide (Gubarenko)](https://antongubarenko.substack.com/p/ios-26-speechanalyzer-guide) · [MacStories hands-on](https://www.macstories.net/stories/hands-on-how-apples-new-speech-apis-outpace-whisper-for-lightning-fast-transcription/) · [on-device TTS eval (VoicePing)](https://voiceping.net/en/blog/research-offline-tts-eval/) · [neural-voice session pitfall](https://medium.com/@info_4533/why-avspeechsynthesizer-sounds-terrible-on-real-iphones-eb4565862ea8)
 Prior art: [Pipecat STTService](https://reference-server.pipecat.ai/en/stable/_modules/pipecat/services/stt_service.html) · [Pipecat TTSService](https://reference-server.pipecat.ai/en/latest/_modules/pipecat/services/tts_service.html) · [LiveKit stt.py](https://github.com/livekit/agents/blob/main/livekit-agents/livekit/agents/stt/stt.py) · [LiveKit tts.py](https://github.com/livekit/agents/blob/main/livekit-agents/livekit/agents/tts/tts.py) · [LiveKit TTS StreamAdapter](https://github.com/livekit/agents/blob/main/livekit-agents/livekit/agents/tts/stream_adapter.py)
 Future providers: [OpenAI realtime transcription](https://developers.openai.com/api/docs/guides/realtime-transcription) · [OpenAI TTS](https://developers.openai.com/api/docs/guides/text-to-speech) · [ElevenLabs stream-input](https://elevenlabs.io/docs/api-reference/text-to-speech/v-1-text-to-speech-voice-id-stream-input) · [DeepL Voice](https://developers.deepl.com/api-reference/voice)
+
+## 14. CP4 addendum: OpenAI stage providers (designed 2026-07-15)
+
+Decisions (owner): OpenAI only — ElevenLabs/DeepL deferred; **defaults
+stay Apple for all three stages**; the owner's day-to-day target is
+Apple STT + **OpenAI translation** + Apple TTS ("chat models handle
+context better than Apple's literal translations"), so MT is the
+flagship and ships first. Per-lane source language stays on the roadmap,
+out of CP4.
+
+### 14.1 OpenAIChatTranslator (the flagship — implementation slice a)
+
+A `Translator` implementation over chat completions, one instance PER
+LANE (unlike Apple's shared session): each lane's jobs stay FIFO via the
+protocol's internal serialization, while lanes translate in parallel —
+at 0.5–1.5 s/request, a shared serial queue would back up behind four
+chatty lanes in a way Apple's 62 ms never did.
+
+- **Context is the point**: the request carries (1) the scene line
+  (`AppSettings.sceneContext` — already user-maintained for the
+  prompter), (2) a rolling window of the last ~6 finalized
+  source→translation pairs ACROSS ALL LANES with speaker names (table
+  context disambiguates pronouns/ellipsis, which is exactly where
+  literal MT fails), and (3) the source utterance. System prompt pins:
+  translate SOURCE→TARGET, output the translation only, no
+  explanations, preserve register. The lane engine supplies the context
+  window via a closure wired by AppModel from TranscriptStore (same
+  pattern as `assist.transcriptWindow`).
+- **Model**: `cascadeTranslationModel` setting, default `gpt-5-mini`,
+  picker fed by the same /v1/models fetch SettingsView already does for
+  the prompter. Reasoning-family models get `reasoning_effort:
+  "minimal"` (research: MT latency balloons otherwise), mirroring
+  whatever AssistEngine/ChatCompletionClient already does — reuse that
+  client if its shape fits, else a thin sibling.
+- **Streaming**: SSE deltas → the existing `onDelta` hook →
+  `translationText(utterance:text:isFinal:false)` replaces live in the
+  bubble; TTS waits for the final (unchanged pipeline).
+- **Failure & offline**: bounded per-job timeout (8 s). On failure or
+  timeout: if the Apple pack for the pair is installed, fall back to
+  AppleTranslator FOR THAT JOB (log + Diagnostics counter; the fallback
+  translator is created lazily once); else the existing empty-final path
+  ("—"). Repeated failures (3 consecutive) raise the notice banner and
+  latch the fallback for the conversation (no per-utterance 8 s stalls
+  on a dead network) — un-latched only by Stop.
+- **Cost**: token usage from the API response × the model's price via
+  the existing AssistPricing table → `onCostDelta`. Unpriced models
+  count 0 with the same "excludes unpriced model" caveat the prompter
+  shows.
+- **Key requirement**: selecting any OpenAI stage makes the API key
+  required at Start again (cascade is keyless only when all-Apple);
+  setup card gains a key-status row per OpenAI stage.
+
+### 14.2 OpenAITTSSynth (slice b — small)
+
+`SpeechSynth` over `POST /v1/audio/speech`, `response_format: "pcm"` —
+natively 24 kHz mono PCM16 LE, i.e. zero-conversion into the playback
+seam. One instance per lane (its voice is fixed per lane); chunked
+response bytes stream to `onAudio` as they arrive (trim to Int16
+alignment), completion → `onFinished`. Model `gpt-4o-mini-tts`; the 13
+static voices surface through the existing per-lane voice UI under
+provider id "openai" (keys are already provider-scoped). Failure: job
+error → skip audio (existing path); no Apple fallback (a voice change
+mid-conversation is worse than one silent utterance). Cost:
+$/character via a pricing constant, → onCostDelta.
+
+### 14.3 OpenAIStreamingSTT (slice c — deferred until wanted)
+
+The deliberately-unwritten STT protocol gets extracted here, covering
+both topologies behind one engine-facing seam:
+
+```swift
+protocol STTSession: AnyObject {           // one per lane per UTTERANCE
+    func send(_ buffer: AVAudioPCMBuffer)  // converted to inputFormat
+    func endUtterance()                    // VAD close → flush finals
+    var onResult: ((STTResult) -> Void)? { get set }   // volatile/final + epoch handled by engine
+}
+protocol STTProvider: AnyObject {
+    var inputFormat: AVAudioFormat? { get async }
+    func acquireSession(lane: Int) async -> STTSession?  // suspends under contention
+    func teardown() async
+}
+```
+
+`AnalyzerPoolSTTProvider` adapts the existing pool (acquire →
+feed/pad/finishAndRetire mapped inside); `OpenAISTTProvider` holds one
+long-lived transcription WebSocket per lane (`session.type:
+"transcription"`, `turn_detection: null`, gpt-4o-mini-transcribe,
+24 kHz PCM16 input — the realtime client's resampler target, no new
+conversion), where `endUtterance` = `input_audio_buffer.commit`,
+deltas → volatile, `completed` → final. No admission limit ⇒
+acquireSession never waits; reconnect mirrors RealtimeLaneEngine's
+contract. Cost: $/audio-minute → onCostDelta. CascadeLaneEngine's
+worker keeps its command stream; the pool-specific commands become
+provider-internal.
+
+### 14.4 Settings & Diagnostics
+
+- Translation pipeline section gains three per-stage pickers
+  (Speech recognition / Translation / Voices), each "Apple (on-device)"
+  or "OpenAI (cloud)", DEFAULT APPLE, latched at Start like everything
+  else. The setup card shows only the selected providers' rows (Apple
+  rows as today; OpenAI rows = key present + model reachable).
+- Voice menus swap inventory with the TTS provider (static 13 for
+  OpenAI); ▶ preview works for both (OpenAI preview does one real
+  request, noting it costs a fraction of a cent).
+- Diagnostics cascade rows add per-stage provider tags and an MT
+  fallback counter; the status bar drops "· on-device" when any cloud
+  stage is selected (cost is no longer zero).
+- CascadeSnapshot gains mtFallbacks + provider labels; Metrics cascade
+  chart needs no change (stages are stages regardless of provider).
+
+### 14.5 Slices & review gates
+
+(a) OpenAIChatTranslator + context window + fallback + cost + MT picker
++ key row — the owner's daily driver. (b) OpenAITTSSynth + voice UI
+integration. (c) STT protocol extraction + OpenAISTTProvider — deferred
+until a use case demands it (mixed-language tables currently parked).
+Each slice: adversarial code review to LGTM + a field run before the
+next lands.

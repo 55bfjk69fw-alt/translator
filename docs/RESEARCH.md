@@ -65,9 +65,18 @@ Realtime API. Confidence noted where it matters.
 - Echo cancellation: avoid Apple voice processing with USB inputs (built for
   handset use; known crashes with route changes). In-ear playback + lav mics means
   AEC is largely unnecessary.
-- Background audio works for full apps (`audio` background mode) but that
-  entitlement is NOT available to Swift Playgrounds app playgrounds → foreground-only
-  until the app graduates to a CI-built Xcode project.
+- Background audio works for full apps (`audio` background mode). It is a plain
+  `UIBackgroundModes` Info.plist key — *not* an entitlement — and Swift
+  Playgrounds exposes no capability for it
+  ([forums 697971](https://developer.apple.com/forums/thread/697971)), so
+  Playgrounds-run builds are foreground-only. Loophole: the `iOSApplication`
+  product type accepts `additionalInfoPlistContentFilePath`, which can inject
+  the key into on-iPad builds
+  ([Rambo](https://www.rambo.codes/posts/2021-12-28-a-document-based-app-in-swift-playgrounds-for-ipad)),
+  but Playgrounds strips the property on manifest rewrites — including its own
+  App Store Connect upload ([FB9824864](https://github.com/feedback-assistant/reports/issues/269))
+  — so it can't ship that way. **2026-07: resolved** — the CI-built real app
+  (docs/DEPLOYMENT.md) carries `UIBackgroundModes: audio` in a real Info.plist.
 
 ## 3. On-iPad development
 
@@ -83,7 +92,12 @@ Realtime API. Confidence noted where it matters.
 - Safari/PWA route rejected: getUserMedia is mono-biased (no multichannel), no
   `setSinkId` on iOS, mic activation forces speaker/HFP re-routes.
 - Escape hatch if background audio or WebRTC ever needed: GitHub Actions macOS
-  runner + fastlane match → TestFlight, managed entirely from the iPad.
+  runner → TestFlight, managed entirely from the iPad. **2026-07: implemented**
+  (docs/DEPLOYMENT.md) — XcodeGen wraps the same `.swiftpm` sources in a real
+  Xcode project on the runner; Xcode *cloud signing* (App Store Connect API
+  key + `-allowProvisioningUpdates`) replaced the planned fastlane match, so
+  no certificate repo exists. `xcodebuild` archiving a `.swiftpm` app
+  playground directly was rejected as undocumented/fragile for unattended CI.
 
 ## 4. OpenAI Realtime API (mid-2026)
 

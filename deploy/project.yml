@@ -1,0 +1,61 @@
+# XcodeGen spec for the CI-built "real" app.
+#
+# Day-to-day development stays in TranslatorApp.swiftpm (Swift Playgrounds on
+# the iPad); this spec wraps the exact same source files in a real Xcode
+# project so CI can produce a signed, TestFlight-able build with capabilities
+# Playgrounds can't grant — most importantly UIBackgroundModes: audio
+# (deploy/Info.plist), so translation keeps running with the screen locked.
+#
+# Generated on the CI runner (never committed):
+#   xcodegen generate --spec deploy/project.yml --project deploy
+# See .github/workflows/testflight.yml and docs/DEPLOYMENT.md.
+
+name: Translator
+
+options:
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "18.0"
+
+settings:
+  base:
+    PRODUCT_BUNDLE_IDENTIFIER: com.stufflebeam.translator
+    MARKETING_VERSION: "0.1"
+    # Overridden per-build on CI with the workflow run number.
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.0"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    CODE_SIGN_STYLE: Automatic
+    # DEVELOPMENT_TEAM is passed on the xcodebuild command line from the
+    # APPLE_TEAM_ID secret so no team identifier lives in the repo.
+    GENERATE_INFOPLIST_FILE: false
+    INFOPLIST_FILE: Info.plist
+    ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+    SUPPORTS_MACCATALYST: false
+
+targets:
+  Translator:
+    type: application
+    platform: iOS
+    sources:
+      - path: ../TranslatorApp.swiftpm
+        name: Sources
+        excludes:
+          - "Package.swift"
+          - "Resources/**"
+          - ".swiftpm/**"
+      - path: ../TranslatorApp.swiftpm/Resources
+        name: Resources
+        buildPhase: resources
+      - path: Assets.xcassets
+
+schemes:
+  Translator:
+    build:
+      targets:
+        Translator: all
+    run:
+      config: Debug
+    archive:
+      config: Release

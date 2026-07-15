@@ -1,0 +1,82 @@
+# Builds a real, signed app from the same sources Swift Playgrounds uses and
+# uploads it to TestFlight. Trigger from the Actions tab ("Run workflow" —
+# works from Safari or the GitHub app on the iPad/iPhone) or by pushing a
+# v* tag. One-time setup (secrets, App Store Connect record): docs/DEPLOYMENT.md.
+#
+# Signing is Xcode cloud signing — the App Store Connect API key lets
+# xcodebuild create/fetch certs and profiles on the fly, so there are no
+# certificates or provisioning profiles to manage or store.
+
+name: TestFlight
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: testflight
+  cancel-in-progress: false
+
+jobs:
+  build-and-upload:
+    name: Archive & upload to TestFlight
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Write App Store Connect API key
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/asc"
+          printf '%s\n' "$ASC_KEY_P8" > "$RUNNER_TEMP/asc/AuthKey_${ASC_KEY_ID}.p8"
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec deploy/project.yml --project deploy
+
+      # CFBundleVersion must be unique per upload; the monotonically
+      # increasing workflow run number does that for free.
+      - name: Archive (cloud signing)
+        run: |
+          xcodebuild archive \
+            -project deploy/Translator.xcodeproj \
+            -scheme Translator \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath "$RUNNER_TEMP/Translator.xcarchive" \
+            CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/asc/AuthKey_${ASC_KEY_ID}.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+
+      - name: Upload to TestFlight
+        run: |
+          sed "s/__TEAM_ID__/$APPLE_TEAM_ID/" deploy/ExportOptions.plist \
+            > "$RUNNER_TEMP/ExportOptions.plist"
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/Translator.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/asc/AuthKey_${ASC_KEY_ID}.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+
+      - name: Summary
+        run: |
+          echo "Uploaded build $GITHUB_RUN_NUMBER (version $(sed -n 's/.*MARKETING_VERSION: "\(.*\)"/\1/p' deploy/project.yml | head -1))." >> "$GITHUB_STEP_SUMMARY"
+          echo "It appears in TestFlight after App Store Connect finishes processing (typically 5–15 min)." >> "$GITHUB_STEP_SUMMARY"

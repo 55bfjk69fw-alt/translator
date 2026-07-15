@@ -49,6 +49,17 @@ To iterate: pull the latest commits in Working Copy and re-open. (Swift Playgrou
 edits the copy, so re-export after pulling, or edit directly in Playgrounds for quick
 experiments.)
 
+## Getting the app onto your iPhone (or iPad home screen)
+
+Swift Playgrounds runs the app only inside Playgrounds on the iPad, and those
+builds are foreground-only. For a real installed app — on your iPhone, with
+**background audio** so translation keeps running while the phone is locked or
+in a pocket — CI builds the same sources into a signed TestFlight build on a
+GitHub-hosted Mac (no Mac of your own needed). One-time setup and the
+build-shipping flow are in **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**; after
+that it's Actions → TestFlight → Run workflow, then install from the
+TestFlight app.
+
 ## First run — bench test (do this before anything else)
 
 The single biggest hardware unknown is whether the DJI RX delivers 4 independent USB
@@ -245,9 +256,11 @@ profile.
 
 ## Roadmap
 
-- [ ] M6: TestFlight self-install (Apple Developer Program, upload from Playgrounds)
-  for a home-screen app; CI (GitHub Actions + fastlane) only if background audio is
-  ever required.
+- [x] M6: TestFlight self-install for a home-screen app — done via CI (GitHub
+  Actions macOS runner + XcodeGen + Xcode cloud signing → TestFlight), which
+  also unlocks background audio; see docs/DEPLOYMENT.md. (Upload from
+  Playgrounds was rejected: it can't carry `UIBackgroundModes`, and its App
+  Store Connect upload path strips custom Info.plist content.)
 - [ ] AirPods personal capture lane (transcribe the user's own speech hands-free)
   if the dual-input probe proves AirPods mic + USB can run together
   (docs/REPLY-FLOW.md §8).

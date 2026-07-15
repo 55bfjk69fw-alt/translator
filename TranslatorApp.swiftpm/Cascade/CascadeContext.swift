@@ -17,6 +17,14 @@ final class CascadeContext {
         case openAI(apiKey: String, model: String)
     }
 
+    /// The STT stage's provider, latched at Start (§5.2 cardinality is a
+    /// non-issue here: both providers are pool-shaped behind STTPool).
+    enum STTProvider {
+        case apple
+        /// Alibaba Bailian fun-asr-realtime (docs/DATONG-STT.md).
+        case funASR(apiKey: String, endpoint: URL)
+    }
+
     struct Readiness {
         let poolSize: Int
         let analyzerFormat: AVAudioFormat?
@@ -25,12 +33,17 @@ final class CascadeContext {
         /// FALLBACK, so a missing pack must not fail Start (the setup
         /// card shows it in fallback-status form instead).
         let cloudTranslation: Bool
+        /// Cloud STT selected: a zero-size pool means the key/network
+        /// failed the Start probe, not a missing on-device model.
+        let cloudSTT: Bool
         /// nil = ready; otherwise the user-facing reason the cascade
         /// cannot run (drives the lane .failed state and the banner
         /// pointing at the setup card).
         var failureText: String? {
             if poolSize == 0 || analyzerFormat == nil {
-                return "Speech recognition model unavailable — download it in Settings → Translation pipeline."
+                return cloudSTT
+                    ? "Fun-ASR unreachable — check the DashScope API key, region, and network in Settings → Translation pipeline."
+                    : "Speech recognition model unavailable — download it in Settings → Translation pipeline."
             }
             if !translationInstalled && !cloudTranslation {
                 return "Translation pack not installed — download it in Settings → Translation pipeline."
@@ -39,7 +52,9 @@ final class CascadeContext {
         }
     }
 
-    let pool = AnalyzerPool()
+    let pool: any STTPool
+    /// Diagnostics label for the STT stage ("apple" / "fun-asr-realtime").
+    let sttProviderLabel: String
     let sourceLocale: Locale
     let sourceLanguage: Locale.Language
     let targetLanguage: Locale.Language
@@ -74,6 +89,7 @@ final class CascadeContext {
     private let readinessTask: Task<Readiness, Never>
 
     init(sourceLanguage: String, targetLanguage: String, laneCap: Int,
+         stt: STTProvider,
          translation: TranslationProvider,
          awaitingPriorTeardown priorTeardown: Task<Void, Never>?) {
         let source = Locale.Language(identifier: sourceLanguage)
@@ -83,6 +99,23 @@ final class CascadeContext {
         self.targetLanguageCode = targetLanguage
         self.sourceLocale = Locale(identifier: sourceLanguage)
         self.translationProvider = translation
+
+        let cloudSTT: Bool
+        switch stt {
+        case .apple:
+            self.pool = AnalyzerPool()
+            self.sttProviderLabel = "apple"
+            cloudSTT = false
+        case .funASR(let apiKey, let endpoint):
+            self.pool = FunASRPool(config: FunASRPool.Config(
+                apiKey: apiKey,
+                endpoint: endpoint,
+                model: "fun-asr-realtime",
+                languageHint: Self.funASRLanguageHint(for: sourceLanguage)
+            ))
+            self.sttProviderLabel = "fun-asr-realtime"
+            cloudSTT = true
+        }
 
         let cloudTranslation: Bool
         switch translation {
@@ -131,9 +164,26 @@ final class CascadeContext {
                 poolSize: size,
                 analyzerFormat: format,
                 translationInstalled: await installed,
-                cloudTranslation: cloudTranslation
+                cloudTranslation: cloudTranslation,
+                cloudSTT: cloudSTT
             )
         }
+    }
+
+    /// Two-letter hint for fun-asr-realtime's language_hints (supported
+    /// codes from the API doc, 2026-07-15); nil = model auto-detects.
+    /// Dialects (晋语 et al.) are detected within "zh" — no dialect
+    /// parameter exists.
+    private static let funASRHintCodes: Set<String> = [
+        "zh", "en", "ja", "ko", "vi", "th", "id", "ms", "tl", "hi", "ar",
+        "fr", "de", "es", "pt", "ru", "it", "nl", "sv", "da", "fi", "no",
+        "el", "pl", "cs", "hu", "ro", "bg", "hr", "sk"
+    ]
+
+    private static func funASRLanguageHint(for sourceLanguage: String) -> String? {
+        guard let code = Locale.Language(identifier: sourceLanguage).languageCode?.identifier,
+              funASRHintCodes.contains(code) else { return nil }
+        return code
     }
 
     /// Awaitable, idempotent readiness (memoized by the task).

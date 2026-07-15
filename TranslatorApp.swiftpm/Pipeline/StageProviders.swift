@@ -3,11 +3,11 @@ import Foundation
 // Stage-provider protocols for the cascade pipeline
 // (docs/CASCADE-PIPELINE.md §5.2): the seam future cloud providers
 // (OpenAI, DeepL, ElevenLabs — CP4) implement so they drop in next to
-// the Apple ones without touching CascadeLaneEngine. The STT stage has
-// no protocol yet on purpose: the Apple implementation is pool-shaped
-// (AnalyzerPool serves lanes per utterance), and the per-lane streaming
-// STT protocol gets extracted when the first per-lane cloud STT provider
-// arrives, rather than guessed now.
+// the Apple ones without touching CascadeLaneEngine. The STT stage's
+// seam lives in Cascade/STTPool.swift instead: when its first cloud
+// provider arrived (FunASRPool, docs/DATONG-STT.md) the extraction
+// landed at the pool-verb altitude both implementations actually share,
+// not the per-stream shape sketched here.
 
 /// One finalized source→translation exchange from the shared cross-lane
 /// context window (docs/CASCADE-PIPELINE.md §14.1). Built by AppModel on

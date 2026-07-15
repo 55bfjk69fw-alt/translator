@@ -205,6 +205,10 @@ struct CascadePipelineSection: View {
     // first render — review NIT.
     @AppStorage(AppSettings.cascadeTranslationModelKey) private var translationModel = AppSettings.defaultCascadeTranslationModel
     @AppStorage(AppSettings.cascadeTranslationPriorityKey) private var translationPriority = false
+    @AppStorage(AppSettings.cascadeSTTProviderKey) private var sttProviderRaw = AppSettings.CascadeSTTProvider.apple.rawValue
+    @AppStorage(AppSettings.dashScopeRegionKey) private var dashScopeRegionRaw = AppSettings.DashScopeRegion.beijing.rawValue
+    @State private var dashScopeKey: String = KeychainStore.loadDashScopeKey() ?? ""
+    @State private var dashScopeKeySaved = false
 
     @StateObject private var setup = CascadeSetupModel()
     @State private var preview = VoicePreviewPlayer()
@@ -229,6 +233,10 @@ struct CascadePipelineSection: View {
         AppSettings.CascadeTranslationProvider(rawValue: translationProviderRaw) ?? .apple
     }
 
+    private var sttProvider: AppSettings.CascadeSTTProvider {
+        AppSettings.CascadeSTTProvider(rawValue: sttProviderRaw) ?? .apple
+    }
+
     var body: some View {
         Section {
             Picker("Pipeline", selection: $pipelineRaw) {
@@ -237,9 +245,25 @@ struct CascadePipelineSection: View {
                 }
             }
             if pipeline == .cascade {
-                statusRow("Speech recognition", status: setup.sttStatus) {
-                    Button(setup.downloading ? "Downloading…" : "Download") { setup.downloadSTT() }
-                        .disabled(setup.downloading)
+                Picker("Speech recognition", selection: $sttProviderRaw) {
+                    ForEach(AppSettings.CascadeSTTProvider.allCases) { option in
+                        Text(option.displayName).tag(option.rawValue)
+                    }
+                }
+                if sttProvider == .funasr {
+                    // Reachability/auth are probed at Start (readiness);
+                    // the card only asserts what it can check statically.
+                    dashScopeKeyRow
+                    Picker("DashScope region", selection: $dashScopeRegionRaw) {
+                        ForEach(AppSettings.DashScopeRegion.allCases) { option in
+                            Text(option.displayName).tag(option.rawValue)
+                        }
+                    }
+                } else {
+                    statusRow("Speech recognition", status: setup.sttStatus) {
+                        Button(setup.downloading ? "Downloading…" : "Download") { setup.downloadSTT() }
+                            .disabled(setup.downloading)
+                    }
                 }
                 // With OpenAI MT selected the pack is the per-job OFFLINE
                 // FALLBACK (§14.4): still downloadable here, because a
@@ -328,8 +352,14 @@ struct CascadePipelineSection: View {
         guard pipeline == .cascade else {
             return "Realtime (OpenAI) translates while people speak (~0.5–1.5 s, per-minute billing, needs the API key and network). The on-device cascade is free and offline-capable with a distinct voice per speaker. Applies at the next Start."
         }
+        let sttNote = sttProvider == .funasr
+            ? "Recognition uses Alibaba Fun-ASR (cloud) — built for Chinese dialects including Jin (晋语, the Datong area); needs the DashScope key and network, billed per second of speech. "
+            : ""
         if translationProvider == .openai {
-            return "Cascade with OpenAI translation: recognition and voices stay on-device; translation uses the chat model with recent-conversation context (per-token billing, needs the API key and network — falls back to the Apple pack per sentence when unreachable). Applies at the next Start. \(AppleTTSProvider.voiceDownloadHint)"
+            return "\(sttNote)Cascade with OpenAI translation: \(sttProvider == .funasr ? "voices stay" : "recognition and voices stay") on-device; translation uses the chat model with recent-conversation context (per-token billing, needs the API key and network — falls back to the Apple pack per sentence when unreachable). Applies at the next Start. \(AppleTTSProvider.voiceDownloadHint)"
+        }
+        if sttProvider == .funasr {
+            return "\(sttNote)Translation and voices stay on-device. Applies at the next Start. \(AppleTTSProvider.voiceDownloadHint)"
         }
         return "On-device: free, works offline once the model, pack, and voices are downloaded, and each speaker gets their own voice. Speech-end → translated audio runs ~1–2 s (the realtime pipeline translates mid-speech). Applies at the next Start. \(AppleTTSProvider.voiceDownloadHint)"
     }
@@ -359,6 +389,24 @@ struct CascadePipelineSection: View {
         } catch {
             modelsNote = "Couldn't fetch your model list — showing common models."
             Log.warn("[cascade] model list fetch failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// DashScope key for the Fun-ASR STT stage, stored in the Keychain
+    /// like the OpenAI key (SettingsView's idiom). Saved explicitly, not
+    /// per keystroke.
+    @ViewBuilder
+    private var dashScopeKeyRow: some View {
+        HStack {
+            SecureField("DashScope API key (sk-…)", text: $dashScopeKey)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            Button(dashScopeKeySaved ? "Saved ✓" : "Save") {
+                KeychainStore.saveDashScopeKey(dashScopeKey.trimmingCharacters(in: .whitespacesAndNewlines))
+                dashScopeKeySaved = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { dashScopeKeySaved = false }
+            }
+            .disabled(dashScopeKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
     }
 

@@ -393,7 +393,7 @@ private struct LanePipelineRow: View {
                 Text("Latency: finalize \(latency(cascade.lastFinalizeSeconds)) · translate \(latency(cascade.lastTranslateSeconds)) · TTS \(latency(cascade.lastTTSFirstAudioSeconds))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text("Stages: STT apple · MT \(cascade.translationProvider) · TTS apple\(cascade.mtFallbacks > 0 ? " · \(cascade.mtFallbacks) MT fallback\(cascade.mtFallbacks == 1 ? "" : "s")" : "")")
+                Text("Stages: STT \(cascade.sttProvider) · MT \(cascade.translationProvider) · TTS apple\(cascade.mtFallbacks > 0 ? " · \(cascade.mtFallbacks) MT fallback\(cascade.mtFallbacks == 1 ? "" : "s")" : "")")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if let error = cascade.lastError {

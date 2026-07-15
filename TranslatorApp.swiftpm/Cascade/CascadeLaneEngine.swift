@@ -136,8 +136,8 @@ final class CascadeLaneEngine: LaneEngine {
         holdsSlot: false, bufferedAudioSeconds: 0, audioSkips: 0,
         lastFinalizeSeconds: nil, lastTranslateSeconds: nil,
         lastTTSFirstAudioSeconds: nil, lastError: nil,
-        translationProvider: "apple", mtFallbacks: 0,
-        mtFallbackUnavailable: false
+        sttProvider: "apple", translationProvider: "apple",
+        mtFallbacks: 0, mtFallbackUnavailable: false
     )
 
     private var state: LaneEngineState = .idle {
@@ -172,6 +172,7 @@ final class CascadeLaneEngine: LaneEngine {
             rate: speechRate,
             languageHint: context.targetLanguageCode
         )
+        stats.sttProvider = context.sttProviderLabel
         stats.translationProvider = context.translationProviderLabel
         wireSynth()
         wireTranslator()
@@ -473,7 +474,7 @@ final class CascadeLaneEngine: LaneEngine {
 
     // MARK: - STT results (queue-confined)
 
-    private func handleResult(_ event: AnalyzerPool.ResultEvent, epoch: Int) {
+    private func handleResult(_ event: STTResultEvent, epoch: Int) {
         guard epoch == slotEpoch, !closed, var utterance = current else { return }
         // Trust results only while a slot is legitimately bound to this
         // utterance: .held (live capture) or .finishing (the close's

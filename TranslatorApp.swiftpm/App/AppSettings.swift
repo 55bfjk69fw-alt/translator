@@ -37,10 +37,59 @@ enum AppSettings {
     static let cascadeTranslationProviderKey = "cascadeTranslationProvider"
     static let cascadeTranslationModelKey = "cascadeTranslationModel"
     static let cascadeTranslationPriorityKey = "cascadeTranslationPriority"
+    static let cascadeSTTProviderKey = "cascadeSTTProvider"
+    static let dashScopeRegionKey = "dashScopeRegion"
+
+    /// Per-stage provider for the cascade's STT stage — slice (b) of the
+    /// provider pickers. Default Apple; read once at Start (latched in
+    /// CascadeContext). Fun-ASR is the dialect-capable cloud model
+    /// (docs/DATONG-STT.md).
+    enum CascadeSTTProvider: String, CaseIterable, Identifiable {
+        case apple
+        case funasr
+        var id: String { rawValue }
+        var displayName: String {
+            switch self {
+            case .apple: return "Apple (on-device)"
+            case .funasr: return "Alibaba Fun-ASR (dialect, cloud)"
+            }
+        }
+    }
+
+    static var cascadeSTTProvider: CascadeSTTProvider {
+        CascadeSTTProvider(rawValue: UserDefaults.standard.string(forKey: cascadeSTTProviderKey) ?? "") ?? .apple
+    }
+
+    /// Bailian/DashScope inference region. Beijing hosts the mainland
+    /// account's models; Singapore is the international endpoint (whether
+    /// it serves the dialect snapshot is UNVERIFIED — docs/DATONG-STT.md
+    /// §2.1). Legacy shared domains per the API doc; the per-workspace
+    /// domains can replace these when the workspace ID is worth a setting.
+    enum DashScopeRegion: String, CaseIterable, Identifiable {
+        case beijing
+        case singapore
+        var id: String { rawValue }
+        var displayName: String {
+            switch self {
+            case .beijing: return "China (Beijing)"
+            case .singapore: return "International (Singapore)"
+            }
+        }
+        var websocketURL: URL {
+            switch self {
+            case .beijing: return URL(string: "wss://dashscope.aliyuncs.com/api-ws/v1/inference")!
+            case .singapore: return URL(string: "wss://dashscope-intl.aliyuncs.com/api-ws/v1/inference")!
+            }
+        }
+    }
+
+    static var dashScopeRegion: DashScopeRegion {
+        DashScopeRegion(rawValue: UserDefaults.standard.string(forKey: dashScopeRegionKey) ?? "") ?? .beijing
+    }
 
     /// Per-stage provider for the cascade's translation stage (§14.4).
     /// Default Apple; read once at Start (latched in CascadeContext).
-    /// STT/TTS provider pickers arrive with their slices (b)/(c).
+    /// The TTS provider picker arrives with its slice (c).
     enum CascadeTranslationProvider: String, CaseIterable, Identifiable {
         case apple
         case openai

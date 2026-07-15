@@ -1411,3 +1411,51 @@ integration. (c) STT protocol extraction + OpenAISTTProvider — deferred
 until a use case demands it (mixed-language tables currently parked).
 Each slice: adversarial code review to LGTM + a field run before the
 next lands.
+
+## 15. Fun-ASR STT stage (implemented 2026-07-15)
+
+Provider research and selection: `docs/DATONG-STT.md` (owner decision:
+Datong-dialect coverage via Alibaba Bailian's `fun-asr-realtime`,
+explicit 晋语 support). This landed §14's deferred slice-(c) STT
+extraction early, with one deliberate deviation from §5.2's sketch:
+
+- **The seam is `STTPool` (Cascade/STTPool.swift), at the pool-verb
+  altitude** — `build / acquire / feed / feedSilence / finishAndRetire /
+  release / teardown` + `STTResultEvent{text, isFinal}` — not the
+  per-stream `STTProviderFactory`/`STTStream` shape. Rationale: what
+  CascadeLaneEngine actually consumes is AnalyzerPool's per-utterance
+  verb surface (ordered command worker, slot epochs, bounded settles),
+  and the Fun-ASR wire protocol maps 1:1 onto those verbs (acquire =
+  run-task, feed = binary frames, finishAndRetire = finish-task with the
+  final flushing during the call). Extracting at §5.2's altitude would
+  have rebuilt the engine's STT half for zero behavior gain. AnalyzerPool
+  conforms via a typealias; the engine is provider-blind.
+- **FunASRPool** (Cascade/FunASRPool.swift): one persistent WebSocket
+  per slot, reused across utterances via run-task/finish-task cycles
+  (doc-blessed after task-finished; dropped after task-failed — the doc
+  rule). Server partials are current-sentence replacement text (exactly
+  the volatile semantics the transcript replace-path renders) and
+  mid-task `sentence_end` finals map onto the engine's sub-segment
+  release. A dead socket costs one utterance (the engine's bounded
+  settle already tolerates a resultless close) and reconnects on the
+  next acquire. Sends are chained, never parallel (frame order). Start
+  readiness runs a bounded auth/reachability probe so a bad key fails
+  Start, not the first utterance.
+- **Selection/config**: Settings → Translation pipeline gains the STT
+  provider picker (slice (b)'s pattern), a Keychain-stored DashScope key,
+  and a region picker (Beijing / Singapore endpoints). Latched at Start
+  into `CascadeContext.STTProvider`; `language_hints` derives from the
+  cascade source language ("zh" → the model auto-detects dialect within
+  it — no dialect parameter exists).
+- **Cost**: the wire reports billed seconds per task (`usage.duration`);
+  the pool accumulates them and logs the total at teardown.
+  `FunASRPool.dollarsPerBilledSecond` is nil until the list price is
+  confirmed (owner, via Alibaba contacts) — set it and the meter lights
+  up through the existing CostMeter path.
+- **Open items**: 大同话 accuracy bench vs the Apple zh_CN baseline
+  (docs/DATONG-STT.md §3); whether the Singapore endpoint serves the
+  dialect snapshot; STT context injection (the API accepts a rolling
+  `input.context` window — the cross-lane MT context push (§14.1) is the
+  natural feeder, deferred until the bench proves the stage); a
+  mid-conversation failure notice channel (today: Diagnostics counters +
+  logs, utterances settle empty per §8's discipline).

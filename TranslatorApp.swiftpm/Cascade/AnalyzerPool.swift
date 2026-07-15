@@ -18,12 +18,10 @@ import Speech
 /// finish-at-utterance-end flushes finals in ~0.1 s (probe-proven). So
 /// slots are per-utterance, and every analyzer await is BOUNDED so a hung
 /// OS call can never wedge a lane's command worker.
-actor AnalyzerPool {
+actor AnalyzerPool: STTPool {
 
-    struct ResultEvent {
-        let text: String
-        let isFinal: Bool
-    }
+    /// The pool's original result shape, now the seam-wide one (STTPool).
+    typealias ResultEvent = STTResultEvent
 
     private final class Slot {
         var analyzer: SpeechAnalyzer?

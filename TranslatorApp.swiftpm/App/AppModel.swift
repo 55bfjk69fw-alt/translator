@@ -272,6 +272,13 @@ final class AppModel: ObservableObject {
             errorBanner = "Add your OpenAI API key in Settings first."
             return
         }
+        // The Fun-ASR STT stage needs ITS key (readiness would also catch
+        // this at the probe, but a missing key is user-fixable now).
+        if AppSettings.pipeline == .cascade, AppSettings.cascadeSTTProvider == .funasr,
+           (KeychainStore.loadDashScopeKey() ?? "").isEmpty {
+            errorBanner = "Add your DashScope API key in Settings → Translation pipeline first."
+            return
+        }
         errorBanner = nil
         stopping = false
         // The estimate next to the lane dots reads as "this conversation's
@@ -422,6 +429,16 @@ final class AppModel: ObservableObject {
             } else {
                 translation = .apple
             }
+            let stt: CascadeContext.STTProvider
+            if AppSettings.cascadeSTTProvider == .funasr {
+                stt = .funASR(
+                    apiKey: KeychainStore.loadDashScopeKey() ?? "",
+                    endpoint: AppSettings.dashScopeRegion.websocketURL
+                )
+                cascadeUsesCloud = true
+            } else {
+                stt = .apple
+            }
             // Pool cap = enabled lanes (§6.1.1's min(enabledLanes, 4)) —
             // one enabled mic must not warm three extra analyzers.
             let enabledCount = (0..<channelCount).filter { AppSettings.speakerEnabled($0) }.count
@@ -429,9 +446,21 @@ final class AppModel: ObservableObject {
                 sourceLanguage: AppSettings.cascadeSourceLanguage,
                 targetLanguage: AppSettings.outputLanguage,
                 laneCap: max(1, enabledCount),
+                stt: stt,
                 translation: translation,
                 awaitingPriorTeardown: lastCascadeTeardown
             )
+            // STT billing reaches the meter the moment the model's rate
+            // constant is set (nil today — pending list-price
+            // confirmation, docs/DATONG-STT.md §2.1); billed seconds are
+            // counted pool-side either way.
+            if let funASRPool = cascadeContext?.pool as? FunASRPool {
+                Task { [weak self] in
+                    await funASRPool.setCostSink { dollars in
+                        self?.costMeter.addDollars(dollars)
+                    }
+                }
+            }
             // The GLOBAL MT latch banner travels a context-level path,
             // not a lane's (§14.1): network death is global, so no lane
             // owns it. CostMeter is thread-safe — no hop for the probe's

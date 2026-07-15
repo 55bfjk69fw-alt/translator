@@ -122,7 +122,11 @@ the natural in-app home if this graduates from manual testing.
 ## 4. Decision (owner, 2026-07-15)
 
 Build the **Alibaba Fun-ASR-Realtime** STT stage first, on top of the
-cascade branch. iFlytek remains the escalation path for dialect
+cascade branch. **Implemented same day**: `Cascade/STTPool.swift` (the
+extracted STT seam), `Cascade/FunASRPool.swift` (the provider), and the
+Settings/AppModel wiring — design notes in `docs/CASCADE-PIPELINE.md`
+§15. The per-second rate is left nil in `FunASRPool` until the list
+price is confirmed; billed seconds are counted and logged regardless. iFlytek remains the escalation path for dialect
 fidelity; self-hosting remains the fine-tuning path. Two follow-ups ride
 on owner's Alibaba contacts: exact fun-asr-realtime list pricing, and
 whether the dialect snapshot is served from the international endpoint.

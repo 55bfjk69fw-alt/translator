@@ -1,12 +1,30 @@
 import Foundation
 import Security
 
-/// Minimal keychain wrapper for the OpenAI API key.
+/// Minimal keychain wrapper for the API keys (OpenAI + DashScope).
 enum KeychainStore {
-    private static let service = "com.stufflebeam.translator.openai"
+    private static let openAIService = "com.stufflebeam.translator.openai"
+    private static let dashScopeService = "com.stufflebeam.translator.dashscope"
     private static let account = "api-key"
 
     static func saveAPIKey(_ key: String) {
+        save(key, service: openAIService)
+    }
+
+    static func loadAPIKey() -> String? {
+        load(service: openAIService)
+    }
+
+    /// DashScope key for the Fun-ASR STT stage (docs/DATONG-STT.md).
+    static func saveDashScopeKey(_ key: String) {
+        save(key, service: dashScopeService)
+    }
+
+    static func loadDashScopeKey() -> String? {
+        load(service: dashScopeService)
+    }
+
+    private static func save(_ key: String, service: String) {
         let data = Data(key.utf8)
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -24,7 +42,7 @@ enum KeychainStore {
         }
     }
 
-    static func loadAPIKey() -> String? {
+    private static func load(service: String) -> String? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,

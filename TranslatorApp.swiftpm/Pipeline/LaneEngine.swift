@@ -118,6 +118,8 @@ struct CascadeSnapshot {
     var lastTranslateSeconds: Double?
     var lastTTSFirstAudioSeconds: Double?
     var lastError: String?
+    /// STT stage provider tag ("apple" / "fun-asr-realtime").
+    var sttProvider: String
     /// Translation stage provider tag ("apple" / "openai <model>", CP4).
     var translationProvider: String
     /// Jobs a cloud translator served via its on-device fallback.

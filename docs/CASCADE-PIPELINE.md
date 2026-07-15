@@ -1304,6 +1304,11 @@ chatty lanes in a way Apple's 62 ms never did.
   the existing AssistPricing table → `onCostDelta`. Unpriced models
   count 0 with the same "excludes unpriced model" caveat the prompter
   shows.
+- **Priority tier**: `cascadeTranslationPriority` — a toggle SEPARATE
+  from the prompter's (owner request; translation latency is heard in
+  the ear every sentence, so its spend knob is its own). Read live per
+  request like the prompter's; metered cost is doubled while on
+  (AssistPricing is standard-rate, priority bills ~2×).
 - **Key requirement**: selecting any OpenAI stage makes the API key
   required at Start again (cascade is keyless only when all-Apple);
   setup card gains a key-status row per OpenAI stage.

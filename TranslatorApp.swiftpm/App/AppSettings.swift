@@ -36,6 +36,7 @@ enum AppSettings {
     static let cascadeSpeechRateKey = "cascadeSpeechRate"
     static let cascadeTranslationProviderKey = "cascadeTranslationProvider"
     static let cascadeTranslationModelKey = "cascadeTranslationModel"
+    static let cascadeTranslationPriorityKey = "cascadeTranslationPriority"
 
     /// Per-stage provider for the cascade's translation stage (§14.4).
     /// Default Apple; read once at Start (latched in CascadeContext).
@@ -63,6 +64,15 @@ enum AppSettings {
     static var cascadeTranslationModel: String {
         let value = UserDefaults.standard.string(forKey: cascadeTranslationModelKey) ?? ""
         return value.isEmpty ? defaultCascadeTranslationModel : value
+    }
+
+    /// OpenAI priority tier for the cascade MT stage, SEPARATE from the
+    /// prompter's toggle (translation latency is heard in the ear every
+    /// sentence; prompter latency is glanced at). Like the prompter's,
+    /// read live per request — safe to flip mid-conversation, no latch
+    /// needed (nothing becomes inconsistent).
+    static var cascadeTranslationPriority: Bool {
+        UserDefaults.standard.bool(forKey: cascadeTranslationPriorityKey)
     }
 
     /// Which per-lane translation engine a conversation uses. Read once at

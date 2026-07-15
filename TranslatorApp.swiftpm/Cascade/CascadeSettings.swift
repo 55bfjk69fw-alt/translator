@@ -204,6 +204,7 @@ struct CascadePipelineSection: View {
     // SettingsView's) so the Picker's selection matches a tag on the very
     // first render — review NIT.
     @AppStorage(AppSettings.cascadeTranslationModelKey) private var translationModel = AppSettings.defaultCascadeTranslationModel
+    @AppStorage(AppSettings.cascadeTranslationPriorityKey) private var translationPriority = false
 
     @StateObject private var setup = CascadeSetupModel()
     @State private var preview = VoicePreviewPlayer()
@@ -275,6 +276,10 @@ struct CascadePipelineSection: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
+                    // Deliberately separate from the prompter's priority
+                    // toggle: translation latency is heard in the ear on
+                    // every sentence, so its spend knob is its own.
+                    Toggle("Priority processing (≈2× token price)", isOn: $translationPriority)
                 }
                 Picker("Source language", selection: $sourceLanguage) {
                     ForEach(setup.sourceOptions, id: \.self) { code in

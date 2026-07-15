@@ -360,7 +360,11 @@ struct OpenAITranslationRequest {
         } else if model.hasPrefix("o1") || model.hasPrefix("o3") || model.hasPrefix("o4") {
             payload["reasoning_effort"] = "low"
         }
-        if AppSettings.priorityProcessing {
+        // The CASCADE toggle, not the prompter's (separate spend knobs —
+        // owner request): read live like the prompter's, so flipping it
+        // mid-conversation applies from the next sentence.
+        let priority = AppSettings.cascadeTranslationPriority
+        if priority {
             payload["service_tier"] = "priority"
         }
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
@@ -402,9 +406,11 @@ struct OpenAITranslationRequest {
                 completionTokens = usage["completion_tokens"] as? Int ?? 0
             }
         }
+        // Priority tier bills ~2× the standard table (AssistPricing is
+        // standard-rate) — approximate rather than silently under-count.
         let cost = AssistPricing.estimatedDollars(
             model: model, promptTokens: promptTokens, completionTokens: completionTokens
-        )
+        ).map { priority ? $0 * 2 : $0 }
         return (accumulated.trimmingCharacters(in: .whitespacesAndNewlines), cost)
     }
 }

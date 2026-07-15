@@ -158,7 +158,12 @@ final class CascadeContext {
                 apiKey: apiKey,
                 model: model,
                 sourceName: english.localizedString(forIdentifier: sourceLanguage) ?? sourceLanguage,
-                targetName: english.localizedString(forIdentifier: targetLanguage) ?? targetLanguage
+                targetName: english.localizedString(forIdentifier: targetLanguage) ?? targetLanguage,
+                // Field-observed Mandarin cross-script STT errors; the
+                // concrete pairs anchor the sound-reading rule.
+                soundAlikeHint: sourceLanguage.hasPrefix("zh")
+                    ? "For example, 好 may appear as “how”, and 是 as “xi” or “shi”."
+                    : nil
             )
             self.openAIRequest = request
             // The half-open recovery probe: a tiny synthetic request,

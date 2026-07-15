@@ -1250,9 +1250,13 @@ chatty lanes in a way Apple's 62 ms never did.
   explanations, preserve register, natural/idiomatic over
   word-for-word. It also declares the input as a raw STT transcript
   with CLOSED correction rules (owner request, post-slice-(a)): fix
-  only clear homophone-class mis-recognitions, drop fillers, and when
-  unsure translate what is written — never add unsupported content.
-  Closed rules on purpose: an open-ended "the transcript may be wrong"
+  only clear sound-alike mis-recognitions — same-script homophones AND
+  cross-script Latin fragments (field-observed: 好 transcribed as
+  "how", 是 as "xi"; a per-source-language example line anchors the
+  rule, zh only for now) — read by SOUND and context-gated; keep
+  deliberate code-switched foreign words; drop fillers; when unsure
+  translate what is written — never add unsupported content. Closed
+  rules on purpose: an open-ended "the transcript may be wrong"
   invites confident confabulation, worst on the parked
   English-into-Mandarin-model case.
   **Mechanism — PUSH, never pull** (a pull closure à la

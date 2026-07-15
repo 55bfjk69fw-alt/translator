@@ -106,7 +106,8 @@ struct MetricsSnapshot {
 
     var realtimeCostTotal: Double { samples.last?.realtimeCost ?? 0 }
     var isEmpty: Bool {
-        samples.isEmpty && connects.isEmpty && firstResponses.isEmpty && assistRequests.isEmpty
+        samples.isEmpty && connects.isEmpty && firstResponses.isEmpty
+            && cascadeStages.isEmpty && assistRequests.isEmpty
     }
 
     static let empty = MetricsSnapshot(

@@ -1174,8 +1174,10 @@ expectations.
   providers, CascadeLaneEngine, TranscriptStore changes (§7.1),
   settings + setup card + per-lane voices. First real conversations
   validate the §7 latency table next.
-- **CP3 — polish**: cascade Diagnostics/Metrics rendering, degraded-mode
-  UX, voice previews, speech-rate slider, README/docs.
+- **CP3 — polish** — SHIPPED (reviewed, LGTM): cascade Metrics series +
+  chart, on-device cost annotation, Diagnostics symptom rows, body-safe
+  voice resolution, README cascade section. (Voice previews, the
+  speech-rate slider, and degraded-mode UX had already shipped with CP2.)
 - **CP4 — cloud providers** (separate follow-up): OpenAI STT/MT/TTS
   implementations of the same protocols, provider pickers per stage,
   cost plumbing for mixed pipelines. DeepL Voice fused-provider path

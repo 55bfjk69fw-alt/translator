@@ -107,7 +107,9 @@ struct ConversationView: View {
             sessionStates: model.sessionStates,
             estimatedCost: model.estimatedCost,
             showCost: model.mode != .idle,
-            onDevice: model.conversationPipeline == .cascade
+            // Gated on .conversation: bench mode never sets the pipeline,
+            // and a stale cascade value must not label a bench's $0.00.
+            onDevice: model.mode == .conversation && model.conversationPipeline == .cascade
         )
     }
 

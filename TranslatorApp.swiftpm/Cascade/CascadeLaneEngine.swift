@@ -31,10 +31,10 @@ final class CascadeLaneEngine: LaneEngine {
 
     private enum Command {
         case waitReady
-        case acquire
+        case acquire(epoch: Int)
         case feed(AVAudioPCMBuffer)
         case padSilence
-        case finalize
+        case finishSlot
         case release
         case teardownLane
     }
@@ -65,8 +65,16 @@ final class CascadeLaneEngine: LaneEngine {
         case none
         case acquiring
         case held
+        /// Close requested; the worker is finishing the slot (finals
+        /// arrive DURING the finish and must still be accepted).
+        case finishing
     }
     private var slotState: SlotState = .none
+    /// Bumped at every settle: results are stamped with the epoch their
+    /// slot was acquired under, so a straggler final flushing from a
+    /// retiring slot can never attach to the NEXT utterance even if it
+    /// already acquired a fresh slot (the timed-out-settle race).
+    private var slotEpoch = 0
 
     /// One utterance flowing through capture → finalize; MT/TTS stages
     /// track their own queues below.
@@ -166,9 +174,9 @@ final class CascadeLaneEngine: LaneEngine {
         queue.async {
             guard !self.closed else { return }
             self.closed = true
-            // Lane close releases — never finishes — its slot (§7):
-            // slots are shared; only CascadeContext.teardown() at Stop
-            // finishes analyzers.
+            // Per-utterance slots: a lane close finishes its in-flight
+            // slot (the pool retires it and spawns a replacement) — the
+            // old lanes-never-finish rule died with long-lived slots.
             if self.slotState != .none { self.commands.yield(.teardownLane) }
             self.commands.finish()
             self.mtQueue.removeAll()
@@ -187,7 +195,7 @@ final class CascadeLaneEngine: LaneEngine {
     func snapshot() -> LaneEngineSnapshot {
         queue.sync {
             var copy = stats
-            copy.holdsSlot = slotState == .held
+            copy.holdsSlot = slotState == .held || slotState == .finishing
             copy.bufferedAudioSeconds = laneBufferSeconds
             return .cascade(copy)
         }
@@ -212,13 +220,13 @@ final class CascadeLaneEngine: LaneEngine {
                 ? Self.fastCloseSeconds : Self.slowCloseSeconds
             if utterance.closeRequestedAt == nil {
                 if quiet > threshold {
-                    requestClose(reason: "quiet \(String(format: "%.2f", quiet))s", keepSlot: false)
+                    requestClose(reason: "quiet \(String(format: "%.2f", quiet))s")
                 } else if now.timeIntervalSince(utterance.openedAt) > Self.maxUtteranceSeconds {
-                    // 12 s hard split: a normal full-cursor close that
-                    // KEEPS the slot — capture continues under a new
-                    // utterance the moment the final lands (audio bridges
-                    // the ~0.1 s finalize wait in the lane buffer).
-                    requestClose(reason: "12s split", keepSlot: true)
+                    // 12 s hard split: a normal close — per-utterance
+                    // slots mean the follow-on utterance simply acquires
+                    // the next slot; interim audio bridges in the lane
+                    // buffer.
+                    requestClose(reason: "12s split")
                 }
             }
         }
@@ -259,22 +267,22 @@ final class CascadeLaneEngine: LaneEngine {
         stats.utterancesOpened += 1
         if slotState == .none {
             slotState = .acquiring
-            commands.yield(.acquire)
+            commands.yield(.acquire(epoch: slotEpoch))
         }
     }
 
-    private func requestClose(reason: String, keepSlot: Bool) {
+    private func requestClose(reason: String) {
         guard var utterance = current, utterance.closeRequestedAt == nil else { return }
         utterance.closeRequestedAt = Date()
         current = utterance
-        settleKeepsSlot = keepSlot && slotState == .held
         Log.info("[\(label)] utterance close (\(reason))")
         if slotState == .held {
-            // Silence pad first: end-of-speech evidence + input progress
-            // past the boundary, without which the transcriber was
-            // observed never flushing its finalization on-device.
+            // Silence pad (end-of-speech evidence), then finish the slot:
+            // the finish flushes the final result (probe-proven ~0.1 s)
+            // and retires the slot; a replacement builds in the pool.
             commands.yield(.padSilence)
-            commands.yield(.finalize)
+            commands.yield(.finishSlot)
+            slotState = .finishing
         }
         // Bounded wait for the final result: if the analyzer recognized
         // nothing (or the slot was never acquired), settle with the
@@ -303,14 +311,6 @@ final class CascadeLaneEngine: LaneEngine {
         stats.utterancesOpened += 1
     }
 
-    /// Set when a close should hand its slot straight to the follow-on
-    /// utterance (the 12 s split) instead of releasing it.
-    private var settleKeepsSlot = false
-    /// Set by a timed-out settle: the finalize's real final may still be
-    /// in flight, and the next final to arrive on this lane is that
-    /// straggler — swallow it instead of attributing it to a newer
-    /// utterance.
-    private var staleDropUntilFinal = false
 
     // MARK: - Pool worker
 
@@ -325,10 +325,10 @@ final class CascadeLaneEngine: LaneEngine {
                 case .waitReady:
                     let readiness = await self.context.ready()
                     self.queue.async { self.readinessResolved(readiness) }
-                case .acquire:
+                case .acquire(let epoch):
                     let waitStart = Date()
                     let granted = await self.context.pool.acquire(onResult: { [weak self] event in
-                        self?.queue.async { self?.handleResult(event) }
+                        self?.queue.async { self?.handleResult(event, epoch: epoch) }
                     })
                     slot = granted
                     let wait = Date().timeIntervalSince(waitStart)
@@ -337,16 +337,14 @@ final class CascadeLaneEngine: LaneEngine {
                     if let slot { await self.context.pool.feed(slotIndex: slot, buffer: buffer) }
                 case .padSilence:
                     if let slot { await self.context.pool.feedSilence(slotIndex: slot, seconds: 0.6) }
-                case .finalize:
-                    if let slot { await self.context.pool.finalizeCurrent(slotIndex: slot) }
+                case .finishSlot:
+                    if let slot { await self.context.pool.finishAndRetire(slotIndex: slot) }
+                    slot = nil
                 case .release:
                     if let slot { await self.context.pool.release(slotIndex: slot) }
                     slot = nil
                 case .teardownLane:
-                    if let slot {
-                        await self.context.pool.finalizeCurrent(slotIndex: slot)
-                        await self.context.pool.release(slotIndex: slot)
-                    }
+                    if let slot { await self.context.pool.finishAndRetire(slotIndex: slot) }
                     slot = nil
                 }
             }
@@ -400,11 +398,6 @@ final class CascadeLaneEngine: LaneEngine {
             return
         }
         slotState = .held
-        // A fresh binding can never receive the previous binding's
-        // straggler (the pool drops unowned results and the .held guard
-        // covered the released window) — clear the latch so it can't eat
-        // this utterance's genuine final.
-        staleDropUntilFinal = false
         // Count only genuine contention (an uncontended grant is a few ms
         // of actor hop) so the Diagnostics "waits" line means something.
         if waitSeconds > 0.05 {
@@ -426,31 +419,16 @@ final class CascadeLaneEngine: LaneEngine {
 
     // MARK: - STT results (queue-confined)
 
-    private func handleResult(_ event: AnalyzerPool.ResultEvent) {
-        guard !closed, var utterance = current else { return }
-        // Trust results only while a slot is legitimately bound: after a
-        // timed-out settle released the slot, a straggler final from the
-        // old range must not land in the next utterance (duplicated
-        // speech) — slotState is .none until re-acquisition, and for the
-        // keep-slot (12 s split) timeout the flag below swallows exactly
-        // the stale final. If the stale final never comes, the next
-        // genuine one is sacrificed and that settle degrades to its
-        // volatile text — graceful, logged, and rare.
-        guard slotState == .held else { return }
-        if staleDropUntilFinal {
-            if event.isFinal {
-                staleDropUntilFinal = false
-            } else {
-                // Volatiles while latched are (almost certainly) the NEW
-                // range's speech — keep them in the utterance so a
-                // timeout settle still degrades to text rather than to
-                // silence; they're just not displayed while the straggler
-                // could contaminate them.
-                utterance.volatileText = event.text
-                current = utterance
-            }
-            return
-        }
+    private func handleResult(_ event: AnalyzerPool.ResultEvent, epoch: Int) {
+        guard epoch == slotEpoch, !closed, var utterance = current else { return }
+        // Trust results only while a slot is legitimately bound to this
+        // utterance: .held (live capture) or .finishing (the close's
+        // finish is flushing the final). After a timed-out settle the
+        // state is .none until the next acquisition, and a retired slot's
+        // stragglers are dropped pool-side (owner unbound at retire) — no
+        // cross-utterance attribution is possible with per-utterance
+        // slots.
+        guard slotState == .held || slotState == .finishing else { return }
         if event.isFinal {
             stats.finalChars += event.text.count
             utterance.finalEvents += 1
@@ -490,34 +468,22 @@ final class CascadeLaneEngine: LaneEngine {
             onMetric?(.sttFinalizeSeconds(seconds))
             Log.info("[\(label)] settled with final (\(finalText.count) chars, finalize \(String(format: "%.2f", seconds))s, results \(utterance.volatileEvents)V/\(utterance.finalEvents)F)")
         }
-        if settleKeepsSlot, slotState == .held {
-            // 12 s split: hand the slot straight to the follow-on
-            // utterance and flush the audio buffered during the finalize
-            // wait as its opening context. This is the ONLY place the
-            // stale-final latch arms: the slot binding survives the
-            // settle, so a straggler final from the old range would land
-            // in the follow-on utterance. In the release path the .held
-            // guard already drops stragglers, and arming there would only
-            // eat the NEXT utterance's genuine final — the re-arm loop
-            // that deafened the lane (review round 2).
-            if timedOut { staleDropUntilFinal = true }
-            settleKeepsSlot = false
-            current = Utterance(id: UUID(), openedAt: Date(), lastVoicedNowAt: Date())
-            stats.utterancesOpened += 1
-            for buffer in laneBuffer { commands.yield(.feed(buffer)) }
-            laneBuffer.removeAll()
-            laneBufferSeconds = 0
-        } else {
-            settleKeepsSlot = false
-            current = nil
-            if slotState == .held {
-                commands.yield(.release)
-                slotState = .none
-            }
-            // slotState == .acquiring: the pending acquire is left
-            // standing; slotGranted releases immediately if no new
-            // utterance opened by then (no squatting on shared slots), or
-            // serves the next utterance if one did.
+        current = nil
+        slotEpoch += 1
+        switch slotState {
+        case .finishing:
+            // The worker's finishSlot retires the slot and the pool
+            // spawns a replacement; nothing more to do here.
+            slotState = .none
+        case .held:
+            // A slot granted AFTER the close request (feeds were blocked,
+            // so it is virgin) — hand it back intact for the next waiter.
+            commands.yield(.release)
+            slotState = .none
+        case .acquiring, .none:
+            // A pending acquire is left standing; slotGranted releases it
+            // immediately if no new utterance opened by then.
+            break
         }
         finishUtterance(utterance, finalText: finalText)
     }

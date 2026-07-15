@@ -7,16 +7,17 @@ import Speech
 ///
 /// The device admits a limited number of simultaneous analyses (measured:
 /// 3 on the target iPad), so analyzers belong to the conversation's
-/// CascadeContext, not to lanes. Each slot is a long-lived analyzer +
-/// transcriber with a running time cursor; a slot serves ONE lane at a
-/// time, so result demux is just "forward to the current owner". Lanes
-/// acquire a slot per utterance (FIFO under contention) and release it
-/// after finalize-through-the-full-cursor delivers the final result — the
-/// invariant that makes owner switches race-free.
+/// CascadeContext, not to lanes. A slot serves ONE utterance for ONE
+/// lane, so result demux is just "forward to the current owner": acquire
+/// (FIFO under contention) → feed → finishAndRetire, which flushes the
+/// final result, retires the slot, and spawns a pre-warmed replacement.
 ///
-/// Slot lifecycle rules (design §7 cancellation): lanes NEVER finish a
-/// slot (finishing is terminal and would shrink the pool for the rest of
-/// the conversation); only teardown() finishes analyzers, at Stop.
+/// FIELD REVISION (2026-07-15, supersedes the design's long-lived-slot
+/// model): finalize(through:) — the mechanism §6.1.1 was built on — hangs
+/// indefinitely on live streams on-device in every form tried, while
+/// finish-at-utterance-end flushes finals in ~0.1 s (probe-proven). So
+/// slots are per-utterance, and every analyzer await is BOUNDED so a hung
+/// OS call can never wedge a lane's command worker.
 actor AnalyzerPool {
 
     struct ResultEvent {
@@ -25,19 +26,20 @@ actor AnalyzerPool {
     }
 
     private final class Slot {
-        let analyzer: SpeechAnalyzer
-        let transcriber: SpeechTranscriber
-        let continuation: AsyncStream<AnalyzerInput>.Continuation
+        var analyzer: SpeechAnalyzer?
+        var transcriber: SpeechTranscriber?
+        var continuation: AsyncStream<AnalyzerInput>.Continuation?
         /// Total seconds of audio fed — the implicit-timeline cursor that
         /// finalize(through:) targets. Carries across acquisitions.
         var cursorSeconds: Double = 0
         var owner: (@Sendable (ResultEvent) -> Void)?
         var harvest: Task<Void, Never>?
-        /// A finalize failed or hung on this slot: an un-finalized region
-        /// may survive its release, so it must never be granted again
-        /// (its leftover results could be delivered to another lane).
-        var suspect = false
-        /// Fully retired (markDead ran): idempotency latch.
+        /// Retired: finished (or broken) and awaiting only deallocation;
+        /// never granted again. Slots are PER-UTTERANCE — field evidence
+        /// (2026-07-15): finalize(through:) hangs indefinitely on live
+        /// streams in every form, while finish-at-utterance-end flushes
+        /// finals in ~0.1 s (probe-proven), so each slot serves one
+        /// utterance and is then finished and replaced.
         var retired = false
 
         init(analyzer: SpeechAnalyzer, transcriber: SpeechTranscriber,
@@ -60,7 +62,7 @@ actor AnalyzerPool {
     private var buildCap = 0
 
     private var liveCount: Int {
-        slots.indices.filter { !slots[$0].suspect }.count
+        slots.indices.filter { !slots[$0].retired }.count
     }
 
     /// Resume a continuation exactly once from whichever of two racing
@@ -196,7 +198,8 @@ actor AnalyzerPool {
     func feed(slotIndex: Int, buffer: AVAudioPCMBuffer) {
         guard slots.indices.contains(slotIndex), !tornDown else { return }
         let slot = slots[slotIndex]
-        slot.continuation.yield(AnalyzerInput(buffer: buffer))
+        guard !slot.retired, let continuation = slot.continuation else { return }
+        continuation.yield(AnalyzerInput(buffer: buffer))
         slot.cursorSeconds += Double(buffer.frameLength) / buffer.format.sampleRate
     }
 
@@ -223,42 +226,45 @@ actor AnalyzerPool {
         } else if let channel = buffer.floatChannelData {
             memset(channel[0], 0, Int(frames) * MemoryLayout<Float>.size)
         }
-        slots[slotIndex].continuation.yield(AnalyzerInput(buffer: buffer))
+        guard !slots[slotIndex].retired, let continuation = slots[slotIndex].continuation else { return }
+        continuation.yield(AnalyzerInput(buffer: buffer))
         slots[slotIndex].cursorSeconds += seconds
     }
 
-    func finalizeCurrent(slotIndex: Int) async {
+    /// End-of-utterance finish: the ONLY finalization path field-proven
+    /// to flush finals (probe: 0.03–0.08 s; finalize(through:) hung
+    /// indefinitely on live streams in every form across four field
+    /// runs). The final result arrives through the harvest DURING this
+    /// call; the slot is then retired and a replacement spawned. Bounded:
+    /// nothing may wedge a lane's command worker.
+    func finishAndRetire(slotIndex: Int) async {
         guard slots.indices.contains(slotIndex), !tornDown else { return }
-        let analyzer = slots[slotIndex].analyzer
-        // nil = finalize everything fed so far (the first field test's
-        // cursor-targeted CMTime produced no finals). BOUNDED: the second
-        // field test showed finalize can hang INDEFINITELY, and an
-        // unbounded await here wedged the lane's command worker — every
-        // subsequent release/acquire queued behind it and the lane went
-        // permanently silent (0V/0F). A timed-out finalize quarantines
-        // the slot; release retires and replaces it.
-        let completed = await Self.awaitBounded(seconds: 2.5) {
+        let slot = slots[slotIndex]
+        guard !slot.retired, let analyzer = slot.analyzer else { return }
+        slot.continuation?.finish()
+        let finished = await Self.awaitBounded(seconds: 2.5) {
             do {
-                try await analyzer.finalize(through: nil)
+                try await analyzer.finalizeAndFinishThroughEndOfInput()
             } catch {
-                Log.warn("[pool] finalize threw on slot \(slotIndex): \(error.localizedDescription)")
+                Log.warn("[pool] finish threw on slot \(slotIndex): \(error.localizedDescription)")
             }
         }
-        if !completed {
-            Log.warn("[pool] finalize did not return within 2.5 s on slot \(slotIndex) — quarantining (retired at release, replacement spawned)")
-            if slots.indices.contains(slotIndex) { slots[slotIndex].suspect = true }
+        if !finished {
+            Log.warn("[pool] finish timed out on slot \(slotIndex) — cancelling")
+            _ = await Self.awaitBounded(seconds: 2) {
+                try? await analyzer.cancelAndFinishNow()
+            }
         }
+        retire(slotIndex: slotIndex)
     }
 
-    /// Unbind the owner and grant the slot to the next FIFO waiter (or
-    /// retire it if a failed finalize made it suspect).
+    /// Return a slot that never received audio (a grant that arrived
+    /// after its utterance settled): virgin slots go back to the free
+    /// list or straight to the next waiter.
     func release(slotIndex: Int) {
-        guard slots.indices.contains(slotIndex), !tornDown else { return }
+        guard slots.indices.contains(slotIndex), !tornDown,
+              !slots[slotIndex].retired else { return }
         slots[slotIndex].owner = nil
-        if slots[slotIndex].suspect {
-            markDead(slotIndex: slotIndex)
-            return
-        }
         if waiters.isEmpty {
             freeSlots.append(slotIndex)
         } else {
@@ -266,49 +272,55 @@ actor AnalyzerPool {
         }
     }
 
-    /// Retire a slot: never grant it again, tear its analyzer down with
-    /// the documented escape hatch for hung sessions (cancelAndFinishNow
-    /// — which also frees its ADMISSION share), and spawn a like-for-like
-    /// replacement so the pool heals instead of shrinking. If the pool
-    /// momentarily hits zero, fail pending waiters so lanes surface
-    /// .failed instead of hanging.
-    private func markDead(slotIndex: Int) {
+    /// Broken slot (results stream error): cancel its analyzer (bounded —
+    /// the documented escape hatch, which also frees its admission share)
+    /// and retire it.
+    private func markDead(slotIndex: Int) async {
+        guard slots.indices.contains(slotIndex), !slots[slotIndex].retired,
+              let analyzer = slots[slotIndex].analyzer else { return }
+        _ = await Self.awaitBounded(seconds: 2) {
+            try? await analyzer.cancelAndFinishNow()
+        }
+        retire(slotIndex: slotIndex)
+    }
+
+    /// Drop every reference the slot holds (the analyzer must deallocate
+    /// for its admission share to free) and spawn a replacement.
+    /// Zero live slots is TRANSIENT (a replacement is coming), so waiters
+    /// are NOT failed here — an utterance that can't get a slot settles
+    /// empty via its own timeout and the lane recovers on the next grant.
+    private func retire(slotIndex: Int) {
         guard slots.indices.contains(slotIndex), !slots[slotIndex].retired else { return }
         let slot = slots[slotIndex]
         slot.retired = true
-        slot.suspect = true
         slot.owner = nil
         slot.harvest?.cancel()
-        slot.continuation.finish()
+        slot.harvest = nil
+        slot.continuation?.finish()
+        slot.continuation = nil
+        slot.analyzer = nil
+        slot.transcriber = nil
         freeSlots.removeAll { $0 == slotIndex }
         poolSize = liveCount
-        Log.warn("[pool] slot \(slotIndex) retired — \(poolSize) live slot(s) remain; spawning replacement")
-        if poolSize == 0 {
-            for waiter in waiters { waiter.resume(returning: nil) }
-            waiters.removeAll()
-        }
-        let analyzer = slot.analyzer
-        Task { [weak self] in
-            // Free the retired analyzer's admission share first, bounded
-            // (it may be the hung one), then attempt the replacement.
-            _ = await Self.awaitBounded(seconds: 3) {
-                do {
-                    try await analyzer.cancelAndFinishNow()
-                } catch {
-                    Log.warn("[pool] cancelAndFinishNow failed on retired slot \(slotIndex): \(error.localizedDescription)")
-                }
-            }
-            await self?.replaceRetiredSlot()
+        if !tornDown {
+            Task { [weak self] in await self?.replaceRetiredSlot() }
         }
     }
 
+    /// Replacement with backoff: the finished analyzer's admission share
+    /// frees ASYNCHRONOUSLY after deallocation — an instant retry was
+    /// observed denied 20 ms after teardown, so patience beats speed.
     private func replaceRetiredSlot() async {
-        guard !tornDown, let locale = buildLocale, liveCount < buildCap else { return }
-        if await makeSlot(locale: locale) {
-            Log.info("[pool] replacement slot ready — \(poolSize) live slot(s)")
-        } else {
-            Log.warn("[pool] replacement slot creation failed — pool stays at \(poolSize)")
+        guard !tornDown, let locale = buildLocale else { return }
+        for delay in [0.25, 0.75, 2.0, 4.0] {
+            guard !tornDown, liveCount < buildCap else { return }
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            if await makeSlot(locale: locale) {
+                Log.info("[pool] replacement slot ready — \(poolSize) live slot(s)")
+                return
+            }
         }
+        Log.warn("[pool] replacement failed after 4 attempts — pool stays at \(poolSize) live slot(s)")
     }
 
     // MARK: - Teardown (Stop only)
@@ -323,8 +335,8 @@ actor AnalyzerPool {
         for waiter in waiters { waiter.resume(returning: nil) }
         waiters.removeAll()
         for (index, slot) in slots.enumerated() where !slot.retired {
-            slot.continuation.finish()
-            let analyzer = slot.analyzer
+            slot.continuation?.finish()
+            guard let analyzer = slot.analyzer else { continue }
             // Bounded like every other analyzer await: a hung slot must
             // not hang teardown — the NEXT conversation's Start awaits
             // this task before building its pool.

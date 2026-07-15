@@ -698,6 +698,22 @@ identically across slots (locale from the source-language setting via
   banner pointing at the card.
 #### 6.1.1 The AnalyzerPool (pooled-mode design pass, gate satisfied)
 
+> **FIELD REVISION (2026-07-15)** — implemented and shipped, supersedes
+> the long-lived-slot model below: `finalize(through:)`, this section's
+> core mechanism, **hangs indefinitely on live streams on-device** in
+> every form tried (cursor-targeted and nil), per three instrumented
+> field runs. Slots are therefore **per-utterance**: close = silence pad
+> + `finalizeAndFinishThroughEndOfInput` (the probe-proven path, flushes
+> finals in ~0.1 s, bounded) → retire (references dropped so the
+> analyzer frees its admission share) → pre-warmed replacement with
+> backoff, plus a slow perpetual recovery loop if the pool ever fully
+> dies. Every analyzer await is wall-clock-bounded so a hung OS call can
+> never wedge a lane. Results are epoch-stamped against straggler
+> misattribution. The FIFO acquisition, one-owner demux, lane-buffer,
+> and contention behavior below remain as designed. Authoritative
+> details: `Cascade/AnalyzerPool.swift` header +
+> `Cascade/CascadeLaneEngine.swift`.
+
 The probe admitted 3 of 4 lanes, so this section is the design pass the
 phasing gate required. The measured throughput makes pooling cheap:
 transcription ran ≥25× real time (10.8 s of audio in ~0.3–0.4 s, even

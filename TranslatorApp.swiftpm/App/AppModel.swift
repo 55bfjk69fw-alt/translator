@@ -226,6 +226,11 @@ final class AppModel: ObservableObject {
             guard let self else { return [] }
             let now = Date()
             return self.transcript.utterances.suffix(60)
+                // Suppressed English pickups stay out of the window: the
+                // prompter suggests replies to the OTHER side's Chinese,
+                // and a bleed-through of the user's own English would be
+                // mis-attributed to that speaker.
+                .filter { !$0.suppressedEnglish }
                 .filter { $0.isFinal || !$0.sourceText.isEmpty || !$0.translatedText.isEmpty }
                 .suffix(25)
                 .map { utterance in
@@ -754,6 +759,8 @@ final class AppModel: ObservableObject {
                     self.transcript.setCascadeSource(lane: lane, utterance: utterance, text: text, isFinal: isFinal)
                 case .translationText(let utterance, let text, let isFinal):
                     self.transcript.setCascadeTranslation(lane: lane, utterance: utterance, text: text, isFinal: isFinal)
+                case .sourceSuppressed(let utterance, let text):
+                    self.transcript.setCascadeSuppressed(lane: lane, utterance: utterance, text: text)
                 }
             }
         }

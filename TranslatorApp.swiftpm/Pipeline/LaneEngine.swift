@@ -73,6 +73,11 @@ enum TranscriptEvent {
     case translationDelta(String)
     case sourceText(utterance: UUID, text: String, isFinal: Bool)
     case translationText(utterance: UUID, text: String, isFinal: Bool)
+    /// Cascade script gate (docs/ENGLISH-SUPPRESSION.md §4.1): the
+    /// utterance finalized as target-language speech and will not be
+    /// translated or spoken. Closes the bubble as a collapsed indicator
+    /// row — the heard text is kept on the utterance but not displayed.
+    case sourceSuppressed(utterance: UUID, text: String)
 }
 
 /// Per-stage latency measurements, forwarded to MetricsStore.

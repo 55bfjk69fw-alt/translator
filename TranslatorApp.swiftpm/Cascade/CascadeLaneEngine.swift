@@ -564,21 +564,21 @@ final class CascadeLaneEngine: LaneEngine {
             onTranscript?(.translationText(utterance: utterance.id, text: "", isFinal: true))
             return
         }
-        onTranscript?(.sourceText(utterance: utterance.id, text: text, isFinal: true))
         // Script gate (docs/ENGLISH-SUPPRESSION.md §4.1): a predominantly
         // Latin final on a Han-script lane means the speech was never the
         // source language — the zh→en session would garble it or parrot
-        // it back to the person who just said it. The recognized text
-        // goes in the translation slot (it already IS target-language
-        // material for the transcript) and nothing reaches MT or TTS —
-        // junk MT jobs would also delay real ones on the shared
-        // serialized translator.
+        // it back to the person who just said it. Checked BEFORE the
+        // source final so the bubble collapses into the indicator row
+        // instead of finalizing as visible English; nothing reaches MT
+        // or TTS (junk MT jobs would delay real ones and, on the cloud
+        // stage, bill tokens and pollute the context window).
         if context.sourceUsesHanScript, Self.isPredominantlyLatin(text) {
             stats.utterancesSuppressedEnglish += 1
             Log.info("[\(label)] final is predominantly Latin on a Han-script lane — synthesis suppressed (\(text.count) chars)")
-            onTranscript?(.translationText(utterance: utterance.id, text: text, isFinal: true))
+            onTranscript?(.sourceSuppressed(utterance: utterance.id, text: text))
             return
         }
+        onTranscript?(.sourceText(utterance: utterance.id, text: text, isFinal: true))
         mtQueue.append(TranslationJob(id: utterance.id, sourceText: text, speechEndedAt: utterance.closeRequestedAt))
         pumpMT()
     }

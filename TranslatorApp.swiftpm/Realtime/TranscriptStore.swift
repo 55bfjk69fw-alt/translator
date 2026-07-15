@@ -58,6 +58,11 @@ final class TranscriptStore: ObservableObject {
         // two are tracked independently for segmentation.
         var lastSourceActivity: Date?
         var lastTranslationActivity: Date?
+        /// Closed by the cascade script gate as target-language speech
+        /// (docs/ENGLISH-SUPPRESSION.md §4.1): rendered as a collapsed
+        /// indicator row, excluded from the prompter window. sourceText
+        /// keeps what was heard (for export/debugging) but is not shown.
+        var suppressedEnglish = false
     }
 
     @Published private(set) var utterances: [Utterance] = []
@@ -177,6 +182,27 @@ final class TranscriptStore: ObservableObject {
             utterances[index].translatedPinyin = text.pinyin
             contentRevision += 1
         }
+    }
+
+    /// Cascade script gate: the utterance was target-language speech —
+    /// collapse it to an indicator row. Creates the row even when no
+    /// volatile ever opened a bubble (the indicator IS the record), and
+    /// deliberately does NOT bump finalizedTotal: a suppressed English
+    /// pickup must not fire the prompter's ambient trigger.
+    func setCascadeSuppressed(lane: Int, utterance: UUID, text: String) {
+        guard let index = cascadeIndex(lane: lane, utterance: utterance, allowCreate: true) else { return }
+        utterances[index].suppressedEnglish = true
+        utterances[index].sourceText = text
+        utterances[index].translatedText = ""
+        utterances[index].sourcePinyin = nil
+        utterances[index].translatedPinyin = nil
+        utterances[index].isFinal = true
+        utterances[index].lastActivity = Date()
+        openCascade[utterance] = nil
+        cascadeEnders[utterance] = nil
+        cascadePinyinAt[utterance] = nil
+        contentRevision += 1
+        trim()
     }
 
     private func cascadeIndex(lane: Int, utterance: UUID, allowCreate: Bool) -> Int? {

@@ -156,17 +156,25 @@ struct ConversationView: View {
                 }
                 ForEach(transcript.utterances) { utterance in
                     let isUser = utterance.laneID == SpeakerLane.userLaneID
-                    UtteranceBubble(
-                        utterance: utterance,
-                        lane: model.lane(for: utterance.laneID),
-                        onReplyTo: prompterEnabled && !isUser && utterance.isFinal
-                            ? { requestScopedReply(to: utterance) }
-                            : nil,
-                        onExplain: prompterEnabled && !isUser && !utterance.sourceText.isEmpty
-                            ? { explain(utterance) }
-                            : nil
-                    )
-                    .id(utterance.id)
+                    if utterance.suppressedEnglish {
+                        SuppressedEnglishRow(
+                            lane: model.lane(for: utterance.laneID),
+                            date: utterance.date
+                        )
+                        .id(utterance.id)
+                    } else {
+                        UtteranceBubble(
+                            utterance: utterance,
+                            lane: model.lane(for: utterance.laneID),
+                            onReplyTo: prompterEnabled && !isUser && utterance.isFinal
+                                ? { requestScopedReply(to: utterance) }
+                                : nil,
+                            onExplain: prompterEnabled && !isUser && !utterance.sourceText.isEmpty
+                                ? { explain(utterance) }
+                                : nil
+                        )
+                        .id(utterance.id)
+                    }
                 }
             }
             .padding()
@@ -681,6 +689,28 @@ private struct LaneStatusDot: View {
         case .failed: return .red
         case .idle, nil: return .gray
         }
+    }
+}
+
+/// Collapsed record of an utterance the script gate suppressed
+/// (docs/ENGLISH-SUPPRESSION.md §4.1): English was heard on this lane and
+/// deliberately not translated or spoken. A thin system-notice row — the
+/// history shows THAT it happened without replaying what was said (the
+/// text is on the utterance and in the diagnostics log).
+private struct SuppressedEnglishRow: View {
+    let lane: SpeakerLane
+    let date: Date
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "speaker.slash")
+            Text("\(lane.name) · English — not translated")
+            Text(date, style: .time)
+                .foregroundStyle(.quaternary)
+        }
+        .font(.caption2)
+        .foregroundStyle(.tertiary)
+        .frame(maxWidth: .infinity, alignment: .center)
     }
 }
 

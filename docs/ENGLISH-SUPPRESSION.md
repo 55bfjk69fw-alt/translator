@@ -106,13 +106,19 @@ Classifier (pure function, engine-local):
   hallucinated 吗 at the end of an English sentence doesn't rescue it.
 - Thresholds are named constants; expect one field-tuning pass.
 
-On English verdict:
+On English verdict (display treatment revised 2026-07-15 after field
+testing — full bubbles of the user's own English cluttered the history):
 
-- Emit the source final as today (the transcript shows what was heard).
-- Emit `.translationText(utterance:, text: <the recognized English>,
-  isFinal: true)` — the text already *is* target-language, so the bubble
-  closes reading sensibly instead of "—", and `setCascadeTranslation`
-  needs no changes.
+- Emit `.sourceSuppressed(utterance:text:)` — the store collapses the
+  bubble (or creates the record if no volatile ever opened one) into a
+  thin centered indicator row: "〈speaker〉 · English — not translated".
+  The heard text stays on the utterance (`sourceText`) for
+  export/debugging but is not displayed; volatiles still stream into
+  the bubble live and collapse at finalization.
+- Suppressed rows are excluded from the prompter's transcript window
+  (bleed-through of the user's own English would be mis-attributed to
+  the speaker) and do not bump `finalizedTotal`, so they never fire the
+  prompter's ambient trigger.
 - Do **not** enqueue MT (junk jobs would delay real ones on the shared
   Apple session — and on the OpenAI MT stage (CASCADE-PIPELINE §14)
   would bill tokens for garbage and, on success, poison the shared

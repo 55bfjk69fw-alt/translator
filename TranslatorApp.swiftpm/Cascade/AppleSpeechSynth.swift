@@ -45,23 +45,23 @@ enum AppleTTSProvider {
         "Better voices: Settings → Accessibility → Read & Speak (Spoken Content pre-iOS 26) → Voices → English — enhanced/premium voices make lanes genuinely distinct."
     }
 
-    /// The lane's voice: the persisted choice if it still exists AND
-    /// matches the target language, else an auto-assigned distinct
-    /// default (persisted so the assignment is stable ever after).
-    /// Fewer usable voices than lanes ⇒ the ranked list cycles
-    /// (duplicates land on distant channels by index) — best-effort,
-    /// never a blocker.
-    static func voice(for channel: Int, language: String) -> AVSpeechSynthesisVoice? {
+    /// The stored choice when it still exists AND matches the target
+    /// language, else nil.
+    private static func storedVoice(for channel: Int, language: String) -> AVSpeechSynthesisVoice? {
         let prefix = String(language.prefix(2))
-        if let stored = AppSettings.laneVoice(provider: id, language: language, channel: channel),
-           let voice = AVSpeechSynthesisVoice(identifier: stored),
-           voice.language.hasPrefix(prefix) {
-            return voice
-        }
+        guard let stored = AppSettings.laneVoice(provider: id, language: language, channel: channel),
+              let voice = AVSpeechSynthesisVoice(identifier: stored),
+              voice.language.hasPrefix(prefix) else { return nil }
+        return voice
+    }
+
+    /// Ranked voices interleaved across language variants (en-US/en-GB…)
+    /// so index-per-channel assignment lands adjacent channels on
+    /// different accents. Fewer usable voices than lanes ⇒ the list
+    /// cycles — best-effort distinctness, never a blocker.
+    private static func interleavedRanking(for language: String) -> [AVSpeechSynthesisVoice] {
         let ranked = voices(for: language)
-        guard !ranked.isEmpty else { return nil }
-        // Interleave accents for adjacent channels where inventory allows:
-        // group by exact language variant and round-robin the groups.
+        guard !ranked.isEmpty else { return [] }
         var byVariant: [String: [AVSpeechSynthesisVoice]] = [:]
         for voice in ranked { byVariant[voice.language, default: []].append(voice) }
         let variants = byVariant.keys.sorted()
@@ -75,10 +75,29 @@ enum AppleTTSProvider {
             }
             offset += 1
         }
+        return interleaved
+    }
+
+    /// The lane's voice, PERSISTING an auto-assignment when none is
+    /// stored (engine path and explicit selection only — never call from
+    /// SwiftUI body evaluation; use previewAssignment there).
+    static func voice(for channel: Int, language: String) -> AVSpeechSynthesisVoice? {
+        if let stored = storedVoice(for: channel, language: language) { return stored }
+        let interleaved = interleavedRanking(for: language)
+        guard !interleaved.isEmpty else { return nil }
         let assigned = interleaved[channel % interleaved.count]
         AppSettings.setLaneVoice(assigned.identifier, provider: id, language: language, channel: channel)
         Log.info("[tts] lane \(channel) auto-assigned voice \(assigned.identifier)")
         return assigned
+    }
+
+    /// Body-safe resolver: what voice(for:) WOULD return, without the
+    /// UserDefaults write or logging side effects.
+    static func previewAssignment(for channel: Int, language: String) -> AVSpeechSynthesisVoice? {
+        if let stored = storedVoice(for: channel, language: language) { return stored }
+        let interleaved = interleavedRanking(for: language)
+        guard !interleaved.isEmpty else { return nil }
+        return interleaved[channel % interleaved.count]
     }
 }
 

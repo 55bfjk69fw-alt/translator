@@ -67,6 +67,7 @@ struct MetricsView: View {
         let samples = windowed(snapshot.samples, \.date, end: end)
         let connects = windowed(snapshot.connects, \.date, end: end)
         let firstResponses = windowed(snapshot.firstResponses, \.date, end: end)
+        let cascadeStages = windowed(snapshot.cascadeStages, \.date, end: end)
         let assistRequests = windowed(snapshot.assistRequests, \.date, end: end)
         return VStack(alignment: .leading, spacing: 14) {
             if snapshot.isEmpty {
@@ -75,6 +76,7 @@ struct MetricsView: View {
                 overviewCard(snapshot, samples: samples)
                 costCard(samples)
                 latencyCard(snapshot, firstResponses: firstResponses, connects: connects)
+                cascadeStagesCard(stages: cascadeStages)
                 throughputCard(samples)
                 sessionsCard(samples)
                 prompterCard(assistRequests)
@@ -90,6 +92,7 @@ struct MetricsView: View {
         [snapshot.samples.last?.date,
          snapshot.connects.last?.date,
          snapshot.firstResponses.last?.date,
+         snapshot.cascadeStages.last?.date,
          snapshot.assistRequests.last?.date]
             .compactMap { $0 }
             .max()
@@ -264,6 +267,39 @@ struct MetricsView: View {
                         .foregroundStyle(by: .value("Speaker", labels[sample.lane] ?? "?"))
                     }
                 }
+            }
+        }
+    }
+
+    private static let cascadeStageOrder = ["finalize", "translate", "tts", "endToEnd"]
+
+    private func cascadeStagesCard(stages: [CascadeStageSample]) -> some View {
+        card("Cascade stages") {
+            Text("On-device pipeline latency per stage: finalize (utterance close → final text), translate, tts (submit → first audio), endToEnd (speech end → first translated audio).")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            chartOrPlaceholder(stages, "No cascade measurements yet — they appear as utterances settle (on-device pipeline only).") {
+                Chart(stages) { sample in
+                    PointMark(
+                        x: .value("Time", sample.date),
+                        y: .value("Seconds", sample.seconds)
+                    )
+                    .symbolSize(45)
+                    .foregroundStyle(by: .value("Stage", sample.stage))
+                }
+                .chartForegroundStyleScale(
+                    domain: Self.cascadeStageOrder,
+                    range: [.teal, .purple, .orange, .indigo]
+                )
+                .frame(height: 150)
+            }
+            if !stages.isEmpty {
+                Text(Self.cascadeStageOrder.map { stage in
+                    let values = stages.filter { $0.stage == stage }.suffix(20).map(\.seconds)
+                    return "\(stage) \(median(values).map { String(format: "%.2fs", $0) } ?? "—")"
+                }.joined(separator: " · "))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
             }
         }
     }

@@ -306,8 +306,10 @@ struct CascadePipelineSection: View {
     @ViewBuilder
     private func voiceRow(channel: Int) -> some View {
         let voices = AppleTTSProvider.voices(for: outputLanguage)
-        let currentID = AppSettings.laneVoice(provider: AppleTTSProvider.id, language: outputLanguage, channel: channel)
-            ?? AppleTTSProvider.voice(for: channel, language: outputLanguage)?.identifier
+        // previewAssignment, not voice(for:): SwiftUI body evaluation
+        // must not write UserDefaults (the persist happens on explicit
+        // selection here, or on the engine path at Start).
+        let currentID = AppleTTSProvider.previewAssignment(for: channel, language: outputLanguage)?.identifier
         HStack {
             Text("\(AppSettings.speakerName(channel)) voice")
                 .font(.callout)

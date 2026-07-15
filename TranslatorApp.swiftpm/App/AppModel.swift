@@ -76,6 +76,9 @@ final class AppModel: ObservableObject {
     @Published private(set) var sessionStates: [Int: LaneEngineState] = [:]
     @Published private(set) var route: AudioSessionController.RouteSnapshot?
     @Published private(set) var estimatedCost: Double = 0
+    /// Which pipeline the RUNNING conversation uses (drives the status
+    /// bar's on-device annotation); meaningful while mode != .idle.
+    @Published private(set) var conversationPipeline: AppSettings.Pipeline = .realtime
     @Published var errorBanner: String?
     /// The once-per-conversation cost alert. Separate from errorBanner so
     /// neither channel can overwrite the other (last-writer-wins on a shared
@@ -392,6 +395,7 @@ final class AppModel: ObservableObject {
         channelMeters.reset(channelCount: channelCount)
 
         let pipeline = AppSettings.pipeline
+        conversationPipeline = pipeline
         if pipeline == .cascade {
             // Pool cap = enabled lanes (§6.1.1's min(enabledLanes, 4)) —
             // one enabled mic must not warm three extra analyzers.
@@ -698,11 +702,14 @@ final class AppModel: ObservableObject {
                     self.metrics.recordConnect(lane: lane, seconds: seconds)
                 case .firstResponseSeconds(let seconds):
                     self.metrics.recordFirstResponse(lane: lane, seconds: seconds)
-                case .sttFinalizeSeconds, .translationSeconds,
-                     .ttsFirstAudioSeconds, .endToEndSeconds:
-                    // Cascade stage metrics — MetricsStore grows series for
-                    // these with CP2.
-                    break
+                case .sttFinalizeSeconds(let seconds):
+                    self.metrics.recordCascadeStage(lane: lane, stage: "finalize", seconds: seconds)
+                case .translationSeconds(let seconds):
+                    self.metrics.recordCascadeStage(lane: lane, stage: "translate", seconds: seconds)
+                case .ttsFirstAudioSeconds(let seconds):
+                    self.metrics.recordCascadeStage(lane: lane, stage: "tts", seconds: seconds)
+                case .endToEndSeconds(let seconds):
+                    self.metrics.recordCascadeStage(lane: lane, stage: "endToEnd", seconds: seconds)
                 }
             }
         }

@@ -398,6 +398,11 @@ private struct LanePipelineRow: View {
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
+                ForEach(cascadeSymptoms(cascade), id: \.self) { symptom in
+                    Label(symptom, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
             } else {
                 Text("No session — one opens on this lane's first detected speech.")
                     .font(.caption)
@@ -409,6 +414,22 @@ private struct LanePipelineRow: View {
 
     private func latency(_ seconds: Double?) -> String {
         seconds.map { String(format: "%.0f ms", $0 * 1000) } ?? "—"
+    }
+
+    /// Symptom-first lines for the cascade, mirroring the realtime rows'
+    /// style: name the broken stage and where to fix it.
+    private func cascadeSymptoms(_ snapshot: CascadeSnapshot) -> [String] {
+        var lines: [String] = []
+        if snapshot.utterancesOpened >= 2, snapshot.volatileChars + snapshot.finalChars == 0 {
+            lines.append("Utterances open but NO speech results return — check the speech model in Settings → Translation pipeline")
+        }
+        if snapshot.utterancesFinalized >= 2, snapshot.utterancesTranslated == 0 {
+            lines.append("Text finalizes but nothing translates — check the translation pack in Settings → Translation pipeline")
+        }
+        if let wait = snapshot.lastSlotWaitSeconds, wait > 2 {
+            lines.append(String(format: "Last slot wait %.1f s — simultaneous speakers exceeded the speech-model pool", wait))
+        }
+        return lines
     }
 
     /// The realtime client counters, when this lane runs the realtime

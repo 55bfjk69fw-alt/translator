@@ -106,7 +106,8 @@ struct ConversationView: View {
             lanes: model.lanes,
             sessionStates: model.sessionStates,
             estimatedCost: model.estimatedCost,
-            showCost: model.mode != .idle
+            showCost: model.mode != .idle,
+            onDevice: model.conversationPipeline == .cascade
         )
     }
 
@@ -229,6 +230,7 @@ private struct StatusBarView: View {
     let sessionStates: [Int: LaneEngineState]
     let estimatedCost: Double
     let showCost: Bool
+    let onDevice: Bool
 
     var body: some View {
         HStack(spacing: 14) {
@@ -242,7 +244,9 @@ private struct StatusBarView: View {
             }
             Spacer()
             if showCost {
-                Text(String(format: "~$%.2f", estimatedCost))
+                // Cascade conversations are free; the annotation says WHY
+                // the number stays at zero (prompter use still adds cost).
+                Text(String(format: "~$%.2f", estimatedCost) + (onDevice ? " · on-device" : ""))
                     .font(.footnote.monospacedDigit())
                     .foregroundStyle(.secondary)
             }

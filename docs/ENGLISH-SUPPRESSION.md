@@ -99,7 +99,9 @@ Classifier (pure function, engine-local):
 - Count `han` = characters in the CJK Unified Ideographs blocks
   (U+3400–U+4DBF, U+4E00–U+9FFF); `latin` = Latin letters. Digits,
   punctuation, whitespace ignored.
-- `han == 0 && latin >= 3` ⇒ English.
+- `han == 0 && latin >= 1` ⇒ English (tightened from 3 after field
+  testing: non-hanzi output from the zh model is garbage more often
+  than not, and even a genuine lone "OK" is redundant to speak back).
 - Else English iff `latin / (latin + 2×han) ≥ 0.75` — the ×2 weight
   approximates per-word mass (one Han char ≈ one syllable; ~5 Latin
   letters ≈ one word), so "我们用 Zoom 开会" stays Chinese while one

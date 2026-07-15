@@ -593,9 +593,11 @@ final class CascadeLaneEngine: LaneEngine {
     /// an English sentence with one hallucinated trailing 吗 scores
     /// ~0.9 and is suppressed. Expect one field-tuning pass.
     private static let latinDominanceThreshold = 0.75
-    /// A hanless final needs a few letters before it counts as speech
-    /// ("OK" or "APP" alone still translate fine).
-    private static let minLatinLettersAlone = 3
+    /// Any Latin at all in a hanless final suppresses it — field
+    /// experience: non-hanzi output from the zh model is garbage more
+    /// often than not, and even a genuine lone "OK" is redundant to
+    /// speak back. Digit-only finals (二零二三 → "2023") still translate.
+    private static let minLatinLettersAlone = 1
 
     /// Internal (not private) so CascadeProbe's step 9 exercises the
     /// EXACT gate the lanes run — a probe verdict from a copy would

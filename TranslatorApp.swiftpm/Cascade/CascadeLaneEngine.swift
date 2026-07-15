@@ -617,6 +617,11 @@ final class CascadeLaneEngine: LaneEngine {
             stats.utterancesTranslated += 1
             onMetric?(.translationSeconds(seconds))
             onTranscript?(.translationText(utterance: job.id, text: result.text, isFinal: true))
+            // ANY success clears the missing-fallback-pack symptom: either
+            // the pack got installed mid-conversation (fallback succeeded)
+            // or the cloud recovered (the symptom's "cloud failing" half
+            // is gone) — a stale "download it" row misleads (review NIT).
+            stats.mtFallbackUnavailable = false
             if result.viaFallback {
                 // Fallback pairs stay OUT of the shared context window —
                 // they'd teach the literal style the cloud provider

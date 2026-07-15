@@ -104,9 +104,12 @@ final class CascadeContext {
             )
             self.openAIRequest = request
             // The half-open recovery probe: a tiny synthetic request,
-            // never a real utterance (§14.1).
+            // never a real utterance (§14.1), under the same overall
+            // deadline as real jobs.
             self.translationHealth = OpenAITranslationHealth(probe: {
-                try await request.stream(text: "OK", context: [], onPartial: { _ in }).cost
+                try await OpenAIChatTranslator.withTimeout(OpenAIChatTranslator.jobTimeoutSeconds) {
+                    try await request.stream(text: "OK", context: [], onPartial: { _ in })
+                }.cost
             })
             cloudTranslation = true
         }

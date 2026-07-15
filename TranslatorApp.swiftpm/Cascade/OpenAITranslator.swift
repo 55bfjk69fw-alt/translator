@@ -67,6 +67,13 @@ final class OpenAITranslationHealth {
     /// A real job (or the probe) got a cloud response.
     func recordSuccess() {
         lock.lock()
+        // Symmetric with recordFailure: a success resolving after Stop
+        // must not mutate latch state or fire notices into the stopped
+        // app (review NIT).
+        guard !tornDown else {
+            lock.unlock()
+            return
+        }
         consecutiveFailures = 0
         let wasLatched = latched
         latched = false
@@ -186,16 +193,16 @@ final class OpenAIChatTranslator: Translator {
         // Deltas must stop the moment the job resolves (single-resolution
         // invariant): a late-streaming chunk after a timeout-triggered
         // fallback must not repaint the bubble the fallback already owns.
-        let live = LockedFlag()
+        let resolved = LockedFlag()
         let request = self.request
         do {
             let (translated, cost) = try await Self.withTimeout(Self.jobTimeoutSeconds) {
                 try await request.stream(text: text, context: context) { [weak self] partial in
-                    guard let self, !live.isSet, !partial.isEmpty else { return }
+                    guard let self, !resolved.isSet, !partial.isEmpty else { return }
                     self.onDelta?(job, partial)
                 }
             }
-            live.set()
+            resolved.set()
             if let cost { onCostDelta?(cost) }
             // An empty completion is a failure, not a translation — count
             // it against the latch and let the fallback speak.
@@ -207,7 +214,7 @@ final class OpenAIChatTranslator: Translator {
             health.recordSuccess()
             return TranslationResult(text: translated, viaFallback: false)
         } catch {
-            live.set()
+            resolved.set()
             guard !cancelledFlag.isSet else { throw CancellationError() }
             health.recordFailure()
             let detail = (error is TimeoutError) ? "timed out after \(Int(Self.jobTimeoutSeconds))s" : error.localizedDescription
@@ -240,8 +247,11 @@ final class OpenAIChatTranslator: Translator {
 
     /// Race the operation against a deadline; exactly one outcome wins
     /// and the loser is cancelled (URLSession's async APIs honor task
-    /// cancellation promptly, so the group never lingers).
-    private static func withTimeout<T>(_ seconds: TimeInterval, _ operation: @escaping () async throws -> T) async throws -> T {
+    /// cancellation promptly, so the group never lingers). Internal so
+    /// CascadeContext's recovery probe gets the same OVERALL deadline as
+    /// real jobs — timeoutInterval alone is an idle timeout, and a
+    /// dribbling response must not stretch a probe iteration (review NIT).
+    static func withTimeout<T>(_ seconds: TimeInterval, _ operation: @escaping () async throws -> T) async throws -> T {
         try await withThrowingTaskGroup(of: T.self) { group in
             group.addTask { try await operation() }
             group.addTask {

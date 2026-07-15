@@ -200,7 +200,10 @@ struct CascadePipelineSection: View {
     @AppStorage(AppSettings.cascadeSpeechRateKey) private var speechRate = 1.0
     @AppStorage(AppSettings.outputLanguageKey) private var outputLanguage = "en"
     @AppStorage(AppSettings.cascadeTranslationProviderKey) private var translationProviderRaw = AppSettings.CascadeTranslationProvider.apple.rawValue
-    @AppStorage(AppSettings.cascadeTranslationModelKey) private var translationModel = ""
+    // Defaulted in the @AppStorage itself (not onAppear-materialized like
+    // SettingsView's) so the Picker's selection matches a tag on the very
+    // first render — review NIT.
+    @AppStorage(AppSettings.cascadeTranslationModelKey) private var translationModel = AppSettings.defaultCascadeTranslationModel
 
     @StateObject private var setup = CascadeSetupModel()
     @State private var preview = VoicePreviewPlayer()
@@ -301,12 +304,7 @@ struct CascadePipelineSection: View {
         } footer: {
             Text(cascadeFooter)
         }
-        .onAppear {
-            setup.refresh()
-            // The picker needs a concrete selection; materialize the
-            // default so the stored value and the UI always agree.
-            if translationModel.isEmpty { translationModel = AppSettings.defaultCascadeTranslationModel }
-        }
+        .onAppear { setup.refresh() }
         .task(id: translationProviderRaw) {
             if translationProvider == .openai { await loadModels() }
         }

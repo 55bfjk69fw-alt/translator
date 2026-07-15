@@ -60,6 +60,11 @@ actor AnalyzerPool {
     /// Saved from build() so retired slots can be replaced like-for-like.
     private var buildLocale: Locale?
     private var buildCap = 0
+    /// Replacements currently in flight (spawned by retire, resolved by
+    /// replaceRetiredSlot). Zero live slots is only "transient" while
+    /// this is nonzero — the acquire guard keys on it.
+    private var pendingReplacements = 0
+    private var slowRecoveryRunning = false
 
     private var liveCount: Int {
         slots.indices.filter { !slots[$0].retired }.count
@@ -192,10 +197,12 @@ actor AnalyzerPool {
         guard !tornDown else { return nil }
         // Zero live slots is TRANSIENT with per-utterance slots (three
         // simultaneous closes retire three slots at once; replacements
-        // are 0.25-0.75 s out) — wait as long as build() ever produced a
-        // pool, instead of failing the lane. A pool that never built at
-        // all is caught earlier by the readiness check.
-        guard poolSize > 0 || buildLocale != nil else { return nil }
+        // are 0.25-0.75 s out) — wait while replacements are in flight.
+        // With none pending AND none live the pool is genuinely dead:
+        // fail fast so lanes surface .failed instead of waiting forever
+        // behind green dots (the slow-recovery loop below revives the
+        // pool if the OS relents, and poolSize > 0 re-opens this guard).
+        guard poolSize > 0 || pendingReplacements > 0 else { return nil }
         if let free = freeSlots.first {
             freeSlots.removeFirst()
             slots[free].owner = onResult
@@ -216,12 +223,6 @@ actor AnalyzerPool {
         slot.cursorSeconds += Double(buffer.frameLength) / buffer.format.sampleRate
     }
 
-    /// Force the final result for everything fed so far (the full-cursor
-    /// close rule — never `lastSpeechTime`, so no un-finalized volatile
-    /// region can remain at release). Does NOT release: the lane engine
-    /// waits for the final to arrive on its onResult (bounded by its own
-    /// timeout) and then calls release() — the wait lives where the
-    /// knowledge is.
     /// Feed zero-filled audio to a held slot: end-of-speech evidence plus
     /// input progress past the finalize boundary, which streaming ASR
     /// needs to flush a finalization (first field test: closes starved of
@@ -316,6 +317,7 @@ actor AnalyzerPool {
         freeSlots.removeAll { $0 == slotIndex }
         poolSize = liveCount
         if !tornDown {
+            pendingReplacements += 1
             Task { [weak self] in await self?.replaceRetiredSlot() }
         }
     }
@@ -324,6 +326,7 @@ actor AnalyzerPool {
     /// frees ASYNCHRONOUSLY after deallocation — an instant retry was
     /// observed denied 20 ms after teardown, so patience beats speed.
     private func replaceRetiredSlot() async {
+        defer { pendingReplacements = max(0, pendingReplacements - 1) }
         guard !tornDown, let locale = buildLocale else { return }
         for delay in [0.25, 0.75, 2.0, 4.0] {
             guard !tornDown, liveCount < buildCap else { return }
@@ -333,7 +336,46 @@ actor AnalyzerPool {
                 return
             }
         }
-        Log.warn("[pool] replacement failed after 4 attempts — pool stays at \(poolSize) live slot(s)")
+        Log.warn("[pool] replacement failed after 4 attempts — \(poolSize) live slot(s)")
+        // Last replacement exhausted with nothing live: the pool is dead.
+        // Fail the waiters NOW (their lanes go .failed with the settings
+        // message instead of silently waiting behind green dots) and keep
+        // a slow recovery loop so a transient OS refusal (>7 s admission
+        // outage) doesn't stay fatal for the whole conversation.
+        if liveCount == 0, pendingReplacements <= 1, !tornDown {
+            for waiter in waiters { waiter.resume(returning: nil) }
+            waiters.removeAll()
+            startSlowRecovery(locale: locale)
+        }
+    }
+
+    /// Perpetual ~10 s retry while the pool is dead; exits on teardown or
+    /// the first success (which re-opens the acquire guard via poolSize).
+    private func startSlowRecovery(locale: Locale) {
+        guard !slowRecoveryRunning, !tornDown else { return }
+        slowRecoveryRunning = true
+        Log.warn("[pool] pool is empty and replacements exhausted — retrying every 10 s")
+        Task { [weak self] in
+            while true {
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                guard let self else { return }
+                if await self.slowRecoveryTick(locale: locale) { return }
+            }
+        }
+    }
+
+    /// Returns true when the loop should stop.
+    private func slowRecoveryTick(locale: Locale) async -> Bool {
+        if tornDown || liveCount > 0 {
+            slowRecoveryRunning = false
+            return true
+        }
+        if await makeSlot(locale: locale) {
+            Log.info("[pool] pool recovered — \(poolSize) live slot(s)")
+            slowRecoveryRunning = false
+            return true
+        }
+        return false
     }
 
     // MARK: - Teardown (Stop only)

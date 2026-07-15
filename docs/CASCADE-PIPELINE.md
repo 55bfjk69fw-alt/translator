@@ -520,7 +520,11 @@ struct STTResult {
 protocol TranslationProviderFactory {
     var id: String { get }
     func availability(from: Locale.Language, to: Locale.Language) async -> ProviderAvailability
-    /// One shared translator per language pair per conversation.
+    /// Cardinality is PROVIDER-DEFINED: Apple shares one translator per
+    /// language pair per conversation (62 ms, serialized is fine);
+    /// OpenAI creates one per lane (0.5–1.5 s/request — lanes must
+    /// translate in parallel). CascadeContext/engine typing moves to
+    /// `any Translator` when the first non-Apple provider lands (§14).
     func makeTranslator(from: Locale.Language, to: Locale.Language) async throws -> any Translator
 }
 
@@ -1238,9 +1242,25 @@ chatty lanes in a way Apple's 62 ms never did.
   context disambiguates pronouns/ellipsis, which is exactly where
   literal MT fails), and (3) the source utterance. System prompt pins:
   translate SOURCE→TARGET, output the translation only, no
-  explanations, preserve register. The lane engine supplies the context
-  window via a closure wired by AppModel from TranscriptStore (same
-  pattern as `assist.transcriptWindow`).
+  explanations, preserve register.
+  **Mechanism — PUSH, never pull** (a pull closure à la
+  `assist.transcriptWindow` does NOT transfer: TranscriptStore is
+  main-confined and that closure is only ever called on main, while the
+  MT pump runs on the lane queue — and `snapshot()` is already a main →
+  lane-queue `queue.sync` at 1 Hz, so a lane-queue → main sync fetch is
+  an ABBA deadlock): AppModel builds the window ON MAIN whenever a
+  cascade utterance finalizes and pushes a read-only value into every
+  cascade engine via `queue.async` (`updateTranslationContext(_:)`);
+  the pump reads its cached copy locally. Speaker names are captured at
+  push time (laneName is main-confined). This codifies the standing
+  seam invariant, now stated: **a lane engine's queue never blocks on
+  main.**
+  **Window content rules**: exclude the job's OWN utterance (it is
+  already a finalized-source row with an empty translation at submit
+  time — the model must not see the sentence it's translating as a
+  failed exemplar); exclude pairs with empty/"—" translations; exclude
+  pairs produced by the Apple fallback (they'd teach the literal style
+  this feature exists to avoid).
 - **Model**: `cascadeTranslationModel` setting, default `gpt-5-mini`,
   picker fed by the same /v1/models fetch SettingsView already does for
   the prompter. Reasoning-family models get `reasoning_effort:
@@ -1254,9 +1274,20 @@ chatty lanes in a way Apple's 62 ms never did.
   timeout: if the Apple pack for the pair is installed, fall back to
   AppleTranslator FOR THAT JOB (log + Diagnostics counter; the fallback
   translator is created lazily once); else the existing empty-final path
-  ("—"). Repeated failures (3 consecutive) raise the notice banner and
-  latch the fallback for the conversation (no per-utterance 8 s stalls
-  on a dead network) — un-latched only by Stop.
+  ("—"). **Single resolution per job is an invariant**: once a job can
+  resolve two ways (fallback after timeout vs a late OpenAI success),
+  each job resolves exactly once by job identity — late completions are
+  dropped (the pool's ResumeOnce discipline; without this, the shipped
+  mtFinished path double-fires: a late non-empty final after the bubble
+  closed CREATES AN ORPHAN DUPLICATE BUBBLE via cascadeIndex's
+  allowCreate, and enqueueTTS speaks the utterance twice).
+  **Latch**: failure counting is GLOBAL (CascadeContext — network death
+  is global; per-lane counters would serialize up to 4 × 3 × 8 s of
+  stalls); 3 consecutive failures latch the fallback and raise the
+  banner. Recovery is half-open: a synthetic probe request every ~60 s
+  (never a real utterance, so real translations never stall) un-latches
+  on success — a 30 s venue-Wi-Fi blip must not cost a 2-hour dinner
+  the context-aware translation that is this feature's point.
 - **Cost**: token usage from the API response × the model's price via
   the existing AssistPricing table → `onCostDelta`. Unpriced models
   count 0 with the same "excludes unpriced model" caveat the prompter
@@ -1287,7 +1318,11 @@ both topologies behind one engine-facing seam:
 protocol STTSession: AnyObject {           // one per lane per UTTERANCE
     func send(_ buffer: AVAudioPCMBuffer)  // converted to inputFormat
     func endUtterance()                    // VAD close → flush finals
-    var onResult: ((STTResult) -> Void)? { get set }   // volatile/final + epoch handled by engine
+    var onResult: ((STTResult) -> Void)? { get set }   // volatile/final; epoch stamped engine-side
+    /// The utterance will NOT finalize (WS death mid-utterance, slot
+    /// failure): the engine settles with volatile text, counts the
+    /// failure, and lets provider-side reconnect/replacement proceed.
+    var onFailure: ((String) -> Void)? { get set }
 }
 protocol STTProvider: AnyObject {
     var inputFormat: AVAudioFormat? { get async }
@@ -1313,8 +1348,14 @@ provider-internal.
 - Translation pipeline section gains three per-stage pickers
   (Speech recognition / Translation / Voices), each "Apple (on-device)"
   or "OpenAI (cloud)", DEFAULT APPLE, latched at Start like everything
-  else. The setup card shows only the selected providers' rows (Apple
-  rows as today; OpenAI rows = key present + model reachable).
+  else. The setup card shows the selected providers' rows (Apple rows
+  as today; OpenAI rows = key present + model reachable) — PLUS, when
+  OpenAI MT is selected, the Apple translation-pack row in
+  fallback-status form ("offline fallback: installed / not installed —
+  download"): the per-job fallback silently depends on it, and a user
+  who never installed the pack must not discover that as "—" on every
+  outage. Diagnostics adds the matching symptom row ("MT fallback
+  unavailable — translation pack not installed").
 - Voice menus swap inventory with the TTS provider (static 13 for
   OpenAI); ▶ preview works for both (OpenAI preview does one real
   request, noting it costs a fraction of a cent).
@@ -1327,7 +1368,12 @@ provider-internal.
 ### 14.5 Slices & review gates
 
 (a) OpenAIChatTranslator + context window + fallback + cost + MT picker
-+ key row — the owner's daily driver. (b) OpenAITTSSynth + voice UI
++ key row — the owner's daily driver. Slice-(a) code touchpoints noted
+by review: CascadeContext/engine move from concrete AppleTranslator to
+`any Translator`; the engine's per-lane FIFO comes from its own
+one-in-flight MT pump (not the protocol); the engine's "onCostDelta
+never fires" comment dies; OpenAI TTS later stamps TTSVoice.language
+with the requested language (its voices are language-agnostic). (b) OpenAITTSSynth + voice UI
 integration. (c) STT protocol extraction + OpenAISTTProvider — deferred
 until a use case demands it (mixed-language tables currently parked).
 Each slice: adversarial code review to LGTM + a field run before the

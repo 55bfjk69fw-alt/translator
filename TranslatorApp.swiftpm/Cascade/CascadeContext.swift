@@ -55,6 +55,12 @@ final class CascadeContext {
     let pool: any STTPool
     /// Diagnostics label for the STT stage ("apple" / "fun-asr-realtime").
     let sttProviderLabel: String
+    /// How long a lane waits for the close's final result before settling
+    /// with volatile text: Apple's finish flushes locally (probe-proven
+    /// ~0.1 s), a cloud final needs a network round trip plus server
+    /// finalize — the same 1.2 s would routinely lose cloud finals to the
+    /// settle timer. Latched here so the engine stays provider-blind.
+    let sttFinalizeGrace: TimeInterval
     let sourceLocale: Locale
     let sourceLanguage: Locale.Language
     let targetLanguage: Locale.Language
@@ -90,6 +96,10 @@ final class CascadeContext {
 
     init(sourceLanguage: String, targetLanguage: String, laneCap: Int,
          stt: STTProvider,
+         /// Dollar sink for cloud STT billing (CostMeter, thread-safe).
+         /// Wired at construction so no billed task can precede it;
+         /// ignored by the Apple provider, which never bills.
+         sttCostSink: (@Sendable (Double) -> Void)? = nil,
          translation: TranslationProvider,
          awaitingPriorTeardown priorTeardown: Task<Void, Never>?) {
         let source = Locale.Language(identifier: sourceLanguage)
@@ -105,15 +115,18 @@ final class CascadeContext {
         case .apple:
             self.pool = AnalyzerPool()
             self.sttProviderLabel = "apple"
+            self.sttFinalizeGrace = 1.2
             cloudSTT = false
         case .funASR(let apiKey, let endpoint):
             self.pool = FunASRPool(config: FunASRPool.Config(
                 apiKey: apiKey,
                 endpoint: endpoint,
                 model: "fun-asr-realtime",
-                languageHint: Self.funASRLanguageHint(for: sourceLanguage)
+                languageHint: Self.funASRLanguageHint(for: sourceLanguage),
+                costSink: sttCostSink
             ))
             self.sttProviderLabel = "fun-asr-realtime"
+            self.sttFinalizeGrace = 2.5
             cloudSTT = true
         }
 
@@ -173,7 +186,10 @@ final class CascadeContext {
     /// Two-letter hint for fun-asr-realtime's language_hints (supported
     /// codes from the API doc, 2026-07-15); nil = model auto-detects.
     /// Dialects (晋语 et al.) are detected within "zh" — no dialect
-    /// parameter exists.
+    /// parameter exists. NOTE: a vendor-doc snapshot, most of it
+    /// unexercisable today (the source picker only offers Apple-STT ∩
+    /// translation languages) and none of it validated against the live
+    /// model beyond zh.
     private static let funASRHintCodes: Set<String> = [
         "zh", "en", "ja", "ko", "vi", "th", "id", "ms", "tl", "hi", "ar",
         "fr", "de", "es", "pt", "ru", "it", "nl", "sv", "da", "fi", "no",

@@ -442,25 +442,22 @@ final class AppModel: ObservableObject {
             // Pool cap = enabled lanes (§6.1.1's min(enabledLanes, 4)) —
             // one enabled mic must not warm three extra analyzers.
             let enabledCount = (0..<channelCount).filter { AppSettings.speakerEnabled($0) }.count
+            // STT billing reaches the meter the moment the provider's
+            // rate constant is set (nil today — pending list-price
+            // confirmation, docs/DATONG-STT.md §2.1); billed seconds are
+            // counted pool-side either way. Wired at construction, like
+            // every other provider's onCostDelta — no downcast, no
+            // wiring race. CostMeter is thread-safe.
+            let meter = costMeter
             cascadeContext = CascadeContext(
                 sourceLanguage: AppSettings.cascadeSourceLanguage,
                 targetLanguage: AppSettings.outputLanguage,
                 laneCap: max(1, enabledCount),
                 stt: stt,
+                sttCostSink: { dollars in meter.addDollars(dollars) },
                 translation: translation,
                 awaitingPriorTeardown: lastCascadeTeardown
             )
-            // STT billing reaches the meter the moment the model's rate
-            // constant is set (nil today — pending list-price
-            // confirmation, docs/DATONG-STT.md §2.1); billed seconds are
-            // counted pool-side either way.
-            if let funASRPool = cascadeContext?.pool as? FunASRPool {
-                Task { [weak self] in
-                    await funASRPool.setCostSink { dollars in
-                        self?.costMeter.addDollars(dollars)
-                    }
-                }
-            }
             // The GLOBAL MT latch banner travels a context-level path,
             // not a lane's (§14.1): network death is global, so no lane
             // owns it. CostMeter is thread-safe — no hop for the probe's

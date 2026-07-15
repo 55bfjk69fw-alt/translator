@@ -36,7 +36,6 @@ struct STTResultEvent {
 ///    the converter); non-nil once `build` succeeds.
 protocol STTPool: Actor {
     var analyzerFormat: AVAudioFormat? { get }
-    var poolSize: Int { get }
     func build(locale: Locale, cap: Int) async -> Int
     func acquire(onResult: @escaping @Sendable (STTResultEvent) -> Void) async -> Int?
     func feed(slotIndex: Int, buffer: AVAudioPCMBuffer)

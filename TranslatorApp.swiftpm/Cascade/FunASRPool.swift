@@ -11,24 +11,35 @@ import AVFoundation
 /// task-finished; after task-failed the connection is unusable and is
 /// dropped). A dead socket is rebuilt on the next acquire, so a network
 /// blip costs one utterance's text, not the conversation: the engine's
-/// bounded settle (finalWaitSeconds) already tolerates a resultless
-/// utterance, and the lane recovers on the next grant.
+/// bounded settle already tolerates a resultless utterance, and the lane
+/// recovers on the next grant. Sustained failure latches acquire shut
+/// (nil grants → lanes surface .failed) with a half-open retry every
+/// cooldown, mirroring the MT stage's latch discipline (§14.1).
 ///
 /// Wire protocol (captured 2026-07-15 from the Bailian WebSocket API
 /// reference — endpoints/auth, client events, server events):
 ///  - connect `wss://…/api-ws/v1/inference`, `Authorization: Bearer key`
 ///    (validated at the WS handshake: bad key = HTTP 401/403 refusal)
 ///  - → run-task {task_group: audio, task: asr, function: recognition,
-///    model, parameters: {format: pcm, sample_rate: 16000,
-///    language_hints?}, input: {}} — ← task-started, then binary mono
-///    PCM16 frames flow
+///    model, parameters: {format: pcm, sample_rate, language_hints?},
+///    input: {}} — ← task-started, then binary mono PCM16 frames flow
 ///  - ← result-generated {output.sentence: {text, sentence_end,
 ///    heartbeat, sentence_id}, usage.duration (billed s, finals only)}.
 ///    Partial text is the CURRENT sentence's accumulated replacement —
 ///    exactly the volatile semantics the engine's replace-path renders —
-///    and a mid-task sentence_end final maps onto the engine's
+///    and a mid-capture sentence_end final maps onto the engine's
 ///    sub-segment release (per-sentence finals, stream continues).
 ///  - → finish-task → trailing finals → ← task-finished
+///
+/// Two contract adaptations to AnalyzerPool's field-proven semantics:
+///  - The engine settles on the FIRST final after a close, and Apple
+///    flushes exactly one cumulative final — so during the finish flush
+///    this pool HOLDS sentence finals and emits ONE merged final at task
+///    end (a second trailing final would be epoch-dropped and its text
+///    lost).
+///  - finish-task is never sent before task-started: the pre-start
+///    audio backlog must flush first, or the server finishes a task
+///    that heard nothing (the entire first utterance on a fresh socket).
 ///
 /// Threading: actor-confined. Sends are chained (each awaits its
 /// predecessor) because parallel Tasks would reorder audio frames; every
@@ -43,6 +54,10 @@ actor FunASRPool: STTPool {
         /// Two-letter hint ("zh") when the source language is one the
         /// model lists; nil lets the model auto-detect.
         let languageHint: String?
+        /// Dollars flow here per finished task once the rate is known;
+        /// wired at construction (CascadeContext) so no billing can
+        /// precede the sink. nil = seconds counted and logged only.
+        let costSink: (@Sendable (Double) -> Void)?
     }
 
     /// Per-second list price — UNKNOWN until the owner confirms it with
@@ -50,6 +65,19 @@ actor FunASRPool: STTPool {
     /// counted and logged but no dollars flow to the CostMeter; set this
     /// to light the meter up.
     static let dollarsPerBilledSecond: Double? = nil
+
+    /// The wire format (and the seam's analyzerFormat): 16 kHz mono
+    /// PCM16. One constant — the silence math, byte caps, and run-task
+    /// JSON must never disagree about the rate.
+    private static let sampleRate = 16_000
+    private static let bytesPerSecond = sampleRate * MemoryLayout<Int16>.size
+
+    /// Sustained-failure latch: after this many consecutive failed tasks
+    /// acquire returns nil (lanes go .failed like a dead AnalyzerPool)
+    /// except one half-open probe grant per cooldown; any finished task
+    /// un-latches.
+    private static let failureLatchThreshold = 3
+    private static let halfOpenCooldownSeconds: TimeInterval = 10
 
     private final class Slot {
         var socket: URLSessionWebSocketTask?
@@ -59,15 +87,22 @@ actor FunASRPool: STTPool {
         var sendChain: Task<Void, Never>?
         var owner: (@Sendable (STTResultEvent) -> Void)?
         var taskID = ""
-        /// run-task sent, terminal event (finished/failed/socket death)
-        /// not yet seen.
+        /// run-task sent, terminal state (finished/failed/abandoned) not
+        /// yet reached.
         var taskActive = false
         /// task-started received: audio flows directly. Before it, audio
-        /// queues in `pending` (the run-task round trip is ~1 RTT; the
+        /// queues in `pending` (the run-task round trip is ≥1 RTT; the
         /// utterance's opening frames land here).
         var started = false
         var pending: [Data] = []
         var pendingBytes = 0
+        /// finishAndRetire ran before task-started: send finish-task
+        /// right after the backlog flush, never before it.
+        var finishPending = false
+        /// The finish flush is underway: sentence finals are HELD (see
+        /// heldFinals) and merged into one final at task end.
+        var finishing = false
+        var heldFinals: [String] = []
         /// Owned by a lane (acquire → finishAndRetire/release cleanup).
         var busy = false
         var finishWaiter: ResumeOnce?
@@ -89,21 +124,17 @@ actor FunASRPool: STTPool {
     /// failures, for the teardown log line and field diagnosis.
     private var billedSeconds = 0
     private var taskFailures = 0
-    private var costSink: (@Sendable (Double) -> Void)?
+    /// Failure latch state (see failureLatchThreshold).
+    private var consecutiveFailures = 0
+    private var lastHalfOpenProbeAt: Date?
 
-    /// ~60 s of 16 kHz PCM16 — matches the lane buffer's cap intent;
+    /// ~60 s of wire audio — matches the lane buffer's cap intent;
     /// drop-oldest beyond it (an unstarted task this far behind is dead
     /// anyway).
-    private static let pendingBytesCap = 60 * 16_000 * 2
+    private static let pendingBytesCap = 60 * bytesPerSecond
 
     init(config: Config) {
         self.config = config
-    }
-
-    /// Dollars per billed second flow here when the rate is known
-    /// (AppModel wires the CostMeter at Start).
-    func setCostSink(_ sink: @escaping @Sendable (Double) -> Void) {
-        costSink = sink
     }
 
     // MARK: - Resume-once (bounded awaits; same primitive as AnalyzerPool)
@@ -141,8 +172,13 @@ actor FunASRPool: STTPool {
         // goes green: a cloud STT stage that cannot reach its server must
         // fail Start (readiness), not the first utterance.
         guard await probe() else { return 0 }
+        // A Stop can land during the probe; slots built on a torn-down
+        // pool would report a live pool for a dead conversation
+        // (AnalyzerPool.makeSlot re-checks for the same race).
+        guard !tornDown else { return 0 }
         analyzerFormat = AVAudioFormat(
-            commonFormat: .pcmFormatInt16, sampleRate: 16_000, channels: 1, interleaved: true
+            commonFormat: .pcmFormatInt16, sampleRate: Double(Self.sampleRate),
+            channels: 1, interleaved: true
         )
         let size = max(1, cap)
         slots = (0..<size).map { _ in Slot() }
@@ -198,6 +234,19 @@ actor FunASRPool: STTPool {
 
     func acquire(onResult: @escaping @Sendable (STTResultEvent) -> Void) async -> Int? {
         guard !tornDown, poolSize > 0 else { return nil }
+        // Sustained-failure latch: fail fast (lanes surface .failed, the
+        // AnalyzerPool dead-pool contract) instead of silently eating
+        // every utterance, but let one probe grant through per cooldown —
+        // a successful task un-latches (endTask .finished).
+        if consecutiveFailures >= Self.failureLatchThreshold {
+            let now = Date()
+            if let last = lastHalfOpenProbeAt,
+               now.timeIntervalSince(last) < Self.halfOpenCooldownSeconds {
+                return nil
+            }
+            lastHalfOpenProbeAt = now
+            Log.warn("[funasr] \(consecutiveFailures) consecutive task failures — granting a half-open probe slot")
+        }
         if let free = freeSlots.first {
             freeSlots.removeFirst()
             beginUtterance(free, onResult: onResult)
@@ -218,6 +267,9 @@ actor FunASRPool: STTPool {
         slot.started = false
         slot.pending = []
         slot.pendingBytes = 0
+        slot.finishPending = false
+        slot.finishing = false
+        slot.heldFinals = []
         slot.taskBilledSeconds = 0
         ensureSocket(index)
         chainSend(index, .string(Self.runTaskJSON(taskID: slot.taskID, config: config)))
@@ -252,21 +304,8 @@ actor FunASRPool: STTPool {
             return
         }
         let data = Data(bytes: channel[0], count: Int(buffer.frameLength) * MemoryLayout<Int16>.size)
-        enqueueAudio(slotIndex, slot: slot, data: data)
-    }
-
-    func feedSilence(slotIndex: Int, seconds: Double) {
-        guard slots.indices.contains(slotIndex), !tornDown else { return }
-        let slot = slots[slotIndex]
-        guard slot.busy, slot.taskActive else { return }
-        let bytes = Int(seconds * 16_000) * MemoryLayout<Int16>.size
-        guard bytes > 0 else { return }
-        enqueueAudio(slotIndex, slot: slot, data: Data(count: bytes))
-    }
-
-    private func enqueueAudio(_ index: Int, slot: Slot, data: Data) {
         if slot.started {
-            chainSend(index, .data(data))
+            chainSend(slotIndex, .data(data))
         } else {
             slot.pending.append(data)
             slot.pendingBytes += data.count
@@ -275,6 +314,13 @@ actor FunASRPool: STTPool {
             }
         }
     }
+
+    /// Deliberate no-op. The pad is an Apple-finalize artifact (the
+    /// analyzer needs post-boundary input to flush finals); Fun-ASR's
+    /// finish-task flushes trailing finals by protocol, and shipping the
+    /// pad would only add billed silence and finish latency per
+    /// utterance.
+    func feedSilence(slotIndex: Int, seconds: Double) {}
 
     /// Order-preserving send: each link awaits its predecessor. A failed
     /// send kills the socket (its task can't complete anyway); the engine
@@ -320,121 +366,184 @@ actor FunASRPool: STTPool {
             slot.pending = []
             slot.pendingBytes = 0
             for data in backlog { chainSend(index, .data(data)) }
+            // A finish requested before the task started waits for the
+            // backlog flush — finish-task ahead of the audio would end a
+            // task that heard nothing (the whole first utterance).
+            if slot.finishPending {
+                slot.finishPending = false
+                chainSend(index, .string(Self.finishTaskJSON(taskID: slot.taskID)))
+            }
         case "result-generated":
             guard slot.taskActive, let sentence = event.sentence, !sentence.heartbeat else { return }
             if sentence.isFinal, let duration = event.billedSeconds {
                 slot.taskBilledSeconds = duration
             }
-            slot.owner?(STTResultEvent(text: sentence.text, isFinal: sentence.isFinal))
-        case "task-finished":
-            endTask(index, failed: false)
-        case "task-failed":
-            taskFailures += 1
-            Log.warn("[funasr] task failed on slot \(index): \(event.errorCode ?? "?") — \(event.errorMessage ?? "?") (\(taskFailures) this conversation)")
-            endTask(index, failed: true)
-            // Doc rule: the connection is unusable after task-failed.
-            if let socket = slot.socket {
-                slot.reader?.cancel()
-                slot.reader = nil
-                slot.socket = nil
-                slot.sendChain = nil
-                socket.cancel(with: .normalClosure, reason: nil)
+            if sentence.isFinal, slot.finishing {
+                // Finish flush: hold sentence finals and emit ONE merged
+                // final at task end — the engine settles on the first
+                // post-close final, so a second one would be epoch-
+                // dropped and its text lost.
+                if !sentence.text.isEmpty { slot.heldFinals.append(sentence.text) }
+            } else {
+                slot.owner?(STTResultEvent(text: sentence.text, isFinal: sentence.isFinal))
             }
+        case "task-finished":
+            endTask(index, outcome: .finished)
+        case "task-failed":
+            Log.warn("[funasr] task failed on slot \(index): \(event.errorCode ?? "?") — \(event.errorMessage ?? "?")")
+            endTask(index, outcome: .failed)
+            // Doc rule: the connection is unusable after task-failed.
+            dropSocket(index)
         default:
             break
         }
     }
 
-    /// Terminal task state: settle billing and wake the finish waiter.
-    private func endTask(_ index: Int, failed: Bool) {
+    private enum TaskOutcome {
+        case finished
+        /// Failed or timed out — counts toward the failure latch.
+        case failed
+        /// Deliberately abandoned (virgin release): affects neither the
+        /// latch nor its recovery.
+        case abandoned
+    }
+
+    /// Terminal task state: emit the merged finish-flush final, settle
+    /// billing, update the failure latch, and wake the finish waiter.
+    private func endTask(_ index: Int, outcome: TaskOutcome) {
         let slot = slots[index]
         guard slot.taskActive else { return }
         slot.taskActive = false
         slot.started = false
+        slot.finishPending = false
+        if !slot.heldFinals.isEmpty {
+            slot.owner?(STTResultEvent(text: slot.heldFinals.joined(), isFinal: true))
+            slot.heldFinals = []
+        }
         if slot.taskBilledSeconds > 0 {
             billedSeconds += slot.taskBilledSeconds
             if let rate = Self.dollarsPerBilledSecond {
-                costSink?(Double(slot.taskBilledSeconds) * rate)
+                config.costSink?(Double(slot.taskBilledSeconds) * rate)
             }
             slot.taskBilledSeconds = 0
         }
-        slot.finishWaiter?.resume(!failed)
+        switch outcome {
+        case .finished:
+            consecutiveFailures = 0
+            lastHalfOpenProbeAt = nil
+        case .failed:
+            taskFailures += 1
+            consecutiveFailures += 1
+            if consecutiveFailures == Self.failureLatchThreshold {
+                Log.warn("[funasr] \(consecutiveFailures) consecutive task failures — latching acquire shut (half-open retry every \(Int(Self.halfOpenCooldownSeconds)) s)")
+            }
+        case .abandoned:
+            break
+        }
+        slot.finishWaiter?.resume(outcome == .finished)
         slot.finishWaiter = nil
+    }
+
+    /// The one place a slot's connection state is dropped: reader,
+    /// socket, and send chain go together (a stale send chain against a
+    /// dead socket is a wedged slot in the field).
+    private func dropSocket(_ index: Int, closeCode: URLSessionWebSocketTask.CloseCode = .normalClosure) {
+        let slot = slots[index]
+        guard let socket = slot.socket else { return }
+        slot.reader?.cancel()
+        slot.reader = nil
+        slot.socket = nil
+        slot.sendChain = nil
+        socket.cancel(with: closeCode, reason: nil)
     }
 
     private func socketDied(index: Int, socket: URLSessionWebSocketTask) {
         guard slots.indices.contains(index) else { return }
         let slot = slots[index]
         guard slot.socket === socket else { return }
-        slot.reader?.cancel()
-        slot.reader = nil
-        slot.socket = nil
-        slot.sendChain = nil
+        dropSocket(index)
         if slot.taskActive {
             Log.warn("[funasr] socket died mid-task on slot \(index) — utterance settles from volatile text")
-            taskFailures += 1
-            endTask(index, failed: true)
+            endTask(index, outcome: .failed)
         }
     }
 
     // MARK: - End of utterance
 
-    /// finish-task, then a bounded wait for task-finished: trailing
-    /// finals arrive through the owner callback DURING this call, exactly
-    /// like AnalyzerPool's finish flush. On timeout the socket is dropped
-    /// (task state unknown) — the slot itself survives and reconnects.
+    /// finish-task (deferred past the backlog flush when the task hasn't
+    /// started yet), then a bounded wait for task-finished: trailing
+    /// finals arrive merged through the owner callback DURING this call,
+    /// exactly like AnalyzerPool's finish flush. On timeout the socket is
+    /// dropped (task state unknown) — the slot itself survives and
+    /// reconnects.
     func finishAndRetire(slotIndex: Int) async {
         guard slots.indices.contains(slotIndex), !tornDown else { return }
         let slot = slots[slotIndex]
         guard slot.busy else { return }
         if slot.taskActive {
-            chainSend(slotIndex, .string(Self.finishTaskJSON(taskID: slot.taskID)))
+            slot.finishing = true
+            if slot.started {
+                chainSend(slotIndex, .string(Self.finishTaskJSON(taskID: slot.taskID)))
+            } else {
+                // Not started yet: the handshake/run-task round trip is
+                // still in flight and ALL audio sits in pending —
+                // finish-task goes out right after the flush at
+                // task-started (or never, if the socket dies; the wait
+                // below is bounded either way).
+                slot.finishPending = true
+            }
+            // 4 s: covers a slow start + backlog flush + finish round
+            // trip abroad; the engine's own settle timer is shorter, so
+            // this bound only protects the lane worker, never latency.
             let finished = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
                 let once = ResumeOnce(continuation)
                 slot.finishWaiter = once
                 Task {
-                    try? await Task.sleep(nanoseconds: 3_000_000_000)
+                    try? await Task.sleep(nanoseconds: 4_000_000_000)
                     once.resume(false)
                 }
             }
+            // Stop can interleave during the await: teardown emptied the
+            // pool and there is nothing to recycle.
+            guard !tornDown, slots.indices.contains(slotIndex) else { return }
             if !finished, slot.taskActive {
                 Log.warn("[funasr] finish timed out on slot \(slotIndex) — dropping the socket")
-                slot.taskActive = false
-                if let socket = slot.socket {
-                    slot.reader?.cancel()
-                    slot.reader = nil
-                    slot.socket = nil
-                    slot.sendChain = nil
-                    socket.cancel(with: .normalClosure, reason: nil)
-                }
+                // Through endTask, not a bare flag flip: the timed-out
+                // task's billed seconds and held finals must not vanish.
+                endTask(slotIndex, outcome: .failed)
+                dropSocket(slotIndex)
             }
         }
         recycle(slotIndex)
     }
 
-    /// Return a slot that never received audio. The protocol's release is
-    /// synchronous, so the (virgin) task is closed out in the background;
-    /// the slot re-enters the free list only when that completes.
+    /// Return a slot that never received audio. Synchronous and instant
+    /// (the AnalyzerPool contract a waiting lane depends on): the virgin
+    /// task is abandoned by dropping its socket — the server reaps the
+    /// task with the connection, and the next utterance on this slot
+    /// reconnects. Politely finishing the task instead would hold the
+    /// slot hostage to a network round trip.
     func release(slotIndex: Int) {
         guard slots.indices.contains(slotIndex), !tornDown else { return }
         let slot = slots[slotIndex]
         guard slot.busy else { return }
-        slot.owner = nil
-        if !slot.taskActive {
-            recycle(slotIndex)
-            return
+        if slot.taskActive {
+            endTask(slotIndex, outcome: .abandoned)
+            dropSocket(slotIndex)
         }
-        Task { await self.finishAndRetire(slotIndex: slotIndex) }
+        recycle(slotIndex)
     }
 
     private func recycle(_ index: Int) {
+        guard !tornDown, slots.indices.contains(index) else { return }
         let slot = slots[index]
         slot.owner = nil
         slot.busy = false
         slot.finishWaiter = nil
+        slot.finishing = false
+        slot.heldFinals = []
         slot.pending = []
         slot.pendingBytes = 0
-        guard !tornDown else { return }
         if waiters.isEmpty {
             freeSlots.append(index)
         } else {
@@ -449,26 +558,26 @@ actor FunASRPool: STTPool {
         tornDown = true
         for waiter in waiters { waiter.resume(returning: nil) }
         waiters.removeAll()
-        for slot in slots {
+        for (index, slot) in slots.enumerated() {
             slot.finishWaiter?.resume(false)
             slot.finishWaiter = nil
             slot.owner = nil
-            slot.reader?.cancel()
-            slot.reader = nil
-            slot.socket?.cancel(with: .goingAway, reason: nil)
-            slot.socket = nil
-            slot.sendChain = nil
+            dropSocket(index, closeCode: .goingAway)
         }
         slots.removeAll()
         freeSlots.removeAll()
         poolSize = 0
+        // URLSession retains internal resources until invalidated —
+        // one leaked session per conversation otherwise (the
+        // RealtimeTranslationClient learned this the same way).
+        session.invalidateAndCancel()
         Log.info("[funasr] torn down — \(billedSeconds) s billed, \(taskFailures) task failure(s) this conversation")
     }
 
     // MARK: - Wire format
 
     private static func runTaskJSON(taskID: String, config: Config) -> String {
-        var parameters: [String: Any] = ["format": "pcm", "sample_rate": 16_000]
+        var parameters: [String: Any] = ["format": "pcm", "sample_rate": sampleRate]
         if let hint = config.languageHint {
             parameters["language_hints"] = [hint]
         }

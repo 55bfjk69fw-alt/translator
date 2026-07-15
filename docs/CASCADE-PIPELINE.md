@@ -1452,10 +1452,36 @@ extraction early, with one deliberate deviation from §5.2's sketch:
   `FunASRPool.dollarsPerBilledSecond` is nil until the list price is
   confirmed (owner, via Alibaba contacts) — set it and the meter lights
   up through the existing CostMeter path.
+- **Review round (same day, 8-angle adversarial pass)**: findings fixed —
+  finish-task ordered strictly after the pre-task-started backlog flush
+  (short first utterances transcribed nothing); teardown-race index
+  crash in recycle/finishAndRetire; build() re-checks tornDown after the
+  probe; the finish-timeout path bills through endTask; finals arriving
+  during the finish flush are HELD and merged into ONE final (the engine
+  settles on the first post-close final — a second would be
+  epoch-dropped); a 3-failure acquire latch with 10 s half-open probe
+  (dead network now reddens lanes instead of green-and-silent);
+  URLSession invalidated at teardown; feedSilence is a no-op here (the
+  0.6 s pad is an Apple-finalize artifact that would bill as silence);
+  release() abandons the virgin task by dropping the socket so the slot
+  hand-off stays instant; the settle bound is provider-scaled
+  (`sttFinalizeGrace` 1.2 s Apple / 2.5 s cloud); STT billing rides a
+  construction-time cost sink instead of an AppModel downcast.
+- **Review findings deferred** (recorded, not taken): Slot's boolean
+  state machine → enum (rewrite risk with no compiler in the loop);
+  ResumeOnce/awaitBounded shared-utility extraction; probe socket handed
+  to slot 0 (saves one handshake at Start); post-task-started send-chain
+  byte cap (bounded today by the 12 s split + finish timeout); source
+  picker still Apple-STT-gated under Fun-ASR (zh-Hans is the app's use
+  case; revisit with per-lane languages); a static key-presence row for
+  the DashScope key (the field itself is on the card); failureText's
+  provider wording lives in Readiness rather than the pool reporting its
+  own reason.
 - **Open items**: 大同话 accuracy bench vs the Apple zh_CN baseline
   (docs/DATONG-STT.md §3); whether the Singapore endpoint serves the
   dialect snapshot; STT context injection (the API accepts a rolling
   `input.context` window — the cross-lane MT context push (§14.1) is the
   natural feeder, deferred until the bench proves the stage); a
-  mid-conversation failure notice channel (today: Diagnostics counters +
-  logs, utterances settle empty per §8's discipline).
+  mid-conversation failure notice channel beyond the acquire latch
+  (today: Diagnostics counters + logs, utterances settle empty per §8's
+  discipline).

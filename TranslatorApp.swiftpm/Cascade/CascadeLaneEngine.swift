@@ -156,8 +156,12 @@ final class CascadeLaneEngine: LaneEngine {
     /// Bounded wait for the close's final result before settling with the
     /// volatile text (~95% identical on short utterances per research).
     /// Deliberately short: waiting long buys little accuracy and costs
-    /// every utterance's latency when finalization is slow.
-    private static let finalWaitSeconds: TimeInterval = 1.2
+    /// every utterance's latency when finalization is slow. Provider-
+    /// scaled (context.sttFinalizeGrace): Apple flushes locally in
+    /// ~0.1 s; a cloud final rides a network round trip. Settling on the
+    /// final's ARRIVAL is the common case either way — the bound only
+    /// prices the failure path.
+    private let finalWaitSeconds: TimeInterval
 
     init(lane: Int, context: CascadeContext, translator: any Translator,
          voiceIdentifier: String, speechRate: Double) {
@@ -166,6 +170,7 @@ final class CascadeLaneEngine: LaneEngine {
         self.translator = translator
         self.label = "cascade ch\(lane)"
         self.queue = DispatchQueue(label: "translator.cascade.lane.\(lane)")
+        self.finalWaitSeconds = context.sttFinalizeGrace
         self.synth = AppleSpeechSynth(
             lane: lane,
             voiceIdentifier: voiceIdentifier,
@@ -313,14 +318,14 @@ final class CascadeLaneEngine: LaneEngine {
         // nothing (or the slot was never acquired), settle with the
         // volatile text rather than hanging the lane.
         let id = utterance.id
-        queue.asyncAfter(deadline: .now() + Self.finalWaitSeconds) { [weak self] in
+        queue.asyncAfter(deadline: .now() + finalWaitSeconds) { [weak self] in
             guard let self, let stuck = self.current, stuck.id == id,
                   stuck.closeRequestedAt != nil else { return }
             let text = (stuck.finalParts + [stuck.volatileText]).joined()
             // The result counts are the diagnosis: 0V/0F = the analyzer
             // returned NOTHING for this utterance (wedged slot or format
             // problem); NV/0F = volatiles flow but finalize never flushes.
-            Log.warn("[\(self.label)] no final within \(Self.finalWaitSeconds)s — settling with \(text.count) chars of volatile text (results: \(stuck.volatileEvents)V/\(stuck.finalEvents)F)")
+            Log.warn("[\(self.label)] no final within \(self.finalWaitSeconds)s — settling with \(text.count) chars of volatile text (results: \(stuck.volatileEvents)V/\(stuck.finalEvents)F)")
             self.settleUtterance(finalText: text, timedOut: true)
         }
     }

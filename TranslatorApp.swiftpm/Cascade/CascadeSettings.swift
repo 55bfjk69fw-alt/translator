@@ -348,20 +348,25 @@ struct CascadePipelineSection: View {
         .onDisappear { preview.stop() }
     }
 
+    /// One explicit sentence per provider combination — these are
+    /// user-facing copy, kept as whole literals so each cell can be
+    /// proofread and edited without decoding interpolation. Grows to a
+    /// third axis when the TTS picker (slice (c)) lands.
     private var cascadeFooter: String {
         guard pipeline == .cascade else {
             return "Realtime (OpenAI) translates while people speak (~0.5–1.5 s, per-minute billing, needs the API key and network). The on-device cascade is free and offline-capable with a distinct voice per speaker. Applies at the next Start."
         }
-        let sttNote = sttProvider == .funasr
-            ? "Recognition uses Alibaba Fun-ASR (cloud) — built for Chinese dialects including Jin (晋语, the Datong area); needs the DashScope key and network, billed per second of speech. "
-            : ""
-        if translationProvider == .openai {
-            return "\(sttNote)Cascade with OpenAI translation: \(sttProvider == .funasr ? "voices stay" : "recognition and voices stay") on-device; translation uses the chat model with recent-conversation context (per-token billing, needs the API key and network — falls back to the Apple pack per sentence when unreachable). Applies at the next Start. \(AppleTTSProvider.voiceDownloadHint)"
+        let funASRNote = "Recognition uses Alibaba Fun-ASR (cloud) — built for Chinese dialects including Jin (晋语, the Datong area); needs the DashScope key and network, billed per second of speech."
+        switch (sttProvider, translationProvider) {
+        case (.apple, .apple):
+            return "On-device: free, works offline once the model, pack, and voices are downloaded, and each speaker gets their own voice. Speech-end → translated audio runs ~1–2 s (the realtime pipeline translates mid-speech). Applies at the next Start. \(AppleTTSProvider.voiceDownloadHint)"
+        case (.apple, .openai):
+            return "Cascade with OpenAI translation: recognition and voices stay on-device; translation uses the chat model with recent-conversation context (per-token billing, needs the API key and network — falls back to the Apple pack per sentence when unreachable). Applies at the next Start. \(AppleTTSProvider.voiceDownloadHint)"
+        case (.funasr, .apple):
+            return "\(funASRNote) Translation and voices stay on-device. Applies at the next Start. \(AppleTTSProvider.voiceDownloadHint)"
+        case (.funasr, .openai):
+            return "\(funASRNote) Translation uses the OpenAI chat model with recent-conversation context (per-token billing, needs the API key — falls back to the Apple pack per sentence when unreachable); voices stay on-device. Applies at the next Start. \(AppleTTSProvider.voiceDownloadHint)"
         }
-        if sttProvider == .funasr {
-            return "\(sttNote)Translation and voices stay on-device. Applies at the next Start. \(AppleTTSProvider.voiceDownloadHint)"
-        }
-        return "On-device: free, works offline once the model, pack, and voices are downloaded, and each speaker gets their own voice. Speech-end → translated audio runs ~1–2 s (the realtime pipeline translates mid-speech). Applies at the next Start. \(AppleTTSProvider.voiceDownloadHint)"
     }
 
     /// Fetched list first, static fallback otherwise; the current

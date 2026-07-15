@@ -293,6 +293,12 @@ struct OpenAITranslationRequest {
     /// → English" more reliably than raw BCP-47 tags.
     let sourceName: String
     let targetName: String
+    /// Optional source-language-specific example of cross-script STT
+    /// errors (field-observed: the Mandarin transcriber sometimes emits
+    /// a Latin sound-alike — 好 as "how", 是 as "xi"). A concrete example
+    /// anchors the sound-reading rule far better than prose; nil for
+    /// languages we have no observed examples for.
+    let soundAlikeHint: String?
     var endpoint: URL = AppSettings.assistEndpoint
 
     enum RequestError: LocalizedError {
@@ -316,18 +322,26 @@ struct OpenAITranslationRequest {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = OpenAIChatTranslator.jobTimeoutSeconds
 
-        // The STT-provenance rules are deliberately CLOSED (fix homophones,
-        // drop fillers, otherwise literal): an open-ended "the transcript
-        // may be wrong" invites confident confabulation — the exact
-        // failure mode the "never add content" anchor guards against
-        // (worst case: English speech through the Mandarin model).
+        // The STT-provenance rules are deliberately CLOSED (fix
+        // sound-alikes, drop fillers, otherwise literal): an open-ended
+        // "the transcript may be wrong" invites confident confabulation —
+        // the exact failure mode the "never add content" anchor guards
+        // against (worst case: English speech through the Mandarin
+        // model). Mis-recognitions span SCRIPTS (field-observed): the
+        // intended word can surface as a similar-sounding source-language
+        // word OR as a Latin romanization/English sound-alike, so the
+        // rule is "read it by sound", context-gated both ways.
         var system = """
         You are a professional interpreter for a live \(sourceName) conversation. \
         Each user message is a raw speech-to-text transcript of one spoken utterance — it may contain \
-        mis-recognized words (usually replaced by similar-sounding ones), wrong or missing punctuation, \
-        and disfluencies. Translate the speaker's intended meaning into \(targetName). \
-        If a word is clearly a mis-recognition — a similar-sounding word fits the context much better — \
-        translate the intended word. Drop fillers and false starts. If you are unsure what was meant, \
+        mis-recognized words, wrong or missing punctuation, and disfluencies. Mis-recognitions are \
+        sound-based: the intended word may appear as a different similar-sounding \(sourceName) word, \
+        or as a Latin-script fragment that phonetically resembles it (a romanization or an English \
+        sound-alike).\(soundAlikeHint.map { " " + $0 } ?? "") \
+        Translate the speaker's intended meaning into \(targetName). \
+        If reading a suspicious word or fragment by its SOUND yields a \(sourceName) word that fits \
+        the context much better, translate that intended word. Keep deliberately used foreign words \
+        that make sense as spoken. Drop fillers and false starts. If you are unsure what was meant, \
         translate what is written; never add content the transcript doesn't support. \
         Produce natural, idiomatic \(targetName) as a human interpreter would speak it, not a \
         word-for-word rendering. \

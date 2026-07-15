@@ -316,9 +316,21 @@ struct OpenAITranslationRequest {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = OpenAIChatTranslator.jobTimeoutSeconds
 
+        // The STT-provenance rules are deliberately CLOSED (fix homophones,
+        // drop fillers, otherwise literal): an open-ended "the transcript
+        // may be wrong" invites confident confabulation — the exact
+        // failure mode the "never add content" anchor guards against
+        // (worst case: English speech through the Mandarin model).
         var system = """
         You are a professional interpreter for a live \(sourceName) conversation. \
-        Translate each user message from \(sourceName) into \(targetName). \
+        Each user message is a raw speech-to-text transcript of one spoken utterance — it may contain \
+        mis-recognized words (usually replaced by similar-sounding ones), wrong or missing punctuation, \
+        and disfluencies. Translate the speaker's intended meaning into \(targetName). \
+        If a word is clearly a mis-recognition — a similar-sounding word fits the context much better — \
+        translate the intended word. Drop fillers and false starts. If you are unsure what was meant, \
+        translate what is written; never add content the transcript doesn't support. \
+        Produce natural, idiomatic \(targetName) as a human interpreter would speak it, not a \
+        word-for-word rendering. \
         Output ONLY the \(targetName) translation — no explanations, no quotes, no notes. \
         Preserve the speaker's register and tone; resolve pronouns and ellipsis from the conversation context.
         """

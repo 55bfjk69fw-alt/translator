@@ -1247,7 +1247,14 @@ chatty lanes in a way Apple's 62 ms never did.
   context disambiguates pronouns/ellipsis, which is exactly where
   literal MT fails), and (3) the source utterance. System prompt pins:
   translate SOURCE→TARGET, output the translation only, no
-  explanations, preserve register.
+  explanations, preserve register, natural/idiomatic over
+  word-for-word. It also declares the input as a raw STT transcript
+  with CLOSED correction rules (owner request, post-slice-(a)): fix
+  only clear homophone-class mis-recognitions, drop fillers, and when
+  unsure translate what is written — never add unsupported content.
+  Closed rules on purpose: an open-ended "the transcript may be wrong"
+  invites confident confabulation, worst on the parked
+  English-into-Mandarin-model case.
   **Mechanism — PUSH, never pull** (a pull closure à la
   `assist.transcriptWindow` does NOT transfer: TranscriptStore is
   main-confined and that closure is only ever called on main, while the

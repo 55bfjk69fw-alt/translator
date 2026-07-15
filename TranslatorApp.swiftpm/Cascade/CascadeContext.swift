@@ -69,6 +69,12 @@ final class CascadeContext {
     /// mid-conversation language change plus a lane re-enable yields a
     /// voice in the new language speaking the old one's text.
     let targetLanguageCode: String
+    /// True when the source language writes in Han script. The lanes'
+    /// script gate (docs/ENGLISH-SUPPRESSION.md §4.1) keys on this: a
+    /// predominantly-Latin final on a Han-script lane means the speech
+    /// was never the source language. Meaningless — and wrong to apply —
+    /// for Latin-script sources, where every legitimate final is Latin.
+    let sourceUsesHanScript: Bool
     /// Diagnostics label for the translation stage ("apple" /
     /// "openai <model>").
     let translationProviderLabel: String
@@ -108,6 +114,12 @@ final class CascadeContext {
         self.targetLanguage = target
         self.targetLanguageCode = targetLanguage
         self.sourceLocale = Locale(identifier: sourceLanguage)
+        // Script from the identifier when explicit (zh-Hans/zh-Hant);
+        // fall back on the language code for bare "zh"/"yue".
+        let script = source.script?.identifier
+        let languageCode = source.languageCode?.identifier
+        self.sourceUsesHanScript = script == "Hans" || script == "Hant"
+            || languageCode == "zh" || languageCode == "yue"
         self.translationProvider = translation
 
         let cloudSTT: Bool

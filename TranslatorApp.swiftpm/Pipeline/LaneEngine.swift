@@ -102,6 +102,10 @@ struct CascadeSnapshot {
     var utterancesFinalized: Int
     var utterancesTranslated: Int
     var utterancesSpoken: Int
+    /// Finals suppressed by the script gate — speech that came out
+    /// predominantly Latin on a Han-script lane and was therefore never
+    /// translated or spoken (docs/ENGLISH-SUPPRESSION.md §4.1).
+    var utterancesSuppressedEnglish: Int
     var volatileChars: Int
     var finalChars: Int
     /// Pool contention evidence.

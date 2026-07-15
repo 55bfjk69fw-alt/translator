@@ -21,6 +21,10 @@ import UIKit
 ///  6. STT finalize latency with/without `prepareToAnalyze`.
 ///  7. The device's voice inventory and each voice's actual write() format.
 ///  8. Sustained-load thermals/battery over a configurable run.
+///  9. What the zh model emits for sustained ENGLISH audio — Latin text
+///     (the script gate's F1 case) or phonetic Han (F2) — and whether
+///     per-run `transcriptionConfidence` separates F2 gibberish from a
+///     genuine-Mandarin baseline (docs/ENGLISH-SUPPRESSION.md §5).
 ///
 /// No microphone, no network (except asset/pack downloads), no API key:
 /// Mandarin test audio is synthesized on-device with a zh voice and fed
@@ -58,6 +62,16 @@ final class CascadeProbe: ObservableObject {
         "这个菜太好吃了！",
         "我们明天上午十点在公司门口见面。",
         "他昨天买了一台新的电脑。"
+    ]
+
+    /// Sustained English for step 9 — plain conversational sentences, the
+    /// register the mics actually pick up when the user speaks.
+    private let englishSentences = [
+        "Could you tell me how much this costs?",
+        "I think we should meet tomorrow morning instead.",
+        "The weather has been really nice this week.",
+        "Please let me know when the documents are ready.",
+        "We are planning to visit the factory next month."
     ]
 
     // MARK: - Control
@@ -157,6 +171,8 @@ final class CascadeProbe: ObservableObject {
         await step3bConcurrentWrite()
         guard !Task.isCancelled else { return }
         step7VoiceInventory()
+        guard !Task.isCancelled else { return }
+        await step9EnglishIntoZh(mandarin: rendered)
         log("=== Cascade probe done — Share the log and paste results into docs/CASCADE-PIPELINE.md §10 ===")
     }
 
@@ -578,6 +594,164 @@ final class CascadeProbe: ObservableObject {
         if en.count < 4 {
             log("[7] Fewer than 4 usable English voices — lanes will share voices until more are downloaded (Settings → Accessibility → Read & Speak → Voices)")
         }
+    }
+
+    // MARK: - Step 9: English audio into a zh analyzer (script gate + confidence)
+
+    /// docs/ENGLISH-SUPPRESSION.md §5: two questions, one run. (a) Does
+    /// the zh-Hans model emit Latin text for sustained English (F1 — the
+    /// script gate catches it) or phonetic Han (F2 — it can't)? (b) Do F2
+    /// finals carry separably lower `transcriptionConfidence` than a
+    /// genuine-Mandarin baseline, i.e. is the layer-2 confidence floor
+    /// worth building? Sentence-per-analyzer, matching the pipeline's
+    /// per-utterance slots.
+    private func step9EnglishIntoZh(mandarin: RenderedAudio?) async {
+        setStage("9 English audio → zh analyzer")
+        guard let locale = await SpeechTranscriber.supportedLocale(equivalentTo: sourceLocale) else {
+            log("[9] zh locale unsupported — skipped")
+            return
+        }
+        guard let enVoice = bestVoice(languagePrefix: "en") else {
+            log("[9] No English voice installed — skipped")
+            return
+        }
+        log("[9] Rendering \(englishSentences.count) English sentences with \(enVoice.identifier)")
+        var buffers: [AVAudioPCMBuffer] = []
+        var ranges: [Range<Int>] = []
+        var format: AVAudioFormat?
+        for sentence in englishSentences {
+            let result = await render(text: sentence, voice: enVoice, synthesizer: renderSynth, timeout: 30)
+            guard case .finished(let rendered, let bufferFormat) = result, let bufferFormat else {
+                log("[9] English render FAILED for “\(sentence)”: \(result.failureDescription) — skipped")
+                return
+            }
+            if format == nil { format = bufferFormat }
+            let start = buffers.count
+            buffers.append(contentsOf: rendered)
+            ranges.append(start..<buffers.count)
+        }
+        guard let englishFormat = format else { return }
+        let english = RenderedAudio(buffers: buffers, format: englishFormat, sentenceRanges: ranges)
+        await confidencePass(label: "English", audio: english, expected: englishSentences, locale: locale)
+        if let mandarin {
+            await confidencePass(label: "Mandarin", audio: mandarin, expected: mandarinSentences, locale: locale)
+        } else {
+            log("[9] No Mandarin render from step 2 — confidence baseline skipped")
+        }
+        log("[9] Decision rule (docs/ENGLISH-SUPPRESSION.md §4.2): build the confidence floor only if English-audio finals score clearly below every Mandarin final; ABSENT confidences mean the attribute isn't populated on-device and layer 2 is off the table.")
+    }
+
+    /// One confidence-enabled transcription per sentence; logs the final
+    /// text, what the lane's script gate would do with it, and the
+    /// per-run confidence distribution.
+    private func confidencePass(label: String, audio: RenderedAudio, expected: [String], locale: Locale) async {
+        for (index, range) in audio.sentenceRanges.enumerated() {
+            guard !Task.isCancelled else { return }
+            do {
+                // Explicit init: the only way to opt into confidence
+                // attributes — the `.progressiveTranscription` preset the
+                // pipeline uses does not request them.
+                let transcriber = SpeechTranscriber(
+                    locale: locale,
+                    transcriptionOptions: [],
+                    reportingOptions: [],
+                    attributeOptions: [.transcriptionConfidence]
+                )
+                let analyzer = SpeechAnalyzer(modules: [transcriber])
+                guard let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
+                    log("[9] bestAvailableAudioFormat returned nil — assets missing?")
+                    return
+                }
+                let sentence = RenderedAudio(
+                    buffers: Array(audio.buffers[range]),
+                    format: audio.format,
+                    sentenceRanges: [0..<range.count]
+                )
+                let finals = try await Self.transcribeOnceWithConfidence(
+                    rendered: sentence,
+                    transcriber: transcriber,
+                    analyzer: analyzer,
+                    analyzerFormat: analyzerFormat
+                )
+                let spoken = expected.indices.contains(index) ? expected[index] : "?"
+                if finals.isEmpty {
+                    log("[9] \(label) #\(index + 1) (“\(spoken)”): NO finals")
+                }
+                for final in finals {
+                    let verdict = CascadeLaneEngine.isPredominantlyLatin(final.text)
+                        ? "LATIN → gate suppresses" : "HAN → gate passes"
+                    log("[9] \(label) #\(index + 1) (“\(spoken)”): “\(final.text)” — \(verdict); confidence \(final.confidenceText)")
+                }
+            } catch {
+                log("[9] \(label) #\(index + 1) FAILED: \(describe(error))")
+            }
+        }
+    }
+
+    private struct ConfidentFinal {
+        let text: String
+        let confidences: [Double]
+
+        var confidenceText: String {
+            guard !confidences.isEmpty else {
+                return "ABSENT — no run carried the attribute"
+            }
+            let mean = confidences.reduce(0, +) / Double(confidences.count)
+            return String(format: "mean %.2f, min %.2f over %d run(s)",
+                          mean, confidences.min() ?? 0, confidences.count)
+        }
+    }
+
+    /// transcribeOnce, but keeping per-run `transcriptionConfidence`
+    /// alongside each final's text. The attribute reads per the docs'
+    /// run-attribute pattern (`audioTimeRange` reads as
+    /// `run.audioTimeRange`); if the compiler disagrees with the exact
+    /// name, fix it here from compiler evidence — this file's charter.
+    private nonisolated static func transcribeOnceWithConfidence(
+        rendered: RenderedAudio,
+        transcriber: SpeechTranscriber,
+        analyzer: SpeechAnalyzer,
+        analyzerFormat: AVAudioFormat
+    ) async throws -> [ConfidentFinal] {
+        let (stream, continuation) = AsyncStream.makeStream(of: AnalyzerInput.self)
+        let harvest = Task<[ConfidentFinal], Error> {
+            var finals: [ConfidentFinal] = []
+            for try await result in transcriber.results where result.isFinal {
+                var confidences: [Double] = []
+                for run in result.text.runs {
+                    if let confidence = run.transcriptionConfidence {
+                        confidences.append(Double(confidence))
+                    }
+                }
+                finals.append(ConfidentFinal(
+                    text: String(result.text.characters),
+                    confidences: confidences
+                ))
+            }
+            return finals
+        }
+        // Same throw discipline as transcribeOnce: a leaked harvest keeps
+        // its transcriber alive past the step.
+        do {
+            try await analyzer.start(inputSequence: stream)
+            guard let converter = AVAudioConverter(from: rendered.format, to: analyzerFormat) else {
+                throw NSError(domain: "CascadeProbe", code: 3, userInfo: [
+                    NSLocalizedDescriptionKey: "No converter \(rendered.format.sampleRate) Hz → \(analyzerFormat.sampleRate) Hz"
+                ])
+            }
+            for buffer in rendered.buffers {
+                if let converted = Self.convert(buffer, with: converter, to: analyzerFormat) {
+                    continuation.yield(AnalyzerInput(buffer: converted))
+                }
+            }
+            continuation.finish()
+            try await analyzer.finalizeAndFinishThroughEndOfInput()
+        } catch {
+            continuation.finish()
+            harvest.cancel()
+            throw error
+        }
+        return try await harvest.value
     }
 
     // MARK: - Step 8: sustained load

@@ -1,6 +1,9 @@
 # English pickup on Chinese lanes: never synthesize it (design)
 
-Status: **research + recommended design, unimplemented**.
+Status: **layer 1 (script gate) + probe step implemented, 2026-07-15;
+layer 2 (confidence floor) awaits the probe's field run** — see §4.2.
+The gate lives in `CascadeLaneEngine.finishUtterance` /
+`isPredominantlyLatin`; the probe step is CascadeProbe step 9.
 Research date: 2026-07-15. Companion to `docs/CASCADE-PIPELINE.md` (the
 cascade pipeline this modifies). Scope: the on-device cascade only — the
 realtime OpenAI pipeline has its own (server-side) code-switching
@@ -110,8 +113,11 @@ On English verdict:
   isFinal: true)` — the text already *is* target-language, so the bubble
   closes reading sensibly instead of "—", and `setCascadeTranslation`
   needs no changes.
-- Do **not** enqueue MT (junk jobs would also delay real ones on the
-  shared serialized translator) and therefore nothing reaches TTS.
+- Do **not** enqueue MT (junk jobs would delay real ones on the shared
+  Apple session — and on the OpenAI MT stage (CASCADE-PIPELINE §14)
+  would bill tokens for garbage and, on success, poison the shared
+  context window with a non-Chinese "source") and therefore nothing
+  reaches TTS.
 - Log + count: `utterancesSuppressedEnglish` in `CascadeSnapshot`,
   rendered in the Diagnostics pipeline panel next to `audioSkips`.
 
@@ -145,14 +151,23 @@ F2 text is indistinguishable from Chinese *as text*; per-run
 
 ## 5. Probe plan (extends CascadeProbe)
 
-New step alongside step 3 (concurrent analyzers), reusing the render
-harness: synthesize ~10 s of *English* via an en voice and ~10 s of
-Mandarin baseline, feed each to a zh-Hans slot constructed with
-confidence attributes, and log per-final: text, Han/Latin counts, run
-confidences (min/mean). Two questions, one run: (a) what does zh-Hans
-STT actually emit for sustained English on-device — Latin (F1) or Han
-(F2)? (b) do F2 finals score separably below genuine-Mandarin finals?
-Export lands in the existing probe report for the decision log.
+Implemented as probe step 9 (`step9EnglishIntoZh`), reusing the render
+harness: five English sentences synthesized via the best en voice plus
+the step-2 Mandarin render as baseline, each sentence fed to its own
+zh-Hans transcriber constructed with
+`attributeOptions: [.transcriptionConfidence]` (the explicit init — the
+`.progressiveTranscription` preset doesn't request attributes). Logged
+per final: the text, the verdict of the *actual* lane gate
+(`CascadeLaneEngine.isPredominantlyLatin`, not a copy), and the per-run
+confidence min/mean. Two questions, one run: (a) what does zh-Hans STT
+actually emit for sustained English on-device — Latin (F1) or Han (F2)?
+(b) do F2 finals score separably below genuine-Mandarin finals? "ABSENT"
+confidences mean the attribute isn't populated on-device and layer 2 is
+off the table. Results land in the probe export for the decision log.
+One caveat: the confidence-attribute *read* (`run.transcriptionConfidence`)
+follows the documented run-attribute pattern but was written without a
+compiler — per the probe file's charter, fix the exact name from
+compiler evidence on-device if it disagrees.
 
 ## 6. Decision log
 

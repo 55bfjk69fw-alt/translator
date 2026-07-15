@@ -131,7 +131,8 @@ final class CascadeLaneEngine: LaneEngine {
     // Stats for the Diagnostics snapshot.
     private var stats = CascadeSnapshot(
         state: .idle, utterancesOpened: 0, utterancesFinalized: 0,
-        utterancesTranslated: 0, utterancesSpoken: 0, volatileChars: 0,
+        utterancesTranslated: 0, utterancesSpoken: 0,
+        utterancesSuppressedEnglish: 0, volatileChars: 0,
         finalChars: 0, slotWaits: 0, lastSlotWaitSeconds: nil,
         holdsSlot: false, bufferedAudioSeconds: 0, audioSkips: 0,
         lastFinalizeSeconds: nil, lastTranslateSeconds: nil,
@@ -564,8 +565,61 @@ final class CascadeLaneEngine: LaneEngine {
             return
         }
         onTranscript?(.sourceText(utterance: utterance.id, text: text, isFinal: true))
+        // Script gate (docs/ENGLISH-SUPPRESSION.md §4.1): a predominantly
+        // Latin final on a Han-script lane means the speech was never the
+        // source language — the zh→en session would garble it or parrot
+        // it back to the person who just said it. The recognized text
+        // goes in the translation slot (it already IS target-language
+        // material for the transcript) and nothing reaches MT or TTS —
+        // junk MT jobs would also delay real ones on the shared
+        // serialized translator.
+        if context.sourceUsesHanScript, Self.isPredominantlyLatin(text) {
+            stats.utterancesSuppressedEnglish += 1
+            Log.info("[\(label)] final is predominantly Latin on a Han-script lane — synthesis suppressed (\(text.count) chars)")
+            onTranscript?(.translationText(utterance: utterance.id, text: text, isFinal: true))
+            return
+        }
         mtQueue.append(TranslationJob(id: utterance.id, sourceText: text, speechEndedAt: utterance.closeRequestedAt))
         pumpMT()
+    }
+
+    // MARK: - Script gate (docs/ENGLISH-SUPPRESSION.md §4.1)
+
+    /// Fraction of letter mass that must be Latin to call a final
+    /// "not the source language". Han characters weigh double: one
+    /// ideograph is roughly a word/syllable while ~5 Latin letters make
+    /// one word, so unweighted counts would over-call mixed sentences.
+    /// "我们用 Zoom 开会" (han 5, latin 4) scores 0.29 and translates;
+    /// an English sentence with one hallucinated trailing 吗 scores
+    /// ~0.9 and is suppressed. Expect one field-tuning pass.
+    private static let latinDominanceThreshold = 0.75
+    /// A hanless final needs a few letters before it counts as speech
+    /// ("OK" or "APP" alone still translate fine).
+    private static let minLatinLettersAlone = 3
+
+    /// Internal (not private) so CascadeProbe's step 9 exercises the
+    /// EXACT gate the lanes run — a probe verdict from a copy would
+    /// drift.
+    static func isPredominantlyLatin(_ text: String) -> Bool {
+        var han = 0
+        var latin = 0
+        for scalar in text.unicodeScalars {
+            switch scalar.value {
+            // CJK Unified Ideographs + Extension A.
+            case 0x4E00...0x9FFF, 0x3400...0x4DBF:
+                han += 1
+            // Basic Latin letters + Latin-1/Extended letters (é, ü, …);
+            // 0xD7/0xF7 are × and ÷, not letters.
+            case 0x41...0x5A, 0x61...0x7A:
+                latin += 1
+            case 0xC0...0x24F where scalar.value != 0xD7 && scalar.value != 0xF7:
+                latin += 1
+            default:
+                break
+            }
+        }
+        if han == 0 { return latin >= minLatinLettersAlone }
+        return Double(latin) / Double(latin + 2 * han) >= latinDominanceThreshold
     }
 
     // MARK: - Translation stage (queue-confined; one in flight per lane)

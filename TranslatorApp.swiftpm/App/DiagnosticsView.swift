@@ -384,7 +384,7 @@ private struct LanePipelineRow: View {
                         .foregroundStyle(.orange)
                 }
             } else if let cascade = cascadeSession {
-                Text("Utterances: \(cascade.utterancesOpened) opened · \(cascade.utterancesFinalized) finalized · \(cascade.utterancesTranslated) translated · \(cascade.utterancesSpoken) spoken\(cascade.audioSkips > 0 ? " · \(cascade.audioSkips) audio skipped" : "")")
+                Text("Utterances: \(cascade.utterancesOpened) opened · \(cascade.utterancesFinalized) finalized · \(cascade.utterancesTranslated) translated · \(cascade.utterancesSpoken) spoken\(cascade.utterancesSuppressedEnglish > 0 ? " · \(cascade.utterancesSuppressedEnglish) English suppressed" : "")\(cascade.audioSkips > 0 ? " · \(cascade.audioSkips) audio skipped" : "")")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Text("STT: \(cascade.volatileChars) volatile / \(cascade.finalChars) final ch · slot \(cascade.holdsSlot ? "held" : "free") · \(cascade.slotWaits) waits\(cascade.bufferedAudioSeconds > 0.5 ? String(format: " · %.1fs buffered", cascade.bufferedAudioSeconds) : "")")

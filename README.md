@@ -119,6 +119,44 @@ translating the table.
 Keep the app in the foreground: Swift Playgrounds apps can't run background audio.
 The app disables the screen-idle timer while a conversation is running.
 
+## On-device cascade mode — free, offline, a voice per speaker
+
+Settings → **Translation pipeline** switches the translation engine from
+the realtime OpenAI sessions to an on-device cascade: Apple's
+`SpeechTranscriber` (the iOS 26 speech engine) → the Translation
+framework (the same packs the Translate app uses) → per-speaker
+`AVSpeechSynthesizer` voices. No API key, no network once the three
+one-time downloads are done (the setup card walks through them: the 中文
+speech model, the 中文→English translation pack, and — optional but
+recommended — enhanced voices via Settings → Accessibility → Read &
+Speak → Voices).
+
+Differences from the realtime pipeline, by design
+(`docs/CASCADE-PIPELINE.md`):
+
+- **Chinese text appears live while someone talks** (the realtime
+  pipeline's Chinese trails); translation + spoken English arrive after
+  each utterance ends (~1–2 s) instead of mid-speech.
+- **Each speaker gets their own voice** — pick per-lane voices (with ▶
+  preview) in the Translation pipeline section.
+- **The source language is explicit** (default Mandarin): English spoken
+  into a Mandarin model comes out as gibberish — disable lanes worn by
+  English speakers, or wait for per-lane source languages (roadmap).
+- The device runs at most 3 concurrent speech analyses (measured), so a
+  4th simultaneous speaker queues briefly; Diagnostics shows slot waits,
+  and the Metrics tab has a per-stage cascade latency chart.
+- Cost shows `$0.00 · on-device`; the reply prompter still uses OpenAI
+  (and the API key) if enabled.
+- **The translation stage can run on OpenAI instead** (Translation
+  pipeline → Translation → "OpenAI (cloud)"): a chat model (default
+  `gpt-5-mini`) translates each sentence WITH the scene line and the
+  last few cross-speaker exchanges as context — noticeably less literal
+  than the Apple packs on pronouns/ellipsis. Needs the API key and
+  network; bills per token (the cost meter counts it, and the
+  "on-device" tag drops). When the API is unreachable it falls back to
+  the Apple pack per sentence and recovers automatically. Recognition
+  and voices stay on-device.
+
 ## Signal tab — seeing and tuning the gate
 
 The **Signal** tab is a live workbench for the multi-mic pipeline. It works during
@@ -251,4 +289,12 @@ profile.
 - [ ] AirPods personal capture lane (transcribe the user's own speech hands-free)
   if the dual-input probe proves AirPods mic + USB can run together
   (docs/REPLY-FLOW.md §8).
+- [x] On-device cascade pipeline (Apple SpeechTranscriber → Translation
+  framework → per-lane AVSpeechSynthesizer voices) — free/offline
+  alternative to the realtime sessions (`docs/CASCADE-PIPELINE.md`).
+- [ ] Per-lane source language (mixed-language tables; fixes English
+  speakers coming out garbled in cascade mode).
+- [ ] CP4: cloud cascade providers behind the same stage protocols —
+  OpenAI translation SHIPPED (context-aware chat MT with Apple
+  fallback); OpenAI TTS next, OpenAI STT / ElevenLabs / DeepL deferred.
 - [ ] Head-to-head: Gemini Live translate / Azure Live Interpreter fallbacks.

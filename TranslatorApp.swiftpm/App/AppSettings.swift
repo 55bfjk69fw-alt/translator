@@ -30,6 +30,151 @@ enum AppSettings {
     /// Last-selected pane of the Monitor tab (Signal/Metrics/Diagnostics).
     static let monitorPaneKey = "monitorPane"
 
+    // Cascade pipeline (docs/CASCADE-PIPELINE.md §8.1, §14)
+    static let pipelineKey = "pipeline"
+    static let cascadeSourceLanguageKey = "cascadeSourceLanguage"
+    static let cascadeSpeechRateKey = "cascadeSpeechRate"
+    static let cascadeTranslationProviderKey = "cascadeTranslationProvider"
+    static let cascadeTranslationModelKey = "cascadeTranslationModel"
+    static let cascadeTranslationPriorityKey = "cascadeTranslationPriority"
+    static let cascadeSTTProviderKey = "cascadeSTTProvider"
+    static let dashScopeRegionKey = "dashScopeRegion"
+
+    /// Per-stage provider for the cascade's STT stage — slice (b) of the
+    /// provider pickers. Default Apple; read once at Start (latched in
+    /// CascadeContext). Fun-ASR is the dialect-capable cloud model
+    /// (docs/DATONG-STT.md).
+    enum CascadeSTTProvider: String, CaseIterable, Identifiable {
+        case apple
+        case funasr
+        var id: String { rawValue }
+        var displayName: String {
+            switch self {
+            case .apple: return "Apple (on-device)"
+            case .funasr: return "Alibaba Fun-ASR (dialect, cloud)"
+            }
+        }
+    }
+
+    static var cascadeSTTProvider: CascadeSTTProvider {
+        CascadeSTTProvider(rawValue: UserDefaults.standard.string(forKey: cascadeSTTProviderKey) ?? "") ?? .apple
+    }
+
+    /// Bailian/DashScope inference region. Beijing hosts the mainland
+    /// account's models; Singapore is the international endpoint (whether
+    /// it serves the dialect snapshot is UNVERIFIED — docs/DATONG-STT.md
+    /// §2.1). Legacy shared domains per the API doc; the per-workspace
+    /// domains can replace these when the workspace ID is worth a setting.
+    enum DashScopeRegion: String, CaseIterable, Identifiable {
+        case beijing
+        case singapore
+        var id: String { rawValue }
+        var displayName: String {
+            switch self {
+            case .beijing: return "China (Beijing)"
+            case .singapore: return "International (Singapore)"
+            }
+        }
+        var websocketURL: URL {
+            switch self {
+            case .beijing: return URL(string: "wss://dashscope.aliyuncs.com/api-ws/v1/inference")!
+            case .singapore: return URL(string: "wss://dashscope-intl.aliyuncs.com/api-ws/v1/inference")!
+            }
+        }
+    }
+
+    static var dashScopeRegion: DashScopeRegion {
+        DashScopeRegion(rawValue: UserDefaults.standard.string(forKey: dashScopeRegionKey) ?? "") ?? .beijing
+    }
+
+    /// Per-stage provider for the cascade's translation stage (§14.4).
+    /// Default Apple; read once at Start (latched in CascadeContext).
+    /// The TTS provider picker arrives with its slice (c).
+    enum CascadeTranslationProvider: String, CaseIterable, Identifiable {
+        case apple
+        case openai
+        var id: String { rawValue }
+        var displayName: String {
+            switch self {
+            case .apple: return "Apple (on-device)"
+            case .openai: return "OpenAI (cloud)"
+            }
+        }
+    }
+
+    static var cascadeTranslationProvider: CascadeTranslationProvider {
+        CascadeTranslationProvider(rawValue: UserDefaults.standard.string(forKey: cascadeTranslationProviderKey) ?? "") ?? .apple
+    }
+
+    static let defaultCascadeTranslationModel = "gpt-5-mini"
+
+    /// Chat model for the OpenAI translation stage (§14.1) — mini-tier
+    /// default: context-aware MT needs judgment, not frontier reasoning.
+    static var cascadeTranslationModel: String {
+        let value = UserDefaults.standard.string(forKey: cascadeTranslationModelKey) ?? ""
+        return value.isEmpty ? defaultCascadeTranslationModel : value
+    }
+
+    /// OpenAI priority tier for the cascade MT stage, SEPARATE from the
+    /// prompter's toggle (translation latency is heard in the ear every
+    /// sentence; prompter latency is glanced at). Like the prompter's,
+    /// read live per request — safe to flip mid-conversation, no latch
+    /// needed (nothing becomes inconsistent).
+    static var cascadeTranslationPriority: Bool {
+        UserDefaults.standard.bool(forKey: cascadeTranslationPriorityKey)
+    }
+
+    /// Which per-lane translation engine a conversation uses. Read once at
+    /// Start; toggling mid-conversation applies to the next one.
+    enum Pipeline: String, CaseIterable, Identifiable {
+        case realtime      // OpenAI gpt-realtime-translate (default)
+        case cascade       // on-device STT → translation → TTS
+        var id: String { rawValue }
+        var displayName: String {
+            switch self {
+            case .realtime: return "Realtime (OpenAI)"
+            case .cascade: return "On-device cascade"
+            }
+        }
+    }
+
+    static var pipeline: Pipeline {
+        Pipeline(rawValue: UserDefaults.standard.string(forKey: pipelineKey) ?? "") ?? .realtime
+    }
+
+    /// Cascade source language (BCP-47). The cascade needs an EXPLICIT
+    /// source (SpeechTranscriber locale + translation source) where the
+    /// realtime pipeline auto-detects. Fixed at Start in CascadeContext.
+    static var cascadeSourceLanguage: String {
+        let value = UserDefaults.standard.string(forKey: cascadeSourceLanguageKey) ?? ""
+        return value.isEmpty ? "zh-Hans" : value
+    }
+
+    /// Global TTS rate multiplier for cascade playback voices
+    /// (AVSpeechUtteranceDefaultSpeechRate × this; 1.0 = normal).
+    static var cascadeSpeechRate: Double {
+        let value = UserDefaults.standard.double(forKey: cascadeSpeechRateKey)
+        return value > 0 ? min(max(value, 0.7), 1.5) : 1.0
+    }
+
+    /// Per-lane TTS voice identifier, scoped by provider AND target
+    /// language: an en-US voice validates fine while mispronouncing
+    /// French, so switching output language switches to that language's
+    /// assignments instead of reusing the wrong ones
+    /// (docs/CASCADE-PIPELINE.md §6.4).
+    static func laneVoiceKey(provider: String, language: String, channel: Int) -> String {
+        "laneVoice.\(provider).\(language).\(channel)"
+    }
+
+    static func laneVoice(provider: String, language: String, channel: Int) -> String? {
+        let value = UserDefaults.standard.string(forKey: laneVoiceKey(provider: provider, language: language, channel: channel)) ?? ""
+        return value.isEmpty ? nil : value
+    }
+
+    static func setLaneVoice(_ identifier: String, provider: String, language: String, channel: Int) {
+        UserDefaults.standard.set(identifier, forKey: laneVoiceKey(provider: provider, language: language, channel: channel))
+    }
+
     // Reply prompter (docs/REPLY-FLOW.md)
     static let prompterEnabledKey = "prompterEnabled"
     static let autoSuggestKey = "prompterAutoSuggest"

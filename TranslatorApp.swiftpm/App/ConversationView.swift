@@ -106,7 +106,13 @@ struct ConversationView: View {
             lanes: model.lanes,
             sessionStates: model.sessionStates,
             estimatedCost: model.estimatedCost,
-            showCost: model.mode != .idle
+            showCost: model.mode != .idle,
+            // Gated on .conversation: bench mode never sets the pipeline,
+            // and a stale cascade value must not label a bench's $0.00.
+            // A cascade with any CLOUD stage (§14.4) drops the annotation
+            // — its cost is no longer zero.
+            onDevice: model.mode == .conversation && model.conversationPipeline == .cascade
+                && !model.cascadeUsesCloud
         )
     }
 
@@ -150,17 +156,25 @@ struct ConversationView: View {
                 }
                 ForEach(transcript.utterances) { utterance in
                     let isUser = utterance.laneID == SpeakerLane.userLaneID
-                    UtteranceBubble(
-                        utterance: utterance,
-                        lane: model.lane(for: utterance.laneID),
-                        onReplyTo: prompterEnabled && !isUser && utterance.isFinal
-                            ? { requestScopedReply(to: utterance) }
-                            : nil,
-                        onExplain: prompterEnabled && !isUser && !utterance.sourceText.isEmpty
-                            ? { explain(utterance) }
-                            : nil
-                    )
-                    .id(utterance.id)
+                    if utterance.suppressedEnglish {
+                        SuppressedEnglishRow(
+                            lane: model.lane(for: utterance.laneID),
+                            date: utterance.date
+                        )
+                        .id(utterance.id)
+                    } else {
+                        UtteranceBubble(
+                            utterance: utterance,
+                            lane: model.lane(for: utterance.laneID),
+                            onReplyTo: prompterEnabled && !isUser && utterance.isFinal
+                                ? { requestScopedReply(to: utterance) }
+                                : nil,
+                            onExplain: prompterEnabled && !isUser && !utterance.sourceText.isEmpty
+                                ? { explain(utterance) }
+                                : nil
+                        )
+                        .id(utterance.id)
+                    }
                 }
             }
             .padding()
@@ -226,9 +240,10 @@ struct ConversationView: View {
 private struct StatusBarView: View {
     @ObservedObject var meters: ChannelMeters
     let lanes: [SpeakerLane]
-    let sessionStates: [Int: RealtimeTranslationClient.State]
+    let sessionStates: [Int: LaneEngineState]
     let estimatedCost: Double
     let showCost: Bool
+    let onDevice: Bool
 
     var body: some View {
         HStack(spacing: 14) {
@@ -242,7 +257,9 @@ private struct StatusBarView: View {
             }
             Spacer()
             if showCost {
-                Text(String(format: "~$%.2f", estimatedCost))
+                // Cascade conversations are free; the annotation says WHY
+                // the number stays at zero (prompter use still adds cost).
+                Text(String(format: "~$%.2f", estimatedCost) + (onDevice ? " · on-device" : ""))
                     .font(.footnote.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
@@ -623,10 +640,10 @@ private struct LaneStatusDot: View {
     let lane: SpeakerLane
     let level: Float
     let open: Bool
-    let state: RealtimeTranslationClient.State?
+    let state: LaneEngineState?
     @AppStorage private var enabled: Bool
 
-    init(lane: SpeakerLane, level: Float, open: Bool, state: RealtimeTranslationClient.State?) {
+    init(lane: SpeakerLane, level: Float, open: Bool, state: LaneEngineState?) {
         self.lane = lane
         self.level = level
         self.open = open
@@ -662,12 +679,38 @@ private struct LaneStatusDot: View {
     }
 
     private var stateColor: Color {
+        // The seam's dot mapping (docs/CASCADE-PIPELINE.md §5.1):
+        // reconnecting stays yellow — the engine is still retrying, and
+        // red is reserved for a lane that has actually given up.
         switch state {
-        case .open: return .green
-        case .connecting: return .yellow
-        case .closed: return .red
+        case .running: return .green
+        case .starting, .reconnecting: return .yellow
+        case .degraded: return .orange
+        case .failed: return .red
         case .idle, nil: return .gray
         }
+    }
+}
+
+/// Collapsed record of an utterance the script gate suppressed
+/// (docs/ENGLISH-SUPPRESSION.md §4.1): English was heard on this lane and
+/// deliberately not translated or spoken. A thin system-notice row — the
+/// history shows THAT it happened without replaying what was said (the
+/// text is on the utterance and in the diagnostics log).
+private struct SuppressedEnglishRow: View {
+    let lane: SpeakerLane
+    let date: Date
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "speaker.slash")
+            Text("\(lane.name) · English — not translated")
+            Text(date, style: .time)
+                .foregroundStyle(.quaternary)
+        }
+        .font(.caption2)
+        .foregroundStyle(.tertiary)
+        .frame(maxWidth: .infinity, alignment: .center)
     }
 }
 

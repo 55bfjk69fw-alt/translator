@@ -134,6 +134,15 @@ final class ChannelGate {
         var pass: Bool
         /// Voiced, but suppressed as bleed of a louder correlated channel.
         var bleed: Bool
+        /// Instantaneous genuine voicing for THIS buffer: the raw VAD
+        /// verdict minus bleed, BEFORE the hangover smoothing that
+        /// `voiced` carries. The cascade pipeline segments utterances on
+        /// a short debounce of this flag (docs/CASCADE-PIPELINE.md §6.1)
+        /// — the hangover keeps the gate open across word gaps and must
+        /// not delay utterance closes, and bleed subtraction keeps a
+        /// suppressed lane's close from being starved while the louder
+        /// correlated speaker keeps talking.
+        var genuineNow: Bool
     }
 
     // MARK: - Telemetry
@@ -157,6 +166,9 @@ final class ChannelGate {
         var voiced: Bool
         var pass: Bool
         var bleed: Bool
+        /// Mirror of Decision.genuineNow so the Signal tab can plot the
+        /// flag the cascade actually segments on.
+        var genuineNow: Bool
     }
 
     struct PairTelemetry {
@@ -312,7 +324,7 @@ final class ChannelGate {
             let voiced = voicedNow[i] || inHangover
             // A user-disabled channel never passes, even with the gate off.
             let pass = isEnabled(i) && (!enabled || (!bleed[i] && (genuine || inHangover)))
-            decisions.append(Decision(rms: rms[i], voiced: voiced, pass: pass, bleed: bleed[i]))
+            decisions.append(Decision(rms: rms[i], voiced: voiced, pass: pass, bleed: bleed[i], genuineNow: genuine))
             channelTelemetry.append(ChannelTelemetry(
                 rms: rms[i],
                 noiseFloor: floors[i],
@@ -320,7 +332,8 @@ final class ChannelGate {
                 vadProbability: probabilities[i],
                 voiced: voiced,
                 pass: pass,
-                bleed: bleed[i]
+                bleed: bleed[i],
+                genuineNow: genuine
             ))
 
             if bleed[i] && !wasBleed.contains(i) {

@@ -8,7 +8,11 @@ import AppleProductTypes
 let package = Package(
     name: "Translator",
     platforms: [
-        .iOS("18.0")
+        // iOS 26: SpeechAnalyzer/SpeechTranscriber and the headless
+        // TranslationSession initializer (docs/CASCADE-PIPELINE.md §4).
+        // Swift Playgrounds 4.7 — required to build this app — already
+        // needs iPadOS 26 hardware, so nothing is lost.
+        .iOS("26.0")
     ],
     products: [
         .iOSApplication(

@@ -69,9 +69,20 @@ final class AppModel: ObservableObject {
         didSet { applyIdleTimerPolicy() }
     }
     @Published private(set) var lanes: [SpeakerLane] = []
-    @Published private(set) var sessionStates: [Int: RealtimeTranslationClient.State] = [:]
+    /// Per-lane engine state for the status dots. Publishes only on CASE
+    /// transitions (sameCase guard in wireEngine): `.reconnecting(3)` →
+    /// `.reconnecting(4)` is the same yellow dot and must not re-render
+    /// the status bar on every retry.
+    @Published private(set) var sessionStates: [Int: LaneEngineState] = [:]
     @Published private(set) var route: AudioSessionController.RouteSnapshot?
     @Published private(set) var estimatedCost: Double = 0
+    /// Which pipeline the RUNNING conversation uses (drives the status
+    /// bar's on-device annotation); meaningful while mode != .idle.
+    @Published private(set) var conversationPipeline: AppSettings.Pipeline = .realtime
+    /// True when the running cascade conversation uses any CLOUD stage
+    /// (§14.4): the status bar's "· on-device" annotation drops because
+    /// cost is no longer zero.
+    @Published private(set) var cascadeUsesCloud = false
     @Published var errorBanner: String?
     /// The once-per-conversation cost alert. Separate from errorBanner so
     /// neither channel can overwrite the other (last-writer-wins on a shared
@@ -88,8 +99,8 @@ final class AppModel: ObservableObject {
         /// Gate currently passing this channel (mirror of the status dot).
         var gateOpen: Bool
         var secondsSinceSpeech: TimeInterval?
-        /// nil = no session right now (they open lazily on first speech).
-        var session: RealtimeTranslationClient.Snapshot?
+        /// nil = no engine right now (they open lazily on first speech).
+        var session: LaneEngineSnapshot?
     }
 
     let transcript: TranscriptStore
@@ -127,58 +138,46 @@ final class AppModel: ObservableObject {
     private let costMeter = CostMeter()
     private let audioQueue = DispatchQueue(label: "translator.audio.pipeline", qos: .userInitiated)
 
-    /// laneID -> client, one per DJI channel (0..<channelCount).
-    /// `clients`, `resamplers`, and `gate` internals are confined to
-    /// audioQueue (mutations from the main thread hop via audioQueue.sync)
-    /// because the tap pipeline reads them concurrently.
-    private var clients: [Int: RealtimeTranslationClient] = [:]
-    private var resamplers: [Int: StreamResampler] = [:]
-    private var reconnectAttempts: [Int: Int] = [:]
-    private var sessionOpenedAt: [Int: Date] = [:]
-    /// The exact still-retrying banner text shown per lane (main thread),
-    /// so recovery can clear its own banner without clobbering an unrelated
-    /// error that replaced it in the meantime.
-    private var reconnectBanner: [Int: String] = [:]
-    /// Whether the lane's last close was the client's backlog reset (main
-    /// thread) — picks the saturated-uplink banner wording over the generic
-    /// connection-failure one.
-    private var lastCloseWasBacklog: [Int: Bool] = [:]
+    /// laneID -> engine, one per DJI channel (0..<channelCount).
+    /// `engines` and `gate` internals are confined to audioQueue
+    /// (mutations from the main thread hop via audioQueue.sync) because
+    /// the tap pipeline reads them concurrently. Resampling, silence
+    /// substitution, and the reconnect loop all live inside the engines
+    /// now (Pipeline/RealtimeLaneEngine.swift) — AppModel sees only the
+    /// LaneEngine seam.
+    private var engines: [Int: any LaneEngine] = [:]
+    /// Text of each lane notice currently displayed, keyed by notice id
+    /// (main thread), so an engine's `cleared` retracts its own banner
+    /// without clobbering an unrelated error that replaced it meanwhile
+    /// (the old reconnectBanner text-equality discipline, id-keyed).
+    private var noticeTexts: [String: String] = [:]
 
     // audioQueue-confined lazy-session state. Sessions open on first
     // detected speech per channel (a powered-off TX is pure silence and
     // never opens one) and are closed again after idle timeout.
     private var pipelineActive = false
     private var sessionAPIKey: String?
+    /// The pipeline this conversation was started with (audioQueue-
+    /// confined like the other session state; the Settings toggle applies
+    /// at the NEXT Start).
+    private var activePipeline: AppSettings.Pipeline = .realtime
+    /// Cascade cross-lane pieces (pool, shared translator); nil while the
+    /// realtime pipeline runs. Main-thread lifecycle; engines capture it.
+    private var cascadeContext: CascadeContext?
+    /// The previous conversation's pool teardown; the next cascade Start
+    /// awaits it so the retiring slots' admission share doesn't
+    /// under-size the new pool (main thread).
+    private var lastCascadeTeardown: Task<Void, Never>?
+    /// Rolling window of the last few finalized cross-lane
+    /// source→translation pairs (main thread), PUSHED into cascade
+    /// engines at every finalization — never pulled from a lane queue
+    /// (docs/CASCADE-PIPELINE.md §14.1).
+    private var cascadeContextWindow: [TranslationContextPair] = []
+    private static let cascadeContextWindowSize = 6
     private var lastVoiceAt: [Int: Date] = [:]
     /// Last logged voiced state per channel (audioQueue-confined) so
     /// speech start/end transitions land in the diagnostics log.
     private var voicedState: [Int: Bool] = [:]
-    /// Channels already warned about dropping gated speech for lack of a
-    /// resampler (audioQueue-confined) — a silent-drop path that otherwise
-    /// looks exactly like "gate open, nothing captured".
-    private var warnedMissingResampler: Set<Int> = []
-
-    // Gate-closed append pausing (audioQueue-confined). Sessions are no
-    // longer fed silence for the whole lull between utterances: after the
-    // gate's hangover closes, a short silence tail is appended (the server
-    // segments phrases on trailing quiet), then the stream pauses entirely.
-    // Server-verified safe: appended audio is treated as contiguous with
-    // what came before (no timestamps on append), which is also why a
-    // resume must splice in a quiet gap — otherwise the new phrase butts
-    // against the previous one in session time.
-    /// Buffers of trailing silence still owed to a lane's session.
-    private var silenceTailRemaining: [Int: Int] = [:]
-    /// Channels whose outbound stream is currently paused.
-    private var appendPaused: Set<Int> = []
-    /// Last 200 ms of real resampled audio per non-passing channel, sent on
-    /// resume so the word onset the gate's attack clipped isn't lost.
-    private var preRoll: [Int: Data] = [:]
-
-    /// ~1.2 s of silence after the hangover closes — long enough to be the
-    /// server's phrase-boundary cue, no longer billed past that.
-    private static let silenceTailBufferCount = 6
-    /// 300 ms splice inserted when a paused stream resumes.
-    private static let resumeSpliceSilence = Data(count: 14_400) // 24 kHz PCM16
 
     // Engine watchdog bookkeeping (main thread). The engine auto-stops on
     // configuration changes and interruptions; the watchdog brings it back.
@@ -227,6 +226,11 @@ final class AppModel: ObservableObject {
             guard let self else { return [] }
             let now = Date()
             return self.transcript.utterances.suffix(60)
+                // Suppressed English pickups stay out of the window: the
+                // prompter suggests replies to the OTHER side's Chinese,
+                // and a bleed-through of the user's own English would be
+                // mis-attributed to that speaker.
+                .filter { !$0.suppressedEnglish }
                 .filter { $0.isFinal || !$0.sourceText.isEmpty || !$0.translatedText.isEmpty }
                 .suffix(25)
                 .map { utterance in
@@ -262,8 +266,22 @@ final class AppModel: ObservableObject {
 
     func startConversation() {
         guard mode == .idle else { return }
-        guard let apiKey = KeychainStore.loadAPIKey(), !apiKey.isEmpty else {
+        // The all-Apple cascade needs no API key (the reply prompter
+        // still does, and degrades with its own messaging without one);
+        // selecting any OpenAI cascade stage makes it required again
+        // (§14.1).
+        let apiKey = KeychainStore.loadAPIKey() ?? ""
+        let needsKey = AppSettings.pipeline == .realtime
+            || (AppSettings.pipeline == .cascade && AppSettings.cascadeTranslationProvider == .openai)
+        if needsKey, apiKey.isEmpty {
             errorBanner = "Add your OpenAI API key in Settings first."
+            return
+        }
+        // The Fun-ASR STT stage needs ITS key (readiness would also catch
+        // this at the probe, but a missing key is user-fixable now).
+        if AppSettings.pipeline == .cascade, AppSettings.cascadeSTTProvider == .funasr,
+           (KeychainStore.loadDashScopeKey() ?? "").isEmpty {
+            errorBanner = "Add your DashScope API key in Settings → Translation pipeline first."
             return
         }
         errorBanner = nil
@@ -402,18 +420,85 @@ final class AppModel: ObservableObject {
         lanes = (0..<channelCount).map { SpeakerLane.djiLane(channel: $0, name: AppSettings.speakerName($0)) }
         channelMeters.reset(channelCount: channelCount)
 
+        let pipeline = AppSettings.pipeline
+        conversationPipeline = pipeline
+        cascadeUsesCloud = false
+        cascadeContextWindow.removeAll()
+        if pipeline == .cascade {
+            // Latched at Start like the languages: a Settings change
+            // applies to the next conversation.
+            let translation: CascadeContext.TranslationProvider
+            if AppSettings.cascadeTranslationProvider == .openai {
+                translation = .openAI(apiKey: apiKey, model: AppSettings.cascadeTranslationModel)
+                cascadeUsesCloud = true
+            } else {
+                translation = .apple
+            }
+            let stt: CascadeContext.STTProvider
+            if AppSettings.cascadeSTTProvider == .funasr {
+                stt = .funASR(
+                    apiKey: KeychainStore.loadDashScopeKey() ?? "",
+                    endpoint: AppSettings.dashScopeRegion.websocketURL
+                )
+                cascadeUsesCloud = true
+            } else {
+                stt = .apple
+            }
+            // Pool cap = enabled lanes (§6.1.1's min(enabledLanes, 4)) —
+            // one enabled mic must not warm three extra analyzers.
+            let enabledCount = (0..<channelCount).filter { AppSettings.speakerEnabled($0) }.count
+            // STT billing reaches the meter the moment the provider's
+            // rate constant is set (nil today — pending list-price
+            // confirmation, docs/DATONG-STT.md §2.1); billed seconds are
+            // counted pool-side either way. Wired at construction, like
+            // every other provider's onCostDelta — no downcast, no
+            // wiring race. CostMeter is thread-safe.
+            let meter = costMeter
+            cascadeContext = CascadeContext(
+                sourceLanguage: AppSettings.cascadeSourceLanguage,
+                targetLanguage: AppSettings.outputLanguage,
+                laneCap: max(1, enabledCount),
+                stt: stt,
+                sttCostSink: { dollars in meter.addDollars(dollars) },
+                translation: translation,
+                awaitingPriorTeardown: lastCascadeTeardown
+            )
+            // The GLOBAL MT latch banner travels a context-level path,
+            // not a lane's (§14.1): network death is global, so no lane
+            // owns it. CostMeter is thread-safe — no hop for the probe's
+            // token cost.
+            if let health = cascadeContext?.translationHealth {
+                health.onNotice = { [weak self] notice in
+                    DispatchQueue.main.async { self?.handleNotice(notice) }
+                }
+                health.onCostDelta = { [weak self] dollars in
+                    self?.costMeter.addDollars(dollars)
+                }
+            }
+        }
         audioQueue.sync {
             applyGateTuningLocked()
             gate.reset()
             pipelineActive = true
             sessionAPIKey = apiKey
+            activePipeline = pipeline
             lastVoiceAt.removeAll()
             voicedState.removeAll()
         }
-        buildResamplers(channelCount: channelCount)
-        // Sessions are opened lazily on first speech per channel, not here —
-        // a disconnected/powered-off TX never opens a billed session.
-        sessionStates = Dictionary(uniqueKeysWithValues: (0..<channelCount).map { ($0, RealtimeTranslationClient.State.idle) })
+        sessionStates = Dictionary(uniqueKeysWithValues: (0..<channelCount).map { ($0, LaneEngineState.idle) })
+        if pipeline == .cascade {
+            // Cascade engines open EAGERLY (docs/CASCADE-PIPELINE.md §6.1):
+            // they're free, warm-up is front-loaded, and pool sizing fails
+            // deterministically at Start instead of mid-conversation.
+            // Realtime keeps lazy-open (billing).
+            audioQueue.sync {
+                for channel in 0..<channelCount where AppSettings.speakerEnabled(channel) {
+                    let engine = makeEngine(lane: channel, apiKey: apiKey)
+                    engines[channel] = engine
+                    engine.start()
+                }
+            }
+        }
 
         signalAnalyzer.startSession()
         // Reset only after every fallible setup step: a Start that dies on
@@ -459,18 +544,16 @@ final class AppModel: ObservableObject {
             pipelineActive = false
             sessionAPIKey = nil
             lastVoiceAt.removeAll()
-            silenceTailRemaining.removeAll()
-            appendPaused.removeAll()
-            preRoll.removeAll()
-            for (_, client) in clients { client.close() }
-            clients.removeAll()
-            resamplers.removeAll()
+            for (_, engine) in engines { engine.close() }
+            engines.removeAll()
         }
         sessionStates.removeAll()
-        reconnectAttempts.removeAll()
-        reconnectBanner.removeAll()
-        lastCloseWasBacklog.removeAll()
-        sessionOpenedAt.removeAll()
+        noticeTexts.removeAll()
+        // Engines are closed above; only now may the pool's analyzers be
+        // finished (terminal) — the one place that ever happens (§7). The
+        // handle lets the next Start wait out the admission share.
+        lastCascadeTeardown = cascadeContext?.teardown()
+        cascadeContext = nil
         pipelineMonitor.clear()
         resetPlaybackState()
         refreshCost()
@@ -488,27 +571,6 @@ final class AppModel: ObservableObject {
     /// open translation session.
     func applyIdleTimerPolicy() {
         UIApplication.shared.isIdleTimerDisabled = AppSettings.keepScreenAwake || mode != .idle
-    }
-
-    private func buildResamplers(channelCount: Int) {
-        let rate = engineGraph.inputSampleRate
-        audioQueue.sync {
-            resamplers.removeAll()
-            warnedMissingResampler.removeAll()
-            silenceTailRemaining.removeAll()
-            preRoll.removeAll()
-            // Every channel restarts PAUSED, not cleared: an engine rebuild
-            // is a real capture gap on a session whose clients survive it,
-            // so the next passing buffer must splice (a speaker talking
-            // through a route change would otherwise butt the two phrase
-            // halves together in session time). Channels without a client
-            // shed the flag on their next buffer; a fresh lazy-opened
-            // session leads with 300 ms of silence, which is harmless.
-            appendPaused = Set(0..<channelCount)
-            for channel in 0..<channelCount {
-                resamplers[channel] = StreamResampler(inputSampleRate: rate)
-            }
-        }
     }
 
     /// Player nodes are torn down on every engine rebuild and their pending
@@ -574,62 +636,35 @@ final class AppModel: ObservableObject {
             // alone (pass implies genuine-or-hangover, which implies voiced).
             let speech = decision.pass && decision.voiced
             if speech { lastVoiceAt[channel] = Date() }
-            guard let resampler = resamplers[channel] else {
-                if speech, warnedMissingResampler.insert(channel).inserted {
-                    Log.error("ch\(channel): gate passed speech but no resampler exists — audio is being dropped before the session (engine/route rebuild mismatch)")
-                }
-                continue
-            }
-            // The real audio is resampled on every buffer — sent or not — so
-            // the converter's filter state stays gapless and the freshest
-            // 200 ms is always available as pre-roll.
-            guard let data = resampler.convert(buffers[channel]) else { continue }
-            if !decision.pass { preRoll[channel] = data }
-            let existingClient = clients[channel]
-            guard let client = existingClient ?? lazyOpenSession(channel: channel, speech: speech) else {
-                // No session: nothing owes a tail and there is nothing to pause.
-                silenceTailRemaining[channel] = nil
-                appendPaused.remove(channel)
-                continue
-            }
-            if decision.pass {
-                let resumed = appendPaused.remove(channel) != nil
-                if resumed || existingClient == nil {
-                    // A fresh session's first append and a resumed stream both
-                    // lead with the pre-roll; only a resume needs the quiet
-                    // splice (a new session has no previous phrase to butt
-                    // against). Oversized appends are fine — the server
-                    // splits them into 200 ms frames itself.
-                    var spliced = Data()
-                    if resumed { spliced.append(Self.resumeSpliceSilence) }
-                    if let pre = preRoll.removeValue(forKey: channel) { spliced.append(pre) }
-                    spliced.append(data)
-                    client.sendAudio(spliced, containsSpeech: speech)
-                } else {
-                    client.sendAudio(data, containsSpeech: speech)
-                }
-                silenceTailRemaining[channel] = Self.silenceTailBufferCount
-            } else if let tail = silenceTailRemaining[channel], tail > 0 {
-                silenceTailRemaining[channel] = tail - 1
-                client.sendAudio(Data(count: data.count), containsSpeech: false)
-            } else {
-                appendPaused.insert(channel)
-            }
+            guard let engine = engines[channel] ?? lazyOpenEngine(channel: channel, speech: speech) else { continue }
+            // The engine owns what suppressed audio becomes (realtime:
+            // silence tail then append pause; cascade: dropped) and does
+            // its own resampling — the seam forwards the raw buffer plus
+            // the gate's verdicts.
+            engine.sendAudio(buffers[channel], verdict: GateVerdict(
+                speech: speech,
+                voicedNow: decision.genuineNow,
+                pass: decision.pass
+            ))
         }
         pushMeters(decisions)
     }
 
-    /// Runs on audioQueue. Opens a channel's translation session the first
-    /// time genuine (non-bleed) speech is detected on it; the client queues
-    /// audio while the socket connects, so the triggering words are
+    /// Runs on audioQueue. Opens a channel's lane engine the first time
+    /// genuine (non-bleed) speech is detected on it; the realtime client
+    /// queues audio while its socket connects, so the triggering words are
     /// translated too.
-    private func lazyOpenSession(channel: Int, speech: Bool) -> RealtimeTranslationClient? {
+    private func lazyOpenEngine(channel: Int, speech: Bool) -> (any LaneEngine)? {
         guard speech, pipelineActive, let apiKey = sessionAPIKey else { return nil }
+        // Cascade lanes normally open eagerly at Start; this path serves
+        // them only for a mid-conversation re-enable (§6.1's single
+        // exception). Realtime requires the key; cascade doesn't.
+        guard activePipeline == .cascade || !apiKey.isEmpty else { return nil }
         Log.info("Speech on channel \(channel) — opening translation session")
-        let client = makeClient(lane: channel, outputLanguage: AppSettings.outputLanguage, apiKey: apiKey)
-        clients[channel] = client
-        client.connect()
-        return client
+        let engine = makeEngine(lane: channel, apiKey: apiKey)
+        engines[channel] = engine
+        engine.start()
+        return engine
     }
 
     private var lastMeterPush = Date.distantPast
@@ -645,132 +680,174 @@ final class AppModel: ObservableObject {
         }
     }
 
-    // MARK: - Sessions
+    // MARK: - Lane engines
 
-    /// Create and wire a client without registering or connecting it.
+    /// Create and wire a lane engine without registering or starting it.
     /// Safe to call from any thread (settings/keychain are thread-safe).
-    private func makeClient(lane: Int, outputLanguage: String, apiKey: String) -> RealtimeTranslationClient {
-        var config = SessionConfig(outputLanguage: outputLanguage)
-        config.model = AppSettings.modelName
-        config.noiseReduction = AppSettings.noiseReduction
-        let client = RealtimeTranslationClient(
-            label: "ch\(lane)→\(outputLanguage)",
-            config: config,
-            apiKey: apiKey,
-            endpointTemplate: AppSettings.endpointTemplate
-        )
-        wireClient(client, lane: lane)
-        return client
+    /// The latched pipeline picks the engine kind here
+    /// (docs/CASCADE-PIPELINE.md §5.1).
+    private func makeEngine(lane: Int, apiKey: String) -> any LaneEngine {
+        let engine: any LaneEngine
+        if activePipeline == .cascade, let context = cascadeContext {
+            // The conversation's LATCHED target language, not a live
+            // settings read — a mid-conversation output-language change
+            // must not give a re-enabled lane a voice mismatching the
+            // translations.
+            let language = context.targetLanguageCode
+            let voice = AppleTTSProvider.voice(for: lane, language: language)
+            if voice == nil {
+                Log.warn("No usable \(language) voice for lane \(lane) — TTS will fall back to a \(language) system voice")
+            }
+            let cascadeEngine = CascadeLaneEngine(
+                lane: lane,
+                context: context,
+                translator: context.makeTranslator(lane: lane),
+                voiceIdentifier: voice?.identifier ?? "",
+                speechRate: AppSettings.cascadeSpeechRate
+            )
+            // Cross-lane context window (§14.1): finalized non-fallback
+            // pairs hop to main, where the window is rebuilt (speaker
+            // names are main-confined) and PUSHED into every cascade
+            // engine. An engine created mid-conversation (lane re-enable)
+            // starts with an empty window and fills on the next pair.
+            cascadeEngine.onTranslationPair = { [weak self] source, translation in
+                DispatchQueue.main.async {
+                    self?.recordCascadePair(lane: lane, source: source, translation: translation)
+                }
+            }
+            engine = cascadeEngine
+        } else {
+            engine = RealtimeLaneEngine(
+                lane: lane,
+                outputLanguage: AppSettings.outputLanguage,
+                model: AppSettings.modelName,
+                noiseReduction: AppSettings.noiseReduction,
+                apiKey: apiKey,
+                endpointTemplate: AppSettings.endpointTemplate,
+                // UserDefaults is thread-safe, so the engine can read the
+                // current speaker name at banner time from its own queue.
+                laneName: { AppSettings.speakerName(lane) }
+            )
+        }
+        wireEngine(engine, lane: lane)
+        return engine
     }
 
-    private func wireClient(_ client: RealtimeTranslationClient, lane: Int) {
-        client.onStateChange = { [weak self, weak client] state in
+    private func wireEngine(_ engine: any LaneEngine, lane: Int) {
+        engine.onState = { [weak self, weak engine] state in
             DispatchQueue.main.async {
-                guard let self, let client else { return }
-                // Ignore events from clients no longer registered for this
-                // lane (e.g. after an idle-close) so they can't clobber the
-                // lane's displayed state or trigger reconnects.
-                guard self.audioQueue.sync(execute: { self.clients[lane] === client }) else { return }
-                switch state {
-                case .open:
-                    self.sessionOpenedAt[lane] = Date()
-                    // A recovered session must retract its own scare banner
-                    // promptly — the close-time counter reset can be an hour
-                    // away on a healthy session, and "keeps failing" over a
-                    // green dot reads as a broken app. 5 s of survival is
-                    // the same proof bar the counter reset uses; the text
-                    // equality check keeps this from clobbering an unrelated
-                    // error that replaced the banner meanwhile.
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
-                        guard let self, self.sessionStates[lane] == .open,
-                              let banner = self.reconnectBanner[lane] else { return }
-                        self.reconnectBanner[lane] = nil
-                        if self.errorBanner == banner { self.errorBanner = nil }
-                    }
-                case .closed(let reason):
-                    // Only a session that survived a while proves the config
-                    // works; resetting the attempt counter on every open let
-                    // an open-then-instant-reject loop retry forever.
-                    // A backlog reset is the exception: those sessions live
-                    // 10+ s by construction (the backlog takes that long to
-                    // grow), so forgiving them pinned the backoff at 2 s and
-                    // kept the banner unreachable on a saturated uplink —
-                    // the attempt counter must keep climbing there so the
-                    // cadence escalates to 30 s and the user gets told.
-                    let backlogReset = reason?.hasPrefix(RealtimeTranslationClient.backlogResetReasonPrefix) == true
-                    self.lastCloseWasBacklog[lane] = backlogReset
-                    if let openedAt = self.sessionOpenedAt.removeValue(forKey: lane),
-                       Date().timeIntervalSince(openedAt) >= 5,
-                       !backlogReset {
-                        self.reconnectAttempts[lane] = 0
-                    }
-                    self.scheduleReconnectIfNeeded(lane: lane)
-                default:
-                    break
-                }
-                // @Published fires objectWillChange on same-value writes,
-                // and state events repeat (reconnect loops re-emit
-                // .connecting/.closed) — publish only real transitions.
-                if self.sessionStates[lane] != state {
+                guard let self, let engine else { return }
+                // Ignore events from engines no longer registered for this
+                // lane (e.g. after an idle-close) so they can't clobber
+                // the lane's displayed state.
+                guard self.audioQueue.sync(execute: { self.engines[lane] === engine }) else { return }
+                // Publish only CASE transitions: @Published fires
+                // objectWillChange on same-value writes, and
+                // .reconnecting(attempt:) changes value on every retry
+                // while staying the same yellow dot.
+                if !(self.sessionStates[lane]?.sameCase(as: state) ?? false) {
                     self.sessionStates[lane] = state
                 }
             }
         }
-        client.onSourceTranscriptDelta = { [weak self] delta in
-            DispatchQueue.main.async { self?.transcript.appendSourceDelta(lane: lane, text: delta) }
+        engine.onNotice = { [weak self] notice in
+            DispatchQueue.main.async { self?.handleNotice(notice) }
         }
-        client.onTranslatedTranscriptDelta = { [weak self] delta in
-            DispatchQueue.main.async { self?.transcript.appendTranslationDelta(lane: lane, text: delta) }
+        engine.onTranscript = { [weak self] event in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch event {
+                case .sourceDelta(let text):
+                    self.transcript.appendSourceDelta(lane: lane, text: text)
+                case .translationDelta(let text):
+                    self.transcript.appendTranslationDelta(lane: lane, text: text)
+                case .sourceText(let utterance, let text, let isFinal):
+                    self.transcript.setCascadeSource(lane: lane, utterance: utterance, text: text, isFinal: isFinal)
+                case .translationText(let utterance, let text, let isFinal):
+                    self.transcript.setCascadeTranslation(lane: lane, utterance: utterance, text: text, isFinal: isFinal)
+                case .sourceSuppressed(let utterance, let text):
+                    self.transcript.setCascadeSuppressed(lane: lane, utterance: utterance, text: text)
+                }
+            }
         }
-        // Deliberately NOT identity-guarded like the callbacks above: an
-        // idle-closed client is deregistered before its close() drain
-        // finishes, and the audio billed during that drain must still count.
-        // CostMeter is thread-safe, so no main hop either.
-        client.onBilledSeconds = { [weak self] seconds in
-            self?.costMeter.addBilledSeconds(seconds)
-        }
-        // Like onBilledSeconds, deliberately not identity-guarded: latency
-        // measured on a client that was idle-closed mid-flight is still a
-        // real measurement. MetricsStore is main-confined, so hop.
-        client.onConnectSeconds = { [weak self] seconds in
-            DispatchQueue.main.async { self?.metrics.recordConnect(lane: lane, seconds: seconds) }
-        }
-        client.onFirstResponseSeconds = { [weak self] seconds in
-            DispatchQueue.main.async { self?.metrics.recordFirstResponse(lane: lane, seconds: seconds) }
-        }
-        client.onTranslatedAudio = { [weak self] audio in
+        engine.onTranslatedAudio = { [weak self] audio in
             DispatchQueue.main.async { self?.playEnglishAudio(audio, lane: lane) }
+        }
+        // Deliberately NOT identity-guarded: an idle-closed engine is
+        // deregistered before its close() drain finishes, and the audio
+        // billed during that drain must still count. CostMeter is
+        // thread-safe, so no main hop either.
+        engine.onCostDelta = { [weak self] dollars in
+            self?.costMeter.addDollars(dollars)
+        }
+        // Like onCostDelta, deliberately not identity-guarded: latency
+        // measured on an engine that was idle-closed mid-flight is still a
+        // real measurement. MetricsStore is main-confined, so hop.
+        engine.onMetric = { [weak self] metric in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch metric {
+                case .connectSeconds(let seconds):
+                    self.metrics.recordConnect(lane: lane, seconds: seconds)
+                case .firstResponseSeconds(let seconds):
+                    self.metrics.recordFirstResponse(lane: lane, seconds: seconds)
+                case .sttFinalizeSeconds(let seconds):
+                    self.metrics.recordCascadeStage(lane: lane, stage: "finalize", seconds: seconds)
+                case .translationSeconds(let seconds):
+                    self.metrics.recordCascadeStage(lane: lane, stage: "translate", seconds: seconds)
+                case .ttsFirstAudioSeconds(let seconds):
+                    self.metrics.recordCascadeStage(lane: lane, stage: "tts", seconds: seconds)
+                case .endToEndSeconds(let seconds):
+                    self.metrics.recordCascadeStage(lane: lane, stage: "endToEnd", seconds: seconds)
+                }
+            }
         }
     }
 
-    private func scheduleReconnectIfNeeded(lane: Int) {
-        DispatchQueue.main.async {
-            guard !self.stopping, self.mode != .idle else { return }
-            guard self.audioQueue.sync(execute: { self.clients[lane] != nil }) else { return }
-            let attempts = (self.reconnectAttempts[lane] ?? 0) + 1
-            self.reconnectAttempts[lane] = attempts
-            // Retry for as long as the conversation runs — never give up.
-            // Giving up used to leave the dead client registered in the
-            // lane's slot, and the lazy-open path only fills EMPTY slots,
-            // so a 1-2 min network outage killed the lane for the rest of
-            // the conversation (idle-close never evicts a lane whose
-            // speaker keeps talking). The guards above — stop flag, mode,
-            // client still registered — are what bound the retry chain:
-            // Stop and idle-close both end it.
-            if attempts == 5 {
-                let name = self.laneName(lane)
-                let banner = self.lastCloseWasBacklog[lane] == true
-                    ? "The network can't keep up with \(name)'s audio — translations will lag and arrive in bursts until the connection improves."
-                    : "Session for \(name) keeps failing — still retrying every 30 s. Check the network; if the network is fine, check the API key and event log."
-                self.reconnectBanner[lane] = banner
-                self.errorBanner = banner
-            }
-            let delay = min(30, pow(2, Double(min(attempts, 5))))
-            Log.warn("Reconnecting \(self.laneName(lane)) in \(Int(delay))s (attempt \(attempts))")
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                guard !self.stopping, self.mode != .idle else { return }
-                self.audioQueue.sync(execute: { self.clients[lane] })?.connect()
-            }
+    /// Main thread. One finalized cascade exchange (non-fallback, §14.1's
+    /// content rules) → append to the rolling window and PUSH the new
+    /// window into every cascade engine. Push-only by design: the MT pump
+    /// reads its cached copy on the lane queue, and a lane-queue → main
+    /// fetch would ABBA-deadlock against the 1 Hz snapshot() sync.
+    private func recordCascadePair(lane: Int, source: String, translation: String) {
+        guard mode != .idle, conversationPipeline == .cascade else { return }
+        // Engines only emit non-empty pairs; the guard is belt-and-
+        // suspenders for the window's content rules (no "—" exemplars).
+        let trimmed = translation.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !source.isEmpty, !trimmed.isEmpty, trimmed != "—" else { return }
+        cascadeContextWindow.append(TranslationContextPair(
+            speaker: laneName(lane), source: source, translation: trimmed
+        ))
+        if cascadeContextWindow.count > Self.cascadeContextWindowSize {
+            cascadeContextWindow.removeFirst(cascadeContextWindow.count - Self.cascadeContextWindowSize)
+        }
+        let window = cascadeContextWindow
+        let cascadeEngines = audioQueue.sync {
+            engines.values.compactMap { $0 as? CascadeLaneEngine }
+        }
+        for engine in cascadeEngines {
+            engine.updateTranslationContext(window)
+        }
+    }
+
+    /// Main thread. Engines own their banner lifecycles (raise AND
+    /// retract); this maps them onto the shared errorBanner with the
+    /// id-keyed discipline: a `cleared` only blanks the banner if the
+    /// banner currently displayed is the one that id raised.
+    private func handleNotice(_ notice: LaneNotice) {
+        switch notice {
+        case .raised(let id, let text):
+            // A raise racing Stop — a .closed event landing on the engine
+            // queue in the window before close() does — must not plant a
+            // banner on the idle screen that nothing will ever clear.
+            // Clears are deliberately NOT mode-scoped (a stale entry must
+            // always be removable).
+            guard mode != .idle else { return }
+            noticeTexts[id] = text
+            errorBanner = text
+        case .cleared(let id):
+            guard let text = noticeTexts.removeValue(forKey: id) else { return }
+            if errorBanner == text { errorBanner = nil }
         }
     }
 
@@ -928,16 +1005,16 @@ final class AppModel: ObservableObject {
         finalizeTimer = timer
     }
 
-    /// Rebuild the Diagnostics pipeline rows from live client counters.
+    /// Rebuild the Diagnostics pipeline rows from live engine counters.
     /// Main thread (UI timer); each snapshot() is a brief sync hop onto that
-    /// client's queue, and the clients dictionary is copied under audioQueue.
+    /// engine's queue, and the engines dictionary is copied under audioQueue.
     private func refreshPipelineStatuses() {
         guard mode == .conversation else {
             pipelineMonitor.clear()
             return
         }
-        let (clientsCopy, voiceTimes) = audioQueue.sync { (clients, lastVoiceAt) }
-        let sessionSnapshots = clientsCopy.mapValues { $0.snapshot() }
+        let (enginesCopy, voiceTimes) = audioQueue.sync { (engines, lastVoiceAt) }
+        let sessionSnapshots = enginesCopy.mapValues { $0.snapshot() }
         let now = Date()
         let open = channelMeters.gateOpen
         pipelineMonitor.update(lanes.map { lane in
@@ -952,10 +1029,18 @@ final class AppModel: ObservableObject {
         // The Metrics tab samples the same 1 Hz snapshots the pipeline
         // panel reads — no extra client-queue hops. Lane names ride along so
         // MetricsView never has to observe AppModel (whose meters churn at
-        // 10 Hz and would re-render every chart at meter rate).
+        // 10 Hz and would re-render every chart at meter rate). Its charts
+        // are realtime-specific, so only realtime snapshots feed it (CP2
+        // adds cascade series).
+        var realtimeSnapshots: [Int: RealtimeTranslationClient.Snapshot] = [:]
+        for (lane, snapshot) in sessionSnapshots {
+            if case .realtime(let clientSnapshot) = snapshot {
+                realtimeSnapshots[lane] = clientSnapshot
+            }
+        }
         metrics.sample(
             realtimeCost: costMeter.estimatedDollars,
-            lanes: sessionSnapshots,
+            lanes: realtimeSnapshots,
             laneNames: Dictionary(uniqueKeysWithValues: lanes.map { ($0.id, $0.name) })
         )
     }
@@ -987,23 +1072,26 @@ final class AppModel: ObservableObject {
         let now = Date()
         var closedLanes: [Int] = []
         var disabledLanes: Set<Int> = []
+        // Idle-close is a realtime-pipeline behavior (it bounds billing);
+        // cascade engines are exempt (docs/CASCADE-PIPELINE.md §5.1) —
+        // closing would terminally finish warm state to save $0. Disabled
+        // mics close regardless of engine kind.
         audioQueue.sync {
-            for (lane, client) in clients {
+            for (lane, engine) in engines {
                 if !AppSettings.speakerEnabled(lane) {
                     disabledLanes.insert(lane)
                 } else {
-                    guard timeout > 0, let last = lastVoiceAt[lane],
+                    guard !(engine is CascadeLaneEngine),
+                          timeout > 0, let last = lastVoiceAt[lane],
                           now.timeIntervalSince(last) > timeout else { continue }
                 }
-                clients[lane] = nil
-                client.close()
+                engines[lane] = nil
+                engine.close()
                 closedLanes.append(lane)
             }
         }
         for lane in closedLanes {
             if sessionStates[lane] != .idle { sessionStates[lane] = .idle }
-            sessionOpenedAt[lane] = nil
-            reconnectAttempts[lane] = 0
             if disabledLanes.contains(lane) {
                 Log.info("Closed session for \(laneName(lane)) — mic disabled in Settings")
             } else {
@@ -1078,11 +1166,27 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private var lastRouteChangeLogAt = Date.distantPast
+    private var routeChangeBurstCount = 0
+
     private func handleRouteChange(_ notification: Notification) {
         refreshRoute()
-        guard mode == .conversation || mode == .bench else { return }
         guard let raw = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
               let reason = AVAudioSession.RouteChangeReason(rawValue: raw) else { return }
+        // Log EVERY reason (throttled): a route that flaps without ever
+        // hitting the rebuild cases below (e.g. repeated category or
+        // configuration changes) was previously invisible in the log —
+        // exactly the evidence needed to tell a power-cycling USB device
+        // from in-app session churn.
+        routeChangeBurstCount += 1
+        let now = Date()
+        if now.timeIntervalSince(lastRouteChangeLogAt) > 2 {
+            lastRouteChangeLogAt = now
+            let burst = routeChangeBurstCount > 1 ? " (×\(routeChangeBurstCount) in the last 2 s)" : ""
+            Log.info("Route change: \(routeChangeReasonName(reason))\(burst) — input now \(audioSession.snapshot().inputName)")
+            routeChangeBurstCount = 0
+        }
+        guard mode == .conversation || mode == .bench else { return }
         switch reason {
         case .oldDeviceUnavailable, .newDeviceAvailable:
             Log.warn("Route change (\(reason == .oldDeviceUnavailable ? "device removed" : "device added")) — rebuilding engine")
@@ -1092,13 +1196,45 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func routeChangeReasonName(_ reason: AVAudioSession.RouteChangeReason) -> String {
+        switch reason {
+        case .unknown: return "unknown"
+        case .newDeviceAvailable: return "device added"
+        case .oldDeviceUnavailable: return "device removed"
+        case .categoryChange: return "category change"
+        case .override: return "override"
+        case .wakeFromSleep: return "wake from sleep"
+        case .noSuitableRouteForCategory: return "no suitable route for category"
+        case .routeConfigurationChange: return "route configuration change"
+        @unknown default: return "raw=\(reason.rawValue)"
+        }
+    }
+
+    /// Interruption log throttling (main thread): a wedged audio daemon
+    /// or flapping USB device fires .began several times a second, and a
+    /// wall of identical lines hides everything else. Coalesce to one
+    /// line per 2 s with a counter, and include the system's REASON —
+    /// routeDisconnected vs default is the difference between "the RX is
+    /// power-cycling" and "something else keeps taking the session".
+    private var interruptionBurstCount = 0
+    private var lastInterruptionLogAt = Date.distantPast
+
     private func handleInterruption(_ notification: Notification) {
         guard let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
               let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
         switch type {
         case .began:
             interruptedSince = Date()
-            Log.warn("Audio interruption began")
+            interruptionBurstCount += 1
+            let now = Date()
+            if now.timeIntervalSince(lastInterruptionLogAt) > 2 {
+                lastInterruptionLogAt = now
+                let reason = (notification.userInfo?[AVAudioSessionInterruptionReasonKey] as? UInt)
+                    .map { interruptionReasonName($0) } ?? "no reason given"
+                let burst = interruptionBurstCount > 1 ? " (×\(interruptionBurstCount) in the last 2 s)" : ""
+                Log.warn("Audio interruption began — \(reason)\(burst)")
+                interruptionBurstCount = 0
+            }
         case .ended:
             interruptedSince = nil
             guard mode != .idle else { return }
@@ -1106,6 +1242,15 @@ final class AppModel: ObservableObject {
             restartEngineForCurrentRoute()
         @unknown default:
             break
+        }
+    }
+
+    private func interruptionReasonName(_ raw: UInt) -> String {
+        switch AVAudioSession.InterruptionReason(rawValue: raw) {
+        case .builtInMicMuted: return "built-in mic muted"
+        case .routeDisconnected: return "route disconnected (the input device dropped off the bus)"
+        case .default: return "another session took the audio (reason: default)"
+        default: return "reason raw=\(raw)"
         }
     }
 
@@ -1118,9 +1263,9 @@ final class AppModel: ObservableObject {
             // Mirror what each mode's start built: bench runs one throwaway
             // player and no resamplers (nothing is sent anywhere).
             try engineGraph.start(playerCount: mode == .bench ? 1 : playbackLaneCount)
-            if mode == .conversation {
-                buildResamplers(channelCount: lanes.count)
-            }
+            // No resampler rebuild here: each engine sniffs incoming buffer
+            // formats per send and rebuilds its own converter when the
+            // hardware rate changes (the seam's format-self-healing rule).
             audioQueue.sync { gate.reset() }
             refreshRoute()
         } catch {

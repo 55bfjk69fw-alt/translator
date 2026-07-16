@@ -49,6 +49,18 @@ struct FirstResponseSample: Identifiable {
     let seconds: Double
 }
 
+/// One cascade stage measurement (docs/CASCADE-PIPELINE.md §9): finalize
+/// (utterance close → final text), translate, tts (submit → first audio),
+/// or endToEnd (speech end → first translated audio).
+struct CascadeStageSample: Identifiable {
+    let id = UUID()
+    let date: Date
+    let lane: Int
+    /// "finalize" | "translate" | "tts" | "endToEnd"
+    let stage: String
+    let seconds: Double
+}
+
 /// One prompter (chat-completions) round trip.
 struct AssistRequestSample: Identifiable {
     let id = UUID()
@@ -84,6 +96,7 @@ struct MetricsSnapshot {
     var samples: [PipelineSample]
     var connects: [ConnectSample]
     var firstResponses: [FirstResponseSample]
+    var cascadeStages: [CascadeStageSample]
     var assistRequests: [AssistRequestSample]
     /// From the store's running ledger — deliberately NOT derived from the
     /// capped assistRequests array, which is a display window that drops old
@@ -93,7 +106,8 @@ struct MetricsSnapshot {
 
     var realtimeCostTotal: Double { samples.last?.realtimeCost ?? 0 }
     var isEmpty: Bool {
-        samples.isEmpty && connects.isEmpty && firstResponses.isEmpty && assistRequests.isEmpty
+        samples.isEmpty && connects.isEmpty && firstResponses.isEmpty
+            && cascadeStages.isEmpty && assistRequests.isEmpty
     }
 
     static let empty = MetricsSnapshot(
@@ -103,6 +117,7 @@ struct MetricsSnapshot {
         samples: [],
         connects: [],
         firstResponses: [],
+        cascadeStages: [],
         assistRequests: [],
         assistCostTotal: 0
     )
@@ -175,6 +190,7 @@ final class MetricsStore: ObservableObject {
     private var samples = RingBuffer<PipelineSample>(capacity: MetricsStore.sampleCapacity)
     private var connects = RingBuffer<ConnectSample>(capacity: MetricsStore.eventCapacity)
     private var firstResponses = RingBuffer<FirstResponseSample>(capacity: MetricsStore.eventCapacity)
+    private var cascadeStages = RingBuffer<CascadeStageSample>(capacity: MetricsStore.eventCapacity)
     private var assistRequests = RingBuffer<AssistRequestSample>(capacity: MetricsStore.eventCapacity)
     private var sessionStartedAt: Date?
     private var isLive = false
@@ -223,6 +239,7 @@ final class MetricsStore: ObservableObject {
         samples = RingBuffer(capacity: Self.sampleCapacity)
         connects = RingBuffer(capacity: Self.eventCapacity)
         firstResponses = RingBuffer(capacity: Self.eventCapacity)
+        cascadeStages = RingBuffer(capacity: Self.eventCapacity)
         assistRequests = RingBuffer(capacity: Self.eventCapacity)
         assistCostTotal = 0
         laneTotals = [:]
@@ -302,6 +319,12 @@ final class MetricsStore: ObservableObject {
         schedulePublish()
     }
 
+    /// Cascade per-stage latency (main thread, like the recorders above).
+    func recordCascadeStage(lane: Int, stage: String, seconds: Double) {
+        cascadeStages.append(CascadeStageSample(date: Date(), lane: lane, stage: stage, seconds: seconds))
+        schedulePublish()
+    }
+
     func recordAssist(_ sample: AssistRequestSample) {
         assistRequests.append(sample)
         if let cost = sample.estimatedCost { assistCostTotal += cost }
@@ -339,6 +362,7 @@ final class MetricsStore: ObservableObject {
             samples: samples.ordered(),
             connects: connects.ordered(),
             firstResponses: firstResponses.ordered(),
+            cascadeStages: cascadeStages.ordered(),
             assistRequests: assistRequests.ordered(),
             assistCostTotal: assistCostTotal
         )

@@ -1,5 +1,9 @@
 # One-on-one bidirectional mode — research & design (2026-07-17)
 
+> **Status: implemented** on this branch as Settings → Conversation mode →
+> "One-on-one (two-way)". §2 is the as-built shape; §3's bench validations
+> are still to be run on hardware.
+
 Experimental concept, forked off `stable`: a **two-person, two-language
 conversation through one shared pair of AirPods**. I speak English wearing a
 DJI lav; you speak Mandarin wearing the other DJI lav. You wear the **left**

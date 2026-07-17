@@ -144,6 +144,49 @@ final class AppModel: ObservableObject {
     /// connection-failure one.
     private var lastCloseWasBacklog: [Int: Bool] = [:]
 
+    /// One lane of the one-on-one wiring (docs/ONE-ON-ONE.md §2), captured
+    /// at Start so a mid-conversation Settings change can't half-switch a
+    /// running pipeline: who speaks on this input channel, what their
+    /// speech translates into, and which ear the translation plays in.
+    struct OneOnOneLane {
+        let channel: Int
+        let isUser: Bool
+        /// Translation target for speech captured on this channel.
+        let outputLanguage: String
+        /// Pan of this channel's translated audio: the LISTENER's ear
+        /// (-1 = left bud, +1 = right bud).
+        let pan: Float
+    }
+
+    /// nil = multi-speaker mode. Written only under audioQueue.sync from
+    /// the main thread (alongside pipelineActive) and stable for the whole
+    /// conversation, so both the main thread (playback routing, names) and
+    /// audioQueue (channel mask, session opening) read it directly.
+    private var oneOnOneLanes: [Int: OneOnOneLane]?
+
+    /// The captured one-on-one wiring for the current Settings state:
+    /// my channel's speech goes out in the partner's language panned to
+    /// the partner's ear, and vice versa.
+    private static func oneOnOneConfig() -> [Int: OneOnOneLane] {
+        let myChannel = AppSettings.myChannel
+        let partnerChannel = 1 - myChannel
+        let myPan: Float = AppSettings.myEarIsRight ? 1 : -1
+        return [
+            myChannel: OneOnOneLane(
+                channel: myChannel,
+                isUser: true,
+                outputLanguage: AppSettings.partnerLanguage,
+                pan: -myPan
+            ),
+            partnerChannel: OneOnOneLane(
+                channel: partnerChannel,
+                isUser: false,
+                outputLanguage: AppSettings.myLanguage,
+                pan: myPan
+            )
+        ]
+    }
+
     // audioQueue-confined lazy-session state. Sessions open on first
     // detected speech per channel (a powered-off TX is pure silence and
     // never opens one) and are closed again after idle timeout.
@@ -398,8 +441,16 @@ final class AppModel: ObservableObject {
             return
         }
 
-        let channelCount = min(4, engineGraph.inputChannelCount)
-        lanes = (0..<channelCount).map { SpeakerLane.djiLane(channel: $0, name: AppSettings.speakerName($0)) }
+        let oneOnOne = AppSettings.conversationMode == .oneOnOne ? Self.oneOnOneConfig() : nil
+        let channelCount = min(oneOnOne != nil ? 2 : 4, engineGraph.inputChannelCount)
+        if oneOnOne != nil && channelCount < 2 {
+            // Don't abort — the one live channel still translates — but the
+            // other person is silent until the RX mode is fixed.
+            errorBanner = "One-on-one needs two mic channels, but the input has \(channelCount). Set the DJI RX to S or Q channel mode."
+        }
+        lanes = (0..<channelCount).map { channel in
+            SpeakerLane.djiLane(channel: channel, name: Self.laneDisplayName(channel: channel, oneOnOne: oneOnOne))
+        }
         channelMeters.reset(channelCount: channelCount)
 
         audioQueue.sync {
@@ -407,9 +458,11 @@ final class AppModel: ObservableObject {
             gate.reset()
             pipelineActive = true
             sessionAPIKey = apiKey
+            oneOnOneLanes = oneOnOne
             lastVoiceAt.removeAll()
             voicedState.removeAll()
         }
+        applyOneOnOneRouting()
         buildResamplers(channelCount: channelCount)
         // Sessions are opened lazily on first speech per channel, not here —
         // a disconnected/powered-off TX never opens a billed session.
@@ -425,7 +478,54 @@ final class AppModel: ObservableObject {
         startUITimer()
         mode = .conversation
         assist.conversationStarted(contentEvents: transcript.finalizedTotal + transcript.sentenceEventTotal)
-        Log.info("Conversation started: \(channelCount) channel(s); sessions open on first speech")
+        if oneOnOne != nil {
+            Log.info("One-on-one conversation started: my ear \(AppSettings.myEarIsRight ? "right" : "left"), my mic ch\(AppSettings.myChannel), \(AppSettings.myLanguage)↔\(AppSettings.partnerLanguage)")
+            if AppSettings.earCheckEnabled { runEarCheck() }
+        } else {
+            Log.info("Conversation started: \(channelCount) channel(s); sessions open on first speech")
+        }
+    }
+
+    /// Display name for an input channel: role names in one-on-one, the
+    /// per-TX speaker names otherwise.
+    private static func laneDisplayName(channel: Int, oneOnOne: [Int: OneOnOneLane]?) -> String {
+        guard let lane = oneOnOne?[channel] else { return AppSettings.speakerName(channel) }
+        return lane.isUser ? AppSettings.userName : AppSettings.partnerName
+    }
+
+    /// Apply the one-on-one pans and per-ear gains to the engine's playback
+    /// lanes. No-op in multi-speaker mode. Main thread; run after every
+    /// engine (re)build — player nodes are recreated flat — and from the
+    /// Settings ear-volume sliders for live adjustment.
+    func applyOneOnOneRouting() {
+        guard let config = oneOnOneLanes else { return }
+        for lane in config.values {
+            engineGraph.setLanePan(lane.pan, lane: lane.channel)
+            // A lane's translation is heard by the OTHER role: my channel
+            // plays into the partner's ear at the partner's gain.
+            engineGraph.setLaneGain(
+                lane.isUser ? AppSettings.partnerEarGain : AppSettings.myEarGain,
+                lane: lane.channel
+            )
+        }
+    }
+
+    /// The Start-time ear check (docs/ONE-ON-ONE.md §2.5): a low cue on the
+    /// lane panned to the left bud, then a high cue on the right — through
+    /// the same players that will carry translations, so what's verified is
+    /// the real path. Each wearer should hear exactly one cue; both cues in
+    /// one ear means Mono Audio or Spatialize Stereo is on, and swapped
+    /// pitches mean swapped buds.
+    private func runEarCheck() {
+        guard let config = oneOnOneLanes else { return }
+        if let left = config.values.first(where: { $0.pan < 0 }) {
+            engineGraph.schedule(pcm16: EarCheckTone.leftPCM16, lane: left.channel)
+        }
+        guard let right = config.values.first(where: { $0.pan > 0 }) else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + EarCheckTone.cueSpacing) { [weak self] in
+            guard let self, self.mode == .conversation else { return }
+            self.engineGraph.schedule(pcm16: EarCheckTone.rightPCM16, lane: right.channel)
+        }
     }
 
     func stopConversation() {
@@ -458,6 +558,7 @@ final class AppModel: ObservableObject {
         audioQueue.sync {
             pipelineActive = false
             sessionAPIKey = nil
+            oneOnOneLanes = nil
             lastVoiceAt.removeAll()
             silenceTailRemaining.removeAll()
             appendPaused.removeAll()
@@ -546,8 +647,15 @@ final class AppModel: ObservableObject {
             channels.append(UnsafePointer(data[0]))
         }
         // UserDefaults is thread-safe; reading per buffer means a Settings
-        // toggle mutes/unmutes a mic mid-conversation.
-        let enabledMask = (0..<channels.count).map { AppSettings.speakerEnabled($0) }
+        // toggle mutes/unmutes a mic mid-conversation. In one-on-one mode
+        // exactly the two configured channels are live — a 4-channel Q-mode
+        // RX must not open sessions for ch2/ch3 chatter, and the multi-mode
+        // per-TX toggles (hidden in this mode's Settings) must not silently
+        // mute a role.
+        let enabledMask = (0..<channels.count).map { channel in
+            if let oneOnOneLanes { return oneOnOneLanes[channel] != nil }
+            return AppSettings.speakerEnabled(channel)
+        }
         let decisions = gate.evaluate(channels: channels, frames: frames, sampleRate: sampleRate, channelEnabled: enabledMask)
         // Fan out to the Signal tab. When the tab is hidden this is a flag
         // check and return; otherwise the buffers are retained (no copy)
@@ -626,7 +734,10 @@ final class AppModel: ObservableObject {
     private func lazyOpenSession(channel: Int, speech: Bool) -> RealtimeTranslationClient? {
         guard speech, pipelineActive, let apiKey = sessionAPIKey else { return nil }
         Log.info("Speech on channel \(channel) — opening translation session")
-        let client = makeClient(lane: channel, outputLanguage: AppSettings.outputLanguage, apiKey: apiKey)
+        // Direction is per lane in one-on-one (my speech → partner's
+        // language, theirs → mine); one shared target otherwise.
+        let outputLanguage = oneOnOneLanes?[channel]?.outputLanguage ?? AppSettings.outputLanguage
+        let client = makeClient(lane: channel, outputLanguage: outputLanguage, apiKey: apiKey)
         clients[channel] = client
         client.connect()
         return client
@@ -739,7 +850,7 @@ final class AppModel: ObservableObject {
             DispatchQueue.main.async { self?.metrics.recordFirstResponse(lane: lane, seconds: seconds) }
         }
         client.onTranslatedAudio = { [weak self] audio in
-            DispatchQueue.main.async { self?.playEnglishAudio(audio, lane: lane) }
+            DispatchQueue.main.async { self?.playTranslatedAudio(audio, lane: lane) }
         }
     }
 
@@ -789,14 +900,19 @@ final class AppModel: ObservableObject {
         engineGraph.outputGain = gain
     }
 
-    // MARK: - English playback with overlap ducking (main thread)
+    // MARK: - Translated playback with overlap ducking (main thread)
 
-    private func playEnglishAudio(_ audio: Data, lane: Int) {
+    private func playTranslatedAudio(_ audio: Data, lane: Int) {
         if !engineGraph.engine.isRunning, Date().timeIntervalSince(lastEngineDownWarn) > 5 {
             lastEngineDownWarn = Date()
             Log.warn("Translated audio arriving for lane \(lane) but the audio engine is not running — playback stalled (watchdog will restart it)")
         }
-        let othersActive = pendingPlaybackBuffers.contains { $0.key != lane && $0.value > 0 }
+        // Overlap ducking is a multi-speaker concern (four feeds sharing two
+        // ears). In one-on-one the two feeds go to different heads and can
+        // never mask each other — ducking one because the OTHER person's
+        // ear is busy would be a bug (docs/ONE-ON-ONE.md §1.5).
+        let othersActive = oneOnOneLanes == nil
+            && pendingPlaybackBuffers.contains { $0.key != lane && $0.value > 0 }
         engineGraph.setLaneVolume(othersActive ? 0.35 : 1.0, lane: lane)
         pendingPlaybackBuffers[lane, default: 0] += 1
         engineGraph.schedule(pcm16: audio, lane: lane) { [weak self] in
@@ -989,7 +1105,10 @@ final class AppModel: ObservableObject {
         var disabledLanes: Set<Int> = []
         audioQueue.sync {
             for (lane, client) in clients {
-                if !AppSettings.speakerEnabled(lane) {
+                // The per-TX disable toggles are a multi-speaker control;
+                // one-on-one roles can't be switched off (hidden in that
+                // mode's Settings), only idle-closed.
+                if oneOnOneLanes == nil && !AppSettings.speakerEnabled(lane) {
                     disabledLanes.insert(lane)
                 } else {
                     guard timeout > 0, let last = lastVoiceAt[lane],
@@ -1072,7 +1191,11 @@ final class AppModel: ObservableObject {
             objectWillChange.send()
         }
         guard !lanes.isEmpty else { return }
-        let updated = lanes.map { SpeakerLane.djiLane(channel: $0.id, name: AppSettings.speakerName($0.id)) }
+        // Role names (one-on-one) and per-TX names (multi) both live-update;
+        // laneDisplayName picks per the wiring captured at Start.
+        let updated = lanes.map {
+            SpeakerLane.djiLane(channel: $0.id, name: Self.laneDisplayName(channel: $0.id, oneOnOne: oneOnOneLanes))
+        }
         if updated.map(\.name) != lanes.map(\.name) {
             lanes = updated
         }
@@ -1120,6 +1243,8 @@ final class AppModel: ObservableObject {
             try engineGraph.start(playerCount: mode == .bench ? 1 : playbackLaneCount)
             if mode == .conversation {
                 buildResamplers(channelCount: lanes.count)
+                // Player nodes were recreated flat — restore pans/ear gains.
+                applyOneOnOneRouting()
             }
             audioQueue.sync { gate.reset() }
             refreshRoute()

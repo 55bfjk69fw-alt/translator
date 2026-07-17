@@ -17,6 +17,16 @@ struct SettingsView: View {
         "gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini"
     ]
 
+    @AppStorage(AppSettings.conversationModeKey) private var conversationModeRaw = AppSettings.ConversationMode.multi.rawValue
+    @AppStorage(AppSettings.partnerNameKey) private var partnerName = ""
+    @AppStorage(AppSettings.myLanguageKey) private var myLanguage = "en"
+    @AppStorage(AppSettings.partnerLanguageKey) private var partnerLanguage = "zh"
+    @AppStorage(AppSettings.myEarKey) private var myEar = "right"
+    @AppStorage(AppSettings.myChannelKey) private var myChannel = 0
+    @AppStorage(AppSettings.myEarGainKey) private var myEarGain = 1.0
+    @AppStorage(AppSettings.partnerEarGainKey) private var partnerEarGain = 1.0
+    @AppStorage(AppSettings.earCheckEnabledKey) private var earCheckEnabled = true
+    @AppStorage(AppSettings.oneOnOnePrompterEnabledKey) private var oneOnOnePrompter = false
     @AppStorage(AppSettings.noiseGateEnabledKey) private var noiseGateEnabled = true
     @AppStorage(AppSettings.neuralVADEnabledKey) private var neuralVADEnabled = true
     @AppStorage(AppSettings.micProfileKey) private var micProfileRaw = AppSettings.MicProfile.worn.rawValue
@@ -52,6 +62,10 @@ struct SettingsView: View {
 
     private var micProfile: AppSettings.MicProfile {
         AppSettings.MicProfile(rawValue: micProfileRaw) ?? .worn
+    }
+
+    private var isOneOnOne: Bool {
+        conversationModeRaw == AppSettings.ConversationMode.oneOnOne.rawValue
     }
 
     private struct LanguageOption: Identifiable {
@@ -91,6 +105,48 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    Picker("Mode", selection: $conversationModeRaw) {
+                        ForEach(AppSettings.ConversationMode.allCases) { mode in
+                            Text(mode.displayName).tag(mode.rawValue)
+                        }
+                    }
+                    if isOneOnOne {
+                        TextField("Your name", text: $userName)
+                        TextField("Partner's name", text: $partnerName, prompt: Text("Partner"))
+                        Picker("I speak", selection: $myLanguage) {
+                            ForEach(Self.outputLanguages) { option in
+                                Text(option.name).tag(option.code)
+                            }
+                        }
+                        Picker("Partner speaks", selection: $partnerLanguage) {
+                            ForEach(Self.outputLanguages) { option in
+                                Text(option.name).tag(option.code)
+                            }
+                        }
+                        Picker("My mic", selection: $myChannel) {
+                            Text("TX1").tag(0)
+                            Text("TX2").tag(1)
+                        }
+                        Picker("My ear", selection: $myEar) {
+                            Text("Right bud").tag("right")
+                            Text("Left bud").tag("left")
+                        }
+                        Toggle("Ear check at Start", isOn: $earCheckEnabled)
+                        earVolumeSlider("My ear", value: $myEarGain)
+                        earVolumeSlider("Partner's ear", value: $partnerEarGain)
+                    }
+                } header: {
+                    Text("Conversation mode")
+                } footer: {
+                    if isOneOnOne {
+                        Text("Two people share one AirPods pair — you wear one bud, your partner wears the other — and each of you wears a DJI transmitter. What you say plays translated into your partner's ear and vice versa; you each hear the other's real voice directly. Mic, ear, and language choices apply at the next Start; ear volumes apply immediately (they balance the two of you under the shared hardware volume). Ear check plays a LOW chime in the left bud, then a HIGH chime in the right, when a conversation starts — each of you should hear exactly one. Before starting, check in iPadOS Settings: Accessibility → Audio/Visual → Mono Audio OFF and Balance centered; Control Center → volume long-press → Spatialize Stereo OFF; DJI RX in S or Q channel mode. Keep both buds in ears — removing both re-routes audio to the iPad speaker, out loud.")
+                    } else {
+                        Text("Multi-speaker table: every mic is translated into one shared language for your ears only (configure speakers and language below). One-on-one is a two-way mode for exactly two people sharing a pair of AirPods.")
+                    }
+                }
+
+                if !isOneOnOne {
+                Section {
                     speakerRow("Speaker 1 (TX1)", name: $speakerName0, enabled: $speakerEnabled0)
                     speakerRow("Speaker 2 (TX2)", name: $speakerName1, enabled: $speakerEnabled1)
                     speakerRow("Speaker 3 (TX3)", name: $speakerName2, enabled: $speakerEnabled2)
@@ -100,6 +156,7 @@ struct SettingsView: View {
                     Text("Speakers")
                 } footer: {
                     Text("Switch off any transmitter you aren't using: its channel is muted and never opens a translation session. Takes effect immediately, even mid-conversation.")
+                }
                 }
 
                 Section {
@@ -124,6 +181,7 @@ struct SettingsView: View {
                     Text("Volume of translated audio, on top of the iPad's hardware volume. Above 100% is a digital boost for loud rooms — the very top of the range can distort. Takes effect immediately. \"Pull AirPods over at Start\" plays a short chime under a media-playback session when a conversation starts — the same signal YouTube sends when it starts playing — so AirPods currently on your iPhone switch to this device by themselves. Hear the chime in your ears and it worked; hear it from the iPad speaker and they didn't move (check Bluetooth → AirPods → Connect to This iPad → Automatically). Only runs when the iPad speaker would otherwise be the output — wired or already-connected headphones skip it. Turn off if you never use AirPods; the grab-and-wait adds a few seconds to Start.")
                 }
 
+                if !isOneOnOne {
                 Section {
                     Picker("Speakers translate to", selection: $outputLanguage) {
                         ForEach(Self.outputLanguages) { option in
@@ -135,11 +193,19 @@ struct SettingsView: View {
                 } footer: {
                     Text("What anyone says is auto-detected (70+ languages) — this chooses the translated output for the table mics. Changes apply when a lane's next session opens (after an idle close, or on the next Start).")
                 }
+                }
 
                 Section {
-                    Toggle("Enable prompter", isOn: $prompterEnabled)
+                    // Each mode has its own enable flag (one-on-one defaults
+                    // off — the partner hears your speech synthesized, so
+                    // cue cards are a fallback there, not the reply path).
+                    if isOneOnOne {
+                        Toggle("Enable prompter in one-on-one", isOn: $oneOnOnePrompter)
+                    } else {
+                        Toggle("Enable prompter", isOn: $prompterEnabled)
+                    }
                     Toggle("Auto-suggest during conversation", isOn: $autoSuggest)
-                        .disabled(!prompterEnabled)
+                        .disabled(isOneOnOne ? !oneOnOnePrompter : !prompterEnabled)
                     Picker("Reply language", selection: $replyLanguage) {
                         ForEach(Self.outputLanguages) { option in
                             Text(option.name).tag(option.code)
@@ -326,6 +392,25 @@ struct SettingsView: View {
         } catch {
             modelsNote = "Couldn't fetch your model list — showing common models."
             Log.warn("[assist] model list fetch failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Per-ear balance under the shared AirPods hardware volume (and the
+    /// master output-volume slider, which still handles boost above 100%).
+    private func earVolumeSlider(_ label: String, value: Binding<Double>) -> some View {
+        VStack(alignment: .leading) {
+            Text("\(label) volume: \(Int((value.wrappedValue * 100).rounded()))%")
+                .font(.callout)
+            HStack {
+                Image(systemName: "speaker.wave.1")
+                    .foregroundStyle(.secondary)
+                Slider(value: value, in: 0.25...1.0, step: 0.05)
+                    .onChange(of: value.wrappedValue) { _, _ in
+                        model.applyOneOnOneRouting()
+                    }
+                Image(systemName: "speaker.wave.3")
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 

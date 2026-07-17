@@ -30,6 +30,18 @@ enum AppSettings {
     /// Last-selected pane of the Monitor tab (Signal/Metrics/Diagnostics).
     static let monitorPaneKey = "monitorPane"
 
+    // One-on-one bidirectional mode (docs/ONE-ON-ONE.md)
+    static let conversationModeKey = "conversationMode"
+    static let partnerNameKey = "oneOnOnePartnerName"
+    static let myLanguageKey = "oneOnOneMyLanguage"
+    static let partnerLanguageKey = "oneOnOnePartnerLanguage"
+    static let myEarKey = "oneOnOneMyEar"
+    static let myChannelKey = "oneOnOneMyChannel"
+    static let myEarGainKey = "oneOnOneMyEarGain"
+    static let partnerEarGainKey = "oneOnOnePartnerEarGain"
+    static let earCheckEnabledKey = "oneOnOneEarCheck"
+    static let oneOnOnePrompterEnabledKey = "oneOnOnePrompterEnabled"
+
     // Reply prompter (docs/REPLY-FLOW.md)
     static let prompterEnabledKey = "prompterEnabled"
     static let autoSuggestKey = "prompterAutoSuggest"
@@ -299,6 +311,94 @@ enum AppSettings {
         if !value.isEmpty { return value }
         let legacy = UserDefaults.standard.string(forKey: legacyPTTOutputLanguageKey) ?? ""
         return legacy.isEmpty ? "zh" : legacy
+    }
+
+    // MARK: - One-on-one bidirectional mode (docs/ONE-ON-ONE.md)
+
+    /// Which conversation shape Start builds. `multi` is the original
+    /// 4-speaker table (every lane translated into `outputLanguage`);
+    /// `oneOnOne` is two people sharing one AirPods pair, one lav and one
+    /// bud each, with a translation session per direction hard-panned to
+    /// the listener's ear.
+    enum ConversationMode: String, CaseIterable, Identifiable {
+        case multi
+        case oneOnOne
+        var id: String { rawValue }
+        var displayName: String {
+            switch self {
+            case .multi: return "Multi-speaker table"
+            case .oneOnOne: return "One-on-one (two-way)"
+            }
+        }
+    }
+
+    static var conversationMode: ConversationMode {
+        ConversationMode(rawValue: UserDefaults.standard.string(forKey: conversationModeKey) ?? "") ?? .multi
+    }
+
+    static var partnerName: String {
+        let value = UserDefaults.standard.string(forKey: partnerNameKey) ?? ""
+        return value.isEmpty ? "Partner" : value
+    }
+
+    /// The language I speak — the target the PARTNER's lane translates into.
+    static var myLanguage: String {
+        let value = UserDefaults.standard.string(forKey: myLanguageKey) ?? ""
+        return value.isEmpty ? "en" : value
+    }
+
+    /// The language the partner speaks — the target MY lane translates into.
+    static var partnerLanguage: String {
+        let value = UserDefaults.standard.string(forKey: partnerLanguageKey) ?? ""
+        return value.isEmpty ? "zh" : value
+    }
+
+    /// Which bud I wear ("left"/"right", default right). The partner wears
+    /// the other one — a single value so the pair can never be mis-assigned
+    /// to the same ear.
+    static var myEarIsRight: Bool {
+        (UserDefaults.standard.string(forKey: myEarKey) ?? "right") != "left"
+    }
+
+    /// Which DJI channel my TX lands on (0 = TX1, default). The partner is
+    /// the other channel of the S-mode pair.
+    static var myChannel: Int {
+        let value = UserDefaults.standard.integer(forKey: myChannelKey)
+        return value == 1 ? 1 : 0
+    }
+
+    /// Per-ear playback gains (0.25–1.0, default 1). The pair shares one
+    /// hardware volume; these balance the two wearers under it. Boost above
+    /// unity stays a master `outputGain` job.
+    static var myEarGain: Float {
+        let value = UserDefaults.standard.float(forKey: myEarGainKey)
+        return value > 0 ? min(1, max(0.25, value)) : 1
+    }
+    static var partnerEarGain: Float {
+        let value = UserDefaults.standard.float(forKey: partnerEarGainKey)
+        return value > 0 ? min(1, max(0.25, value)) : 1
+    }
+
+    /// Play the left-then-right ear-check tones when a one-on-one
+    /// conversation starts (catches a swapped bud, Mono Audio, or
+    /// Spatialize Stereo misconfiguration before anyone talks).
+    static var earCheckEnabled: Bool {
+        UserDefaults.standard.object(forKey: earCheckEnabledKey) == nil
+            ? true
+            : UserDefaults.standard.bool(forKey: earCheckEnabledKey)
+    }
+
+    /// Prompter participation is per mode: in one-on-one the partner hears
+    /// my speech synthesized, so cue cards default OFF (they remain a
+    /// "say it myself" fallback); the multi-speaker toggle is untouched.
+    static var oneOnOnePrompterEnabled: Bool {
+        UserDefaults.standard.bool(forKey: oneOnOnePrompterEnabledKey)
+    }
+
+    /// The mode-aware prompter flag the engine and UI consult (the raw
+    /// per-mode toggles stay independent so switching modes round-trips).
+    static var prompterActive: Bool {
+        conversationMode == .oneOnOne ? oneOnOnePrompterEnabled : prompterEnabled
     }
 
     // MARK: - Reply prompter

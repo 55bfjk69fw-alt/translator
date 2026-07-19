@@ -13,6 +13,12 @@ final class EngineGraph {
     var onInputChannels: (([UnsafePointer<Float>], Int, Double) -> Void)?
 
     private var players: [AVAudioPlayerNode] = []
+    /// Per-lane steady gain (one-on-one per-ear balance) and transient duck
+    /// factor (multi-speaker overlap ducking). A player's volume is always
+    /// their product, so ducking can't clobber the ear balance or vice
+    /// versa. Cleared on every graph rebuild; the owner re-applies.
+    private var laneGains: [Int: Float] = [:]
+    private var laneDucks: [Int: Float] = [:]
     private let playbackFormat = AVAudioFormat(
         commonFormat: .pcmFormatFloat32,
         sampleRate: 24_000,
@@ -117,6 +123,8 @@ final class EngineGraph {
             engine.detach(player)
         }
         players.removeAll()
+        laneGains.removeAll()
+        laneDucks.removeAll()
         engine.reset()
         isRunning = false
     }
@@ -162,8 +170,30 @@ final class EngineGraph {
 
     /// Duck (or restore) a playback lane's volume.
     func setLaneVolume(_ volume: Float, lane: Int) {
+        laneDucks[lane] = volume
+        applyLaneVolume(lane)
+    }
+
+    /// Steady per-lane gain under the duck factor (one-on-one per-ear
+    /// balance). Main-thread only, like schedule(); reapply after start().
+    func setLaneGain(_ gain: Float, lane: Int) {
+        laneGains[lane] = gain
+        applyLaneVolume(lane)
+    }
+
+    /// Pan a lane's mono output within the stereo mix: -1 = left bud only,
+    /// +1 = right bud only, 0 = center (both). At full deflection the
+    /// equal-power pan law leaves the opposite channel silent — the router
+    /// for one-on-one mode (docs/ONE-ON-ONE.md §1.2). Main-thread only;
+    /// reapply after start().
+    func setLanePan(_ pan: Float, lane: Int) {
         guard players.indices.contains(lane) else { return }
-        players[lane].volume = volume
+        players[lane].pan = max(-1, min(1, pan))
+    }
+
+    private func applyLaneVolume(_ lane: Int) {
+        guard players.indices.contains(lane) else { return }
+        players[lane].volume = (laneDucks[lane] ?? 1) * (laneGains[lane] ?? 1)
     }
 
     static func pcm16ToFloatBuffer(_ data: Data, format: AVAudioFormat, gain: Float = 1) -> AVAudioPCMBuffer? {

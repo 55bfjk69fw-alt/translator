@@ -13,6 +13,14 @@ you type into the same kind of card. See `docs/REPLY-FLOW.md` for the design.
 Developed and run entirely on the iPad with **Swift Playgrounds 4.7+** — no Mac needed.
 See `docs/RESEARCH.md` for the feasibility research behind every design decision.
 
+**This branch adds an experimental One-on-one (two-way) mode**: two people
+share one AirPods pair — one bud each — and wear one DJI transmitter each;
+your English plays translated to Chinese in your partner's bud while their
+Mandarin plays translated to English in yours, each direction hard-panned to
+its wearer's ear. Enable it in Settings → Conversation mode; the in-app
+footer lists the required iPadOS settings (Mono Audio off, Balance centered,
+Spatialize Stereo off). Research and design: `docs/ONE-ON-ONE.md`.
+
 ## Hardware setup
 
 1. **DJI Mic 3 receiver**: set the channel mode to **Q (Quadraphonic)** on the RX

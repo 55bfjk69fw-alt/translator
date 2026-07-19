@@ -15,8 +15,18 @@ struct ConversationView: View {
     /// The privacy switch: with the prompter off, NO assist affordance may
     /// exist — the composer, tray, and long-press actions all send the
     /// transcript window + bio to OpenAI (the engine also guards, but the
-    /// UI must not offer what the setting promises is off).
-    @AppStorage(AppSettings.prompterEnabledKey) private var prompterEnabled = true
+    /// UI must not offer what the setting promises is off). Mode-aware like
+    /// AppSettings.prompterActive: one-on-one has its own default-off
+    /// toggle, since the partner hears my speech synthesized there.
+    @AppStorage(AppSettings.prompterEnabledKey) private var multiPrompterEnabled = true
+    @AppStorage(AppSettings.oneOnOnePrompterEnabledKey) private var oneOnOnePrompterEnabled = false
+    @AppStorage(AppSettings.conversationModeKey) private var conversationModeRaw = AppSettings.ConversationMode.multi.rawValue
+
+    private var prompterEnabled: Bool {
+        conversationModeRaw == AppSettings.ConversationMode.oneOnOne.rawValue
+            ? oneOnOnePrompterEnabled
+            : multiPrompterEnabled
+    }
 
     var body: some View {
         NavigationStack {
